@@ -4,6 +4,8 @@ Copy `config.example.json` to the ignored `config.local.json` and set its
 trusted Python interpreter before running local workers. Generated task
 workspaces and detailed local results are intentionally ignored; the aggregate
 `results/summary.json` is retained as publishable evidence.
+The interpretation and limitations of the current run are recorded in
+`S5-RESULTS.md`.
 
 This benchmark compares two workflows from identical task snapshots:
 
@@ -42,6 +44,8 @@ inside the isolated task.
 - A task passes only when both public and hidden tests pass.
 - Initial snapshots must fail at least one public or hidden assertion.
 - Record failures, rework and takeovers; do not report only successful runs.
+- Rerunning an evaluation archives the previous canonical result under the
+  ignored local `results/<group>/history/` directory.
 - Codex token usage is `unavailable` unless an actual per-attempt measurement is
   supplied. Call counts or subscription percentages are not converted to tokens.
 - Tool-building time is reported separately from per-task execution time.

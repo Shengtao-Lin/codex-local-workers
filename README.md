@@ -97,7 +97,9 @@ it only with trusted local repositories and review every resulting diff.
 
 ## Status
 
-S0-S4 of the improvement plan are implemented. S5 benchmarking is in progress.
-The first ten-task local-Coder run reached 10/10 final acceptance, but required
-substantial rework; current work is measuring and improving first-review
-quality before considering optional S6 reviewer experiments.
+S0-S4 of the improvement plan are implemented. The initial S5 quality baseline
+is complete: both direct Primary and local-Coder workflows reached 10/10 final
+acceptance, but the original local-Coder run required substantial rework and
+the experiment did not expose exact Codex token usage. See
+[`benchmarks/S5-RESULTS.md`](benchmarks/S5-RESULTS.md) before drawing efficiency
+conclusions or starting optional S6 reviewer experiments.

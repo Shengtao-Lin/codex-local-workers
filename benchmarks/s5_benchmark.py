@@ -410,6 +410,23 @@ def atomic_json(path: Path, payload: object) -> None:
     os.replace(temporary, path)
 
 
+def preserve_previous_result(path: Path) -> int:
+    """Archive an existing canonical result and return the next attempt number."""
+    if not path.exists():
+        return 1
+    previous = json.loads(path.read_text(encoding="utf-8"))
+    previous_attempt = int(previous.get("evaluation_attempt", 1))
+    history = path.parent / "history"
+    archive = history / f"{path.stem}-attempt-{previous_attempt:02d}.json"
+    if archive.exists():
+        archived = json.loads(archive.read_text(encoding="utf-8"))
+        if archived != previous:
+            raise RuntimeError(f"result history conflict: {archive}")
+    else:
+        atomic_json(archive, previous)
+    return previous_attempt + 1
+
+
 def task_root(group: str, task_id: str) -> Path:
     return WORK / group / task_id
 
@@ -509,8 +526,10 @@ def evaluate_case(group: str, case: Case, phase: str) -> dict:
         hidden_path = Path(temp_dir) / "test_hidden.py"
         hidden_path.write_text(case.hidden_tests, encoding="utf-8")
         hidden = run_pytest(cwd, hidden_path)
+    result_path = RESULTS / group / f"{case.task_id}-{phase}.json"
     result = {
         "schema_version": 1,
+        "evaluation_attempt": preserve_previous_result(result_path),
         "task_id": case.task_id,
         "group": group,
         "phase": phase,
@@ -520,7 +539,7 @@ def evaluate_case(group: str, case: Case, phase: str) -> dict:
         "measured_at_unix": time.time(),
         "codex_usage": "unavailable",
     }
-    atomic_json(RESULTS / group / f"{case.task_id}-{phase}.json", result)
+    atomic_json(result_path, result)
     print(f"{group}/{case.task_id}: public={'PASS' if public['passed'] else 'FAIL'} hidden={'PASS' if hidden['passed'] else 'FAIL'}")
     return result
 
@@ -535,6 +554,7 @@ def summary() -> None:
         grouped.setdefault(record["group"], []).append(record)
     payload = {"groups": {}, "codex_usage": "unavailable"}
     for group, items in sorted(grouped.items()):
+        worker_metrics_applicable = group != "A"
         passed = sum(bool(item["qualified_pass"]) for item in items)
         task_metrics = []
         for item in items:
@@ -555,13 +575,13 @@ def summary() -> None:
             task_metrics.append({
                 "task_id": item["task_id"],
                 "qualified_pass": item["qualified_pass"],
-                "coder_calls": state.get("usage", {}).get("coder_calls", 0),
-                "explorer_calls": state.get("usage", {}).get("explorer_calls", 0),
-                "first_review_pass": bool(reviews and reviews[0].get("decision") == "accept"),
-                "rework_reviews": sum(review.get("decision") == "rework" for review in reviews),
-                "takeovers": sum(review.get("decision") == "takeover" for review in reviews),
-                "worker_failed_runs": sum(attempt.get("result") == "failed" for attempt in state.get("execution_history", [])),
-                "archived_runtime_seconds": round(runtime_seconds, 3),
+                "coder_calls": state.get("usage", {}).get("coder_calls", 0) if worker_metrics_applicable else None,
+                "explorer_calls": state.get("usage", {}).get("explorer_calls", 0) if worker_metrics_applicable else None,
+                "first_review_pass": bool(reviews and reviews[0].get("decision") == "accept") if worker_metrics_applicable else None,
+                "rework_reviews": sum(review.get("decision") == "rework" for review in reviews) if worker_metrics_applicable else None,
+                "takeovers": sum(review.get("decision") == "takeover" for review in reviews) if worker_metrics_applicable else None,
+                "worker_failed_runs": sum(attempt.get("result") == "failed" for attempt in state.get("execution_history", [])) if worker_metrics_applicable else None,
+                "archived_runtime_seconds": round(runtime_seconds, 3) if worker_metrics_applicable else None,
             })
         payload["groups"][group] = {
             "evaluated": len(items),
@@ -570,13 +590,14 @@ def summary() -> None:
             "public_passed": sum(bool(item["public"]["passed"]) for item in items),
             "hidden_passed": sum(bool(item["hidden"]["passed"]) for item in items),
             "test_duration_seconds": round(sum(item["public"]["duration_seconds"] + item["hidden"]["duration_seconds"] for item in items), 3),
-            "coder_calls": sum(item["coder_calls"] for item in task_metrics),
-            "explorer_calls": sum(item["explorer_calls"] for item in task_metrics),
-            "first_review_passed": sum(item["first_review_pass"] for item in task_metrics),
-            "rework_reviews": sum(item["rework_reviews"] for item in task_metrics),
-            "takeovers": sum(item["takeovers"] for item in task_metrics),
-            "worker_failed_runs": sum(item["worker_failed_runs"] for item in task_metrics),
-            "archived_runtime_seconds": round(sum(item["archived_runtime_seconds"] for item in task_metrics), 3),
+            "worker_metrics_applicable": worker_metrics_applicable,
+            "coder_calls": sum(item["coder_calls"] for item in task_metrics) if worker_metrics_applicable else None,
+            "explorer_calls": sum(item["explorer_calls"] for item in task_metrics) if worker_metrics_applicable else None,
+            "first_review_passed": sum(item["first_review_pass"] for item in task_metrics) if worker_metrics_applicable else None,
+            "rework_reviews": sum(item["rework_reviews"] for item in task_metrics) if worker_metrics_applicable else None,
+            "takeovers": sum(item["takeovers"] for item in task_metrics) if worker_metrics_applicable else None,
+            "worker_failed_runs": sum(item["worker_failed_runs"] for item in task_metrics) if worker_metrics_applicable else None,
+            "archived_runtime_seconds": round(sum(item["archived_runtime_seconds"] for item in task_metrics), 3) if worker_metrics_applicable else None,
             "tasks": task_metrics,
         }
     atomic_json(RESULTS / "summary.json", payload)
