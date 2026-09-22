@@ -1,0 +1,33 @@
+{
+  "lmstudio_base_url": "http://127.0.0.1:12345/v1",
+  "explorer_model": "openai/gpt-oss-20b",
+  "explorer_reasoning_effort": "low",
+  "coder_model": "qwen3-coder-30b-a3b-instruct-i1",
+  "coder_structured_output": true,
+  "coder_temperature": 0.1,
+  "coder_top_p": 0.9,
+  "coder_top_k": 40,
+  "coder_min_p": 0.0,
+  "coder_repeat_penalty": 1.0,
+  "coder_max_tokens": 4096,
+  "python": "C:\\path\\to\\trusted-repo\\.venv\\Scripts\\python.exe",
+  "validation_profiles": {
+    "python-focused": {
+      "python": "C:\\path\\to\\trusted-repo\\.venv\\Scripts\\python.exe",
+      "compile": true,
+      "pytest_argv": ["-B", "-m", "pytest"]
+    }
+  },
+  "max_local_repairs": 2,
+  "max_model_turns": 24,
+  "max_protocol_errors": 4,
+  "max_explorer_turns": 16,
+  "max_explorer_file_reads": 8,
+  "max_explorer_searches": 10,
+  "max_explorer_protocol_errors": 6,
+  "model_request_timeout_seconds": 180,
+  "command_timeout_seconds": 180,
+  "invocation_timeout_seconds": 900,
+  "explorer_invocation_timeout_seconds": 600,
+  "max_tool_output_chars": 16000
+}

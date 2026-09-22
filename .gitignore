@@ -1,0 +1,21 @@
+# Python generated files
+**/__pycache__/
+**/.pytest_cache/
+**/.venv/
+*.py[cod]
+
+# Local worker execution state and immutable run archives
+**/.agent/
+
+# Machine-specific configuration
+.local-agents/config.json
+benchmarks/config.local.json
+
+# Generated benchmark workspaces and detailed local results
+benchmarks/work/
+
+# Editor and operating-system noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

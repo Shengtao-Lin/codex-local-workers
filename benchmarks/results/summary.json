@@ -1,0 +1,171 @@
+{
+  "groups": {
+    "B": {
+      "evaluated": 10,
+      "qualified_passed": 10,
+      "qualified_pass_rate": 1.0,
+      "public_passed": 10,
+      "hidden_passed": 10,
+      "test_duration_seconds": 6.076,
+      "coder_calls": 22,
+      "explorer_calls": 0,
+      "first_review_passed": 2,
+      "rework_reviews": 12,
+      "takeovers": 0,
+      "worker_failed_runs": 3,
+      "archived_runtime_seconds": 220.588,
+      "tasks": [
+        {
+          "task_id": "task-01",
+          "qualified_pass": true,
+          "coder_calls": 1,
+          "explorer_calls": 0,
+          "first_review_pass": true,
+          "rework_reviews": 0,
+          "takeovers": 0,
+          "worker_failed_runs": 0,
+          "archived_runtime_seconds": 3.826
+        },
+        {
+          "task_id": "task-02",
+          "qualified_pass": true,
+          "coder_calls": 3,
+          "explorer_calls": 0,
+          "first_review_pass": false,
+          "rework_reviews": 2,
+          "takeovers": 0,
+          "worker_failed_runs": 1,
+          "archived_runtime_seconds": 55.434
+        },
+        {
+          "task_id": "task-03",
+          "qualified_pass": true,
+          "coder_calls": 2,
+          "explorer_calls": 0,
+          "first_review_pass": false,
+          "rework_reviews": 1,
+          "takeovers": 0,
+          "worker_failed_runs": 0,
+          "archived_runtime_seconds": 13.036
+        },
+        {
+          "task_id": "task-04",
+          "qualified_pass": true,
+          "coder_calls": 2,
+          "explorer_calls": 0,
+          "first_review_pass": false,
+          "rework_reviews": 1,
+          "takeovers": 0,
+          "worker_failed_runs": 0,
+          "archived_runtime_seconds": 11.084
+        },
+        {
+          "task_id": "task-05",
+          "qualified_pass": true,
+          "coder_calls": 1,
+          "explorer_calls": 0,
+          "first_review_pass": true,
+          "rework_reviews": 0,
+          "takeovers": 0,
+          "worker_failed_runs": 0,
+          "archived_runtime_seconds": 4.519
+        },
+        {
+          "task_id": "task-06",
+          "qualified_pass": true,
+          "coder_calls": 2,
+          "explorer_calls": 0,
+          "first_review_pass": false,
+          "rework_reviews": 1,
+          "takeovers": 0,
+          "worker_failed_runs": 0,
+          "archived_runtime_seconds": 16.595
+        },
+        {
+          "task_id": "task-07",
+          "qualified_pass": true,
+          "coder_calls": 2,
+          "explorer_calls": 0,
+          "first_review_pass": false,
+          "rework_reviews": 1,
+          "takeovers": 0,
+          "worker_failed_runs": 1,
+          "archived_runtime_seconds": 18.465
+        },
+        {
+          "task_id": "task-08",
+          "qualified_pass": true,
+          "coder_calls": 4,
+          "explorer_calls": 0,
+          "first_review_pass": false,
+          "rework_reviews": 3,
+          "takeovers": 0,
+          "worker_failed_runs": 1,
+          "archived_runtime_seconds": 59.243
+        },
+        {
+          "task_id": "task-09",
+          "qualified_pass": true,
+          "coder_calls": 3,
+          "explorer_calls": 0,
+          "first_review_pass": false,
+          "rework_reviews": 2,
+          "takeovers": 0,
+          "worker_failed_runs": 0,
+          "archived_runtime_seconds": 30.32
+        },
+        {
+          "task_id": "task-10",
+          "qualified_pass": true,
+          "coder_calls": 2,
+          "explorer_calls": 0,
+          "first_review_pass": false,
+          "rework_reviews": 1,
+          "takeovers": 0,
+          "worker_failed_runs": 0,
+          "archived_runtime_seconds": 8.066
+        }
+      ]
+    },
+    "P": {
+      "evaluated": 2,
+      "qualified_passed": 1,
+      "qualified_pass_rate": 0.5,
+      "public_passed": 2,
+      "hidden_passed": 1,
+      "test_duration_seconds": 1.305,
+      "coder_calls": 2,
+      "explorer_calls": 0,
+      "first_review_passed": 1,
+      "rework_reviews": 1,
+      "takeovers": 0,
+      "worker_failed_runs": 0,
+      "archived_runtime_seconds": 9.521,
+      "tasks": [
+        {
+          "task_id": "task-07",
+          "qualified_pass": true,
+          "coder_calls": 1,
+          "explorer_calls": 0,
+          "first_review_pass": true,
+          "rework_reviews": 0,
+          "takeovers": 0,
+          "worker_failed_runs": 0,
+          "archived_runtime_seconds": 4.761
+        },
+        {
+          "task_id": "task-08",
+          "qualified_pass": false,
+          "coder_calls": 1,
+          "explorer_calls": 0,
+          "first_review_pass": false,
+          "rework_reviews": 1,
+          "takeovers": 0,
+          "worker_failed_runs": 0,
+          "archived_runtime_seconds": 4.76
+        }
+      ]
+    }
+  },
+  "codex_usage": "unavailable"
+}

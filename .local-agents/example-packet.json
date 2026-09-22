@@ -1,0 +1,60 @@
+{
+  "schema_version": 2,
+  "task_id": "example-01",
+  "unit_id": "example-behavior",
+  "run_id": "example-01-a1",
+  "attempt": 1,
+  "plan_revision": 1,
+  "packet_revision": 1,
+  "goal": "Describe one concrete implementation outcome.",
+  "scope": {
+    "read": [
+      "src",
+      "tests"
+    ],
+    "modify": [
+      "src/example.py",
+      "tests/test_example.py"
+    ],
+    "create": [],
+    "forbidden": []
+  },
+  "required_behavior": [
+    {
+      "id": "behavior-1",
+      "text": "State the externally observable behavior."
+    }
+  ],
+  "acceptance_criteria": [
+    {
+      "id": "acceptance-compile",
+      "text": "Modified Python files compile."
+    },
+    {
+      "id": "acceptance-focused-tests",
+      "text": "The focused tests pass."
+    }
+  ],
+  "acceptance_scenarios": [
+    {
+      "id": "scenario-normal",
+      "text": "Exercise the normal behavior with a representative valid input."
+    },
+    {
+      "id": "scenario-boundary",
+      "text": "Exercise the most important boundary or invalid input."
+    }
+  ],
+  "validation_profile": "python-focused",
+  "focused_tests": [
+    "tests/test_example.py"
+  ],
+  "explorer_findings": [],
+  "review_feedback": [],
+  "limits": {
+    "max_local_repairs": 2,
+    "max_model_turns": 24,
+    "max_protocol_errors": 4,
+    "command_timeout_seconds": 180
+  }
+}
