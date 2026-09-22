@@ -29,6 +29,22 @@ class SafeEditTests(unittest.TestCase):
             with self.assertRaisesRegex(SAFE_EDIT.SafeEditError, "changed since it was read"):
                 editor.replace("src/example.py", "three\n", "four\n", digest)
 
+    def test_missing_replace_target_returns_current_context(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "src" / "example.py"
+            target.parent.mkdir()
+            target.write_text("alpha = 1\nbeta = 2\ngamma = 3\n", encoding="utf-8")
+            editor = SAFE_EDIT.SafeEditor(
+                root, allowed_modify=["src/example.py"], allowed_create=[]
+            )
+            _, digest = editor.read_bytes("src/example.py")
+            with self.assertRaisesRegex(SAFE_EDIT.SafeEditError, "not found") as caught:
+                editor.replace("src/example.py", "beta = 20", "beta = 4", digest)
+            self.assertEqual(caught.exception.details["path"], "src/example.py")
+            self.assertEqual(caught.exception.details["current_sha256"], digest)
+            self.assertIn("beta = 2", caught.exception.details["context"])
+
     def test_create_refuses_unlisted_and_existing_paths(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)

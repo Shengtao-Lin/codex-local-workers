@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import ast
+import difflib
 import fnmatch
 import importlib.util
 import json
@@ -334,6 +336,26 @@ def normalize_requirements(value: Any, name: str, prefix: str) -> list[dict[str,
     return normalized
 
 
+def normalize_scenarios(value: Any) -> list[dict[str, Any]]:
+    normalized = normalize_requirements(value, "acceptance_scenarios", "scenario")
+    for index, source in enumerate(value):
+        if not isinstance(source, dict) or "observables" not in source:
+            continue
+        observables = source["observables"]
+        if not isinstance(observables, dict) or not observables:
+            raise WorkerError(
+                f"acceptance_scenarios[{index + 1}].observables must be a non-empty object"
+            )
+        try:
+            json.dumps(observables, ensure_ascii=False)
+        except (TypeError, ValueError) as exc:
+            raise WorkerError(
+                f"acceptance_scenarios[{index + 1}].observables must be JSON serializable"
+            ) from exc
+        normalized[index]["observables"] = observables
+    return normalized
+
+
 def require_identifier(value: Any, name: str) -> str:
     identifier = require_string(value, name)
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", identifier):
@@ -400,9 +422,20 @@ def validate_packet(packet: dict[str, Any]) -> dict[str, Any]:
             {"id": f"scenario-{item['id']}", "text": item["text"]}
             for item in packet["acceptance_criteria"]
         ]
-    packet["acceptance_scenarios"] = normalize_requirements(
-        scenario_source, "acceptance_scenarios", "scenario"
+    packet["acceptance_scenarios"] = normalize_scenarios(scenario_source)
+    packet["required_order"] = require_string_list(
+        packet.get("required_order", []), "required_order"
     )
+    packet["forbidden_orderings"] = require_string_list(
+        packet.get("forbidden_orderings", []), "forbidden_orderings"
+    )
+    contract_check_required = packet.get(
+        "contract_check_required",
+        bool(packet["required_order"] or packet["forbidden_orderings"]),
+    )
+    if not isinstance(contract_check_required, bool):
+        raise WorkerError("contract_check_required must be a boolean")
+    packet["contract_check_required"] = contract_check_required
     packet["validation_profile"] = require_string(
         packet.get("validation_profile", "python-focused"), "validation_profile"
     )
@@ -455,6 +488,7 @@ class ValidationResult:
     status: str
     py_compile: dict[str, Any]
     focused_tests: dict[str, Any]
+    contract_check: dict[str, Any] | None = None
 
 
 class WorkerRuntime:
@@ -491,15 +525,24 @@ class WorkerRuntime:
             mutation_guard=self._assert_mutation_allowed,
         )
         self.max_turns = int(self._limit("max_model_turns", 24))
+        self.repair_turn_reserve = int(self._limit("repair_turn_reserve", 8))
+        self.hard_max_turns = int(self._limit("hard_max_model_turns", 32))
         self.max_protocol_errors = int(self._limit("max_protocol_errors", 4))
         self.max_repairs = int(self._limit("max_local_repairs", 2))
         self.command_timeout = int(self._limit("command_timeout_seconds", 180))
         self.invocation_timeout = int(self._limit("invocation_timeout_seconds", 900))
         self.max_output = int(config.get("max_tool_output_chars", 16000))
-        if self.command_timeout < 1 or self.invocation_timeout < 1 or self.max_output < 1:
+        if (
+            self.command_timeout < 1
+            or self.invocation_timeout < 1
+            or self.max_output < 1
+            or self.max_turns < 1
+            or self.repair_turn_reserve < 0
+            or self.hard_max_turns < self.max_turns
+        ):
             raise PreflightBlocked(
                 "invalid_config",
-                "command_timeout_seconds, invocation_timeout_seconds, and max_tool_output_chars must be positive",
+                "timeouts/output/model turns must be positive, repair_turn_reserve must be nonnegative, and hard_max_model_turns must be at least max_model_turns",
             )
         self.protocol_errors = 0
         self.protocol_normalizations = 0
@@ -509,18 +552,21 @@ class WorkerRuntime:
         self.validated_revision = -1
         self.validation: ValidationResult | None = None
         self.validation_count = 0
+        self.first_validation_turn: int | None = None
         self.validated_input_facts: dict[str, dict[str, Any]] | None = None
         self.pending_failed_validation = False
         self.changed: dict[str, dict[str, str]] = {}
         self.observed_hashes: dict[str, str] = {}
         self.initial_hashes: dict[str, str | None] = {}
+        self.preimages: dict[str, bytes | None] = {}
         self.baseline: dict[str, Any] | None = None
         for path in scope["modify"]:
             try:
-                _, digest = self.editor.read_bytes(path)
+                content, digest = self.editor.read_bytes(path)
             except SafeEditError as exc:
                 raise PreflightBlocked("modify_target_missing", str(exc)) from exc
             self.initial_hashes[path] = digest
+            self.preimages[path] = content
         for path in scope["create"]:
             relative, resolved = self.editor.resolve(path)
             if resolved.exists():
@@ -528,6 +574,7 @@ class WorkerRuntime:
                     "create_target_exists", f"scope.create target already exists: {relative}"
                 )
             self.initial_hashes[path] = None
+            self.preimages[path] = None
         for test_target in self.packet["focused_tests"]:
             test_path = test_target.split("::", 1)[0]
             relative, resolved = self.editor.resolve(test_path)
@@ -571,7 +618,7 @@ class WorkerRuntime:
             ),
         }
         try:
-            self.archive.prepare(self.source_packet, self.baseline)
+            self.archive.prepare(self.source_packet, self.baseline, self.preimages)
         except RunStateError as exc:
             raise PreflightBlocked("run_id_conflict", str(exc)) from exc
 
@@ -645,8 +692,57 @@ class WorkerRuntime:
         }
         return post_state, changes
 
+    def _render_diffs(self) -> tuple[str, str]:
+        forward: list[str] = []
+        reverse: list[str] = []
+        for path in sorted(self.preimages):
+            before = self.preimages[path]
+            resolved = self.repo_root / Path(path)
+            after = resolved.read_bytes() if resolved.is_file() else None
+            if before == after:
+                continue
+            try:
+                before_lines = (before or b"").decode("utf-8").splitlines(keepends=True)
+                after_lines = (after or b"").decode("utf-8").splitlines(keepends=True)
+            except UnicodeDecodeError:
+                marker = f"Binary files differ: {path}\n"
+                forward.append(marker)
+                reverse.append(marker)
+                continue
+            forward.extend(
+                difflib.unified_diff(
+                    before_lines,
+                    after_lines,
+                    fromfile=f"a/{path}",
+                    tofile=f"b/{path}",
+                )
+            )
+            reverse.extend(
+                difflib.unified_diff(
+                    after_lines,
+                    before_lines,
+                    fromfile=f"b/{path}",
+                    tofile=f"a/{path}",
+                )
+            )
+        return "".join(forward), "".join(reverse)
+
     @staticmethod
-    def _failure_signature(report: dict[str, Any]) -> str | None:
+    def _error_code(exc: BaseException) -> str:
+        message = str(exc).lower()
+        if "target block was not found" in message:
+            return "safe_replace_target_missing"
+        if "file changed since it was read" in message:
+            return "stale_read_hash"
+        if "repair budget is exhausted" in message:
+            return "repair_budget_exhausted"
+        if isinstance(exc, SafeEditError):
+            return "safe_edit_error"
+        if isinstance(exc, WorkerError):
+            return "worker_protocol_error"
+        return type(exc).__name__.lower()
+
+    def _failure_signature(self, report: dict[str, Any]) -> str | None:
         status = report.get("status")
         if status in {"ready_for_review"}:
             return None
@@ -655,8 +751,29 @@ class WorkerRuntime:
         )
         validation = report.get("validation") or {}
         validation_status = validation.get("status")
-        raw = f"coder|{status}|{reason_code or validation_status or report.get('failure_reason') or 'unknown'}"
-        return re.sub(r"\s+", " ", raw)[:240]
+        failure_reason = str(report.get("failure_reason") or "").strip().lower()
+        if failure_reason == "turn limit":
+            reason = (
+                "turn_limit_after_validation"
+                if self.validation_count
+                else "turn_limit_before_validation"
+            )
+        elif validation_status == "failed":
+            focused = validation.get("focused_tests") or {}
+            diagnostic = focused.get("diagnostic") or {}
+            failed_ids = diagnostic.get("failed_test_ids") or []
+            reason = "validation_failed"
+            if failed_ids:
+                reason += "|" + ",".join(str(item)[:120] for item in failed_ids[:3])
+        elif reason_code:
+            reason = str(reason_code)
+        elif self.protocol_error_details:
+            reason = str(self.protocol_error_details[-1].get("error_code") or "protocol_error")
+        elif failure_reason:
+            reason = re.sub(r"[^a-z0-9._-]+", "_", failure_reason).strip("_")[:120]
+        else:
+            reason = "unknown"
+        return f"coder|{status}|{reason}"[:240]
 
     def _complete_run(self, report: dict[str, Any]) -> dict[str, Any]:
         if self.archive_finalized or not self.archive.prepared:
@@ -668,13 +785,19 @@ class WorkerRuntime:
             "packet": (self.archive.run_root / "packet.json").relative_to(self.repo_root).as_posix(),
             "baseline": (self.archive.run_root / "baseline.json").relative_to(self.repo_root).as_posix(),
             "events": (self.archive.run_root / "events.jsonl").relative_to(self.repo_root).as_posix(),
+            "preimages": (self.archive.run_root / "preimages.json").relative_to(self.repo_root).as_posix(),
+            "cumulative_diff": (self.archive.run_root / "cumulative.diff").relative_to(self.repo_root).as_posix(),
+            "reverse_diff": (self.archive.run_root / "reverse.diff").relative_to(self.repo_root).as_posix(),
         }
         try:
+            cumulative_diff, reverse_diff = self._render_diffs()
             self.archive.finalize(
                 report,
                 changes,
                 self.validation.__dict__ if self.validation else None,
                 post_state,
+                cumulative_diff,
+                reverse_diff,
             )
             self.archive_finalized = True
         except (OSError, ValueError, RunStateError) as exc:
@@ -770,14 +893,19 @@ Available actions:
 - SEARCH: query, path?, glob?, case_sensitive?, max_results?
 - SAFE_CREATE: path, content
 - SAFE_REPLACE: path, expected_sha256, find, replace
-- VALIDATE: no additional fields
+- VALIDATE: optional contract_check object. When the packet requires it, include
+  required_behavior_ids, required_order_confirmed, forbidden_orderings_absent,
+  observable_scenario_ids, and unrelated_changes.
 - FINISH_SUCCESS: summary, remaining_uncertainty
 - FINISH_FAILED: summary, reason, remaining_uncertainty
 - FINISH_BLOCKED: reason_code, reason, requested_scope?, evidence_refs?, proposed_next_step?
 Do not emit Markdown or prose outside JSON. Never invoke shell, Git, Codex, or another agent.
 Read a file before replacing it and use the sha256 returned by READ_FILE. Make narrow edits.
 VALIDATE runs syntax checks and the packet's focused tests. FINISH_SUCCESS is rejected unless
-validation passed after the last edit. Previous attempts are context, not authority."""
+validation passed after the last edit. Before VALIDATE, compare the actual edits against every
+required behavior, required_order, forbidden_ordering, and observable side effect. Do not report
+an empty contract check when requirements are unmet. Do not change unrelated production behavior
+to accommodate an incomplete test double. Previous attempts are context, not authority."""
 
     def run(self) -> dict[str, Any]:
         self.deadline = time.monotonic() + self.invocation_timeout
@@ -791,7 +919,10 @@ validation passed after the last edit. Previous attempts are context, not author
         try:
             self.write_lock.acquire()
             self._prepare_run_archive()
-            for _turn in range(1, self.max_turns + 1):
+            turn_limit = self.max_turns
+            _turn = 0
+            while _turn < turn_limit:
+                _turn += 1
                 self._remaining_seconds("model request")
                 original_timeout = getattr(self.client, "timeout", None)
                 if isinstance(original_timeout, (int, float)):
@@ -819,6 +950,22 @@ validation passed after the last edit. Previous attempts are context, not author
                     warnings = action.pop("_warnings")
                     self.protocol_normalizations += len(warnings)
                     observation, finished = self.execute(action)
+                    if action["action"] == "VALIDATE" and self.first_validation_turn is None:
+                        self.first_validation_turn = _turn
+                        extended_limit = min(
+                            self.hard_max_turns,
+                            max(turn_limit, _turn + self.repair_turn_reserve),
+                        )
+                        if extended_limit > turn_limit:
+                            turn_limit = extended_limit
+                            self.archive.event(
+                                "repair_turns_reserved",
+                                {
+                                    "first_validation_turn": _turn,
+                                    "turn_limit": turn_limit,
+                                    "hard_max_turns": self.hard_max_turns,
+                                },
+                            )
                     self.archive.event(
                         "tool_action",
                         {
@@ -868,10 +1015,22 @@ validation passed after the last edit. Previous attempts are context, not author
                             },
                         ))
                     self.protocol_errors += 1
+                    error_code = self._error_code(exc)
+                    details = getattr(exc, "details", {})
                     self.protocol_error_details.append(
-                        {"error": str(exc), "response": raw[:1000]}
+                        {
+                            "error": str(exc),
+                            "error_code": error_code,
+                            "response": raw[:1000],
+                        }
                     )
-                    observation = {"status": "error", "error": str(exc)}
+                    observation = {
+                        "status": "error",
+                        "error": str(exc),
+                        "error_code": error_code,
+                    }
+                    if details:
+                        observation["details"] = details
                     finished = None
                     if self.protocol_errors >= self.max_protocol_errors:
                         return self._complete_run(self.report(
@@ -1067,10 +1226,11 @@ validation passed after the last edit. Previous attempts are context, not author
         if self.pending_failed_validation:
             if self.repairs >= self.max_repairs:
                 raise WorkerError("local repair budget is exhausted; finish with failure")
-            self.repairs += 1
-            self.pending_failed_validation = False
 
     def _record_edit(self, result: dict[str, str]) -> dict[str, Any]:
+        if self.pending_failed_validation:
+            self.repairs += 1
+            self.pending_failed_validation = False
         self.edit_revision += 1
         self.validation = None
         self.validated_input_facts = None
@@ -1192,15 +1352,187 @@ validation passed after the last edit. Previous attempts are context, not author
             "argv": argv,
         }
 
+    @staticmethod
+    def _diagnostic(output: str) -> dict[str, Any]:
+        lines = output.splitlines()
+        failed_ids: list[str] = []
+        for line in lines:
+            match = re.match(r"(?:FAILED|ERROR)\s+([^\s]+)", line.strip())
+            if match and match.group(1) not in failed_ids:
+                failed_ids.append(match.group(1))
+        selected: list[str] = []
+        important = re.compile(
+            r"FAILED|ERROR|E\s+|AssertionError|NameError|TypeError|ValueError|ImportError|short test summary",
+            re.IGNORECASE,
+        )
+        for index, line in enumerate(lines):
+            if important.search(line):
+                start = max(0, index - 1)
+                end = min(len(lines), index + 3)
+                for candidate in lines[start:end]:
+                    if candidate not in selected:
+                        selected.append(candidate)
+            if len(selected) >= 30:
+                break
+        if not selected:
+            selected = lines[-20:]
+        return {
+            "failed_test_ids": failed_ids[:10],
+            "excerpt": "\n".join(selected)[:6000],
+        }
+
+    def _contract_check(self, args: dict[str, Any]) -> dict[str, Any] | None:
+        if set(args) - {"contract_check"}:
+            raise WorkerError("VALIDATE accepts only the optional contract_check object")
+        value = args.get("contract_check")
+        if value is None:
+            if self.packet["contract_check_required"]:
+                raise WorkerError("VALIDATE requires contract_check for this packet")
+            return None
+        if not isinstance(value, dict):
+            raise WorkerError("contract_check must be an object")
+        checked = set(
+            require_string_list(
+                value.get("required_behavior_ids", []),
+                "contract_check.required_behavior_ids",
+            )
+        )
+        expected = {item["id"] for item in self.packet["required_behavior"]}
+        missing = sorted(expected - checked)
+        if missing:
+            raise WorkerError(
+                "contract_check is missing required behavior ids: " + ", ".join(missing)
+            )
+        if self.packet["required_order"] and value.get("required_order_confirmed") is not True:
+            raise WorkerError("contract_check must confirm required_order")
+        if (
+            self.packet["forbidden_orderings"]
+            and value.get("forbidden_orderings_absent") is not True
+        ):
+            raise WorkerError("contract_check must confirm forbidden orderings are absent")
+        unrelated = value.get("unrelated_changes", [])
+        if not isinstance(unrelated, list) or any(not isinstance(item, str) for item in unrelated):
+            raise WorkerError("contract_check.unrelated_changes must be an array of strings")
+        if unrelated:
+            raise WorkerError(
+                "contract_check reports unrelated changes; remove them before validation"
+            )
+        observable_ids = {
+            item["id"]
+            for item in self.packet["acceptance_scenarios"]
+            if item.get("observables")
+        }
+        covered = set(
+            require_string_list(
+                value.get("observable_scenario_ids", []),
+                "contract_check.observable_scenario_ids",
+            )
+        )
+        missing_observables = sorted(observable_ids - covered)
+        if missing_observables:
+            raise WorkerError(
+                "contract_check is missing observable scenario ids: "
+                + ", ".join(missing_observables)
+            )
+        return {
+            "required_behavior_ids": sorted(checked),
+            "required_order_confirmed": value.get("required_order_confirmed") is True,
+            "forbidden_orderings_absent": value.get("forbidden_orderings_absent") is True,
+            "observable_scenario_ids": sorted(covered),
+            "unrelated_changes": [],
+        }
+
+    def _changed_test_quality_issues(self) -> list[str]:
+        if self.config.get("require_assertions_in_changed_tests", True) is False:
+            return []
+        focused = {target.split("::", 1)[0] for target in self.packet["focused_tests"]}
+        issues: list[str] = []
+        for relative in sorted(focused & set(self.changed)):
+            if not relative.lower().endswith(".py"):
+                continue
+            path = self.repo_root / relative
+            try:
+                tree = ast.parse(path.read_text(encoding="utf-8-sig"), filename=relative)
+            except (OSError, SyntaxError, UnicodeError) as exc:
+                issues.append(f"{relative}: could not inspect test assertions: {exc}")
+                continue
+            tests = [
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name.startswith("test")
+            ]
+            for test in tests:
+                has_assertion = any(isinstance(node, ast.Assert) for node in ast.walk(test))
+                if not has_assertion:
+                    for node in ast.walk(test):
+                        if not isinstance(node, ast.Call):
+                            continue
+                        name = ""
+                        if isinstance(node.func, ast.Attribute):
+                            name = node.func.attr
+                        elif isinstance(node.func, ast.Name):
+                            name = node.func.id
+                        if name.startswith("assert") or name == "raises":
+                            has_assertion = True
+                            break
+                if not has_assertion:
+                    issues.append(
+                        f"{relative}::{test.name} has no assert, pytest.raises, or unittest-style assertion"
+                    )
+        return issues
+
+    def _validation_observation(self, validation: ValidationResult) -> dict[str, Any]:
+        focused = validation.focused_tests
+        return {
+            "status": validation.status,
+            "edit_revision": self.edit_revision,
+            "repair_count": self.repairs,
+            "remaining_repairs": max(0, self.max_repairs - self.repairs),
+            "contract_check": validation.contract_check,
+            "syntax": {
+                "status": validation.py_compile.get("status"),
+                "diagnostic": validation.py_compile.get("diagnostic"),
+            },
+            "focused_tests": {
+                "status": focused.get("status"),
+                "junit": focused.get("junit"),
+                "diagnostic": focused.get("diagnostic"),
+                "inputs_unchanged": focused.get("inputs_unchanged"),
+            },
+        }
+
     def validate(self, args: dict[str, Any]) -> dict[str, Any]:
-        if args:
-            raise WorkerError("VALIDATE does not accept arguments")
+        contract_check = self._contract_check(args)
         self.validation_count += 1
         profile = self.validation_profile()
         python_path = self.python_path()
         if not python_path.is_file():
             raise WorkerError(f"project Python was not found: {python_path}")
         input_facts_before = self._validation_facts()
+        test_quality_issues = self._changed_test_quality_issues()
+        if test_quality_issues:
+            validation = ValidationResult(
+                "failed",
+                {"status": "not_run"},
+                {
+                    "status": "failed",
+                    "stage": "test_quality",
+                    "diagnostic": {
+                        "failed_test_ids": [],
+                        "excerpt": "\n".join(test_quality_issues)[:6000],
+                    },
+                },
+                contract_check,
+            )
+            self.validation = validation
+            self.pending_failed_validation = True
+            self.validated_input_facts = None
+            self.archive.event(
+                "validation_finished",
+                {"status": "failed", "stage": "test_quality", "edit_revision": self.edit_revision},
+            )
+            return {"status": "failed", "validation": self._validation_observation(validation)}
         python_files = sorted(path for path in self.changed if path.lower().endswith(".py"))
         compile_results = []
         for path in python_files if profile.get("compile", True) else []:
@@ -1220,8 +1552,13 @@ validation passed after the last edit. Previous attempts are context, not author
             if result["status"] != "passed":
                 validation = ValidationResult(
                     "failed",
-                    {"status": "failed", "files": compile_results},
+                    {
+                        "status": "failed",
+                        "files": compile_results,
+                        "diagnostic": self._diagnostic(result.get("output", "")),
+                    },
                     {"status": "not_run"},
+                    contract_check,
                 )
                 self.validation = validation
                 self.pending_failed_validation = True
@@ -1230,7 +1567,7 @@ validation passed after the last edit. Previous attempts are context, not author
                     "validation_finished",
                     {"status": "failed", "stage": "syntax", "edit_revision": self.edit_revision},
                 )
-                return {"status": "failed", "validation": validation.__dict__}
+                return {"status": "failed", "validation": self._validation_observation(validation)}
         tests = self.packet["focused_tests"]
         pytest_argv = profile.get("pytest_argv", ["-B", "-m", "pytest"])
         if not isinstance(pytest_argv, list) or any(not isinstance(item, str) for item in pytest_argv):
@@ -1240,6 +1577,7 @@ validation passed after the last edit. Previous attempts are context, not author
         test_result = self._run_command(
             [str(python_path), *pytest_argv, *runtime_pytest_args]
         )
+        test_result["diagnostic"] = self._diagnostic(test_result.get("output", ""))
         junit: dict[str, Any] = {"path": str(junit_path), "available": False}
         try:
             root = ET.parse(junit_path).getroot()
@@ -1286,6 +1624,7 @@ validation passed after the last edit. Previous attempts are context, not author
                 "inputs_unchanged": inputs_unchanged,
                 "input_facts": input_facts_after,
             },
+            contract_check,
         )
         self.validation = validation
         if status == "passed":
@@ -1304,7 +1643,7 @@ validation passed after the last edit. Previous attempts are context, not author
                 "executed": junit.get("executed"),
             },
         )
-        return {"status": status, "validation": validation.__dict__}
+        return {"status": status, "validation": self._validation_observation(validation)}
 
     def blocked_report(self, args: dict[str, Any]) -> dict[str, Any]:
         reason_code = require_string(args.get("reason_code"), "reason_code")
@@ -1394,6 +1733,10 @@ validation passed after the last edit. Previous attempts are context, not author
                 "process_events": self.process_events,
                 "invocation_timeout_seconds": self.invocation_timeout,
                 "command_timeout_seconds": self.command_timeout,
+                "base_model_turn_limit": self.max_turns,
+                "hard_model_turn_limit": self.hard_max_turns,
+                "repair_turn_reserve": self.repair_turn_reserve,
+                "first_validation_turn": self.first_validation_turn,
             },
             "next_action_required": {
                 "ready_for_review": "primary_review",
@@ -1417,6 +1760,8 @@ validation passed after the last edit. Previous attempts are context, not author
                 "acceptance_scenario_ids": [
                     item["id"] for item in self.packet["acceptance_scenarios"]
                 ],
+                "required_order_count": len(self.packet["required_order"]),
+                "forbidden_ordering_count": len(self.packet["forbidden_orderings"]),
             },
         }
 

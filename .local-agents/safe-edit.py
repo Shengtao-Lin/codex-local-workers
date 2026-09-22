@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import difflib
 import json
 import os
 import stat
@@ -11,7 +12,9 @@ from typing import Callable, Iterable
 
 
 class SafeEditError(ValueError):
-    pass
+    def __init__(self, message: str, *, details: dict | None = None) -> None:
+        super().__init__(message)
+        self.details = details or {}
 
 
 def normalize_relative_path(raw_path: str) -> str:
@@ -186,7 +189,31 @@ class SafeEditor:
         replacement = normalize_newlines(replacement)
         occurrences = text.count(find)
         if occurrences == 0:
-            raise SafeEditError("target block was not found")
+            lines = text.splitlines()
+            needle_lines = [line for line in find.splitlines() if line.strip()]
+            needle = needle_lines[0] if needle_lines else find[:200]
+            best_index = 0
+            if lines and needle:
+                best_index = max(
+                    range(len(lines)),
+                    key=lambda index: difflib.SequenceMatcher(
+                        None, needle.strip(), lines[index].strip()
+                    ).ratio(),
+                )
+            start = max(0, best_index - 3)
+            end = min(len(lines), best_index + 4)
+            context = "\n".join(
+                f"{index + 1}: {lines[index]}" for index in range(start, end)
+            )
+            raise SafeEditError(
+                "target block was not found",
+                details={
+                    "path": relative,
+                    "current_sha256": current_sha256,
+                    "suggested_start_line": best_index + 1 if lines else None,
+                    "context": context[:4000],
+                },
+            )
         if occurrences != 1:
             raise SafeEditError(
                 f"target block occurs {occurrences} times; refusing ambiguous edit"

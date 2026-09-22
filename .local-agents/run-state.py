@@ -46,10 +46,26 @@ def facts_for_paths(repo_root: Path, paths: Iterable[str]) -> dict[str, dict[str
     }
 
 
+def _git_control_root(repo_root: Path) -> Path:
+    resolved = repo_root.resolve()
+    for candidate in (resolved, *resolved.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    return resolved
+
+
 def _run_git(repo_root: Path, args: list[str]) -> dict[str, Any]:
+    git_root = _git_control_root(repo_root)
     try:
         completed = subprocess.run(
-            ["git", "-C", str(repo_root), *args],
+            [
+                "git",
+                "-c",
+                f"safe.directory={git_root.as_posix()}",
+                "-C",
+                str(repo_root),
+                *args,
+            ],
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -124,6 +140,20 @@ def write_json_once(path: Path, value: Any) -> None:
             os.close(descriptor)
 
 
+def write_bytes_once(path: Path, value: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = -1
+            stream.write(value)
+            stream.flush()
+            os.fsync(stream.fileno())
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
 class RunArchive:
     def __init__(self, repo_root: Path, task_id: str, unit_id: str, run_id: str) -> None:
         self.repo_root = repo_root.resolve()
@@ -136,7 +166,12 @@ class RunArchive:
         self.prepared = False
         self.model_started = False
 
-    def prepare(self, packet: dict[str, Any], baseline: dict[str, Any]) -> None:
+    def prepare(
+        self,
+        packet: dict[str, Any],
+        baseline: dict[str, Any],
+        preimages: dict[str, bytes | None] | None = None,
+    ) -> None:
         self.run_root.parent.mkdir(parents=True, exist_ok=True)
         try:
             self.run_root.mkdir()
@@ -146,6 +181,23 @@ class RunArchive:
         try:
             write_json_once(self.run_root / "packet.json", packet)
             write_json_once(self.run_root / "baseline.json", baseline)
+            manifest = []
+            for relative, content in sorted((preimages or {}).items()):
+                archive_path = None
+                if content is not None:
+                    target = self.run_root / "preimages" / Path(relative)
+                    write_bytes_once(target, content)
+                    archive_path = target.relative_to(self.repo_root).as_posix()
+                manifest.append(
+                    {
+                        "path": relative,
+                        "existed": content is not None,
+                        "archive_path": archive_path,
+                        "sha256": sha256_bytes(content) if content is not None else None,
+                        "size": len(content) if content is not None else None,
+                    }
+                )
+            write_json_once(self.run_root / "preimages.json", manifest)
             self.event("run_prepared", {"unit_id": self.unit_id})
         except BaseException:
             # Keep any partial directory as conflict evidence; never recycle the run id.
@@ -170,6 +222,8 @@ class RunArchive:
         changes: dict[str, Any],
         validation: dict[str, Any] | None,
         post_state: dict[str, Any],
+        cumulative_diff: str = "",
+        reverse_diff: str = "",
     ) -> None:
         if not self.prepared:
             return
@@ -177,6 +231,8 @@ class RunArchive:
         write_json_once(self.run_root / "validation.json", validation)
         write_json_once(self.run_root / "handoff.json", report)
         write_json_once(self.run_root / "post-state.json", post_state)
+        write_bytes_once(self.run_root / "cumulative.diff", cumulative_diff.encode("utf-8"))
+        write_bytes_once(self.run_root / "reverse.diff", reverse_diff.encode("utf-8"))
         write_json_once(
             self.run_root / "completed.json",
             {"completed_at": utc_now(), "status": report.get("status")},

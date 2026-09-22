@@ -25,6 +25,15 @@
       "text": "State the externally observable behavior."
     }
   ],
+  "required_order": [
+    "Perform the main operation.",
+    "Re-read and validate the state that authorizes finalization.",
+    "Apply final state mutations and commit."
+  ],
+  "forbidden_orderings": [
+    "Do not perform the final authorization check before the main operation."
+  ],
+  "contract_check_required": true,
   "acceptance_criteria": [
     {
       "id": "acceptance-compile",
@@ -38,11 +47,19 @@
   "acceptance_scenarios": [
     {
       "id": "scenario-normal",
-      "text": "Exercise the normal behavior with a representative valid input."
+      "text": "Exercise the normal behavior with a representative valid input.",
+      "observables": {
+        "success_mutations": 1,
+        "commit_calls": 1
+      }
     },
     {
       "id": "scenario-boundary",
-      "text": "Exercise the most important boundary or invalid input."
+      "text": "Exercise the most important boundary or invalid input.",
+      "observables": {
+        "success_mutations": 0,
+        "commit_calls": 0
+      }
     }
   ],
   "validation_profile": "python-focused",
@@ -54,6 +71,8 @@
   "limits": {
     "max_local_repairs": 2,
     "max_model_turns": 24,
+    "repair_turn_reserve": 8,
+    "hard_max_model_turns": 32,
     "max_protocol_errors": 4,
     "command_timeout_seconds": 180
   }

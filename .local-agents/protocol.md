@@ -31,6 +31,11 @@ workers cannot submit arbitrary shell strings.
 `acceptance_scenarios` names the normal, important failure, and boundary cases
 Primary expects to review. Older packets without it receive compatibility
 scenarios derived from their acceptance criteria.
+Scenarios may include a JSON `observables` object for required side effects.
+Concurrency- or transaction-sensitive packets should also include
+`required_order` and `forbidden_orderings`. Such packets require a structured
+`contract_check` in the `VALIDATE` action; this focuses the repair loop but is
+self-reported evidence, not proof that the implementation is correct.
 
 Schema version 1 packets remain accepted. Runtime normalizes them to v2 using
 the task id as the unit id, revision 1, repository-wide reads, generated
@@ -93,14 +98,18 @@ Before the first model turn, the runtime exclusively creates:
 
 A reused `run_id` returns `blocked/run_id_conflict`; an existing archive is
 never overwritten or recycled. Every completed run contains `packet.json`,
-`baseline.json`, `events.jsonl`, `changes.json`, `validation.json`,
-`post-state.json`, `handoff.json`, and `completed.json`. Pytest JUnit evidence is
-stored alongside them. `current-task.json` is only a reconstructable pointer;
+`baseline.json`, `preimages.json`, exact authorized-file preimages,
+`events.jsonl`, `changes.json`, `cumulative.diff`, `reverse.diff`,
+`validation.json`, `post-state.json`, `handoff.json`, and `completed.json`.
+Pytest JUnit evidence is stored alongside them. `current-task.json` is only a reconstructable pointer;
 the task `state.json` retains execution history, Primary-owned decisions and
 open issues.
 
 The baseline records resolved repository identity, Git HEAD/status when Git is
 available, packet/config hashes, authorized-file facts, and focused-test facts.
+Git probes use a process-local, exact repository `safe.directory` setting and
+do not modify global Git configuration. Preimages permit exact restoration of
+this run's authorized files without discarding older user changes.
 Post-state distinguishes runtime edits from unattributed changes to relevant
 files. Existing user changes are not cleaned or rolled back.
 
@@ -110,6 +119,12 @@ collected tests, all-skipped/all-xfail results, missing JUnit evidence, command
 failure, or relevant input changes during validation all fail the quality gate.
 The runtime snapshots authorized files, focused tests, and observed evidence
 before/after validation and checks them again before `ready_for_review`.
+Validation observations sent back to the model contain a bounded diagnostic
+excerpt, failed test identifiers, edit revision, and remaining repair count.
+When Coder modifies a focused Python test, the deterministic test-quality gate
+requires each test function to contain an assertion, `pytest.raises`, or a
+unittest-style assertion call. Primary must still review fixture and mock
+semantics.
 
 Runtime execution history records facts and stable failure signatures across
 packet revisions. It does not mark a unit accepted, decide material progress,

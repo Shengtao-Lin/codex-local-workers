@@ -146,14 +146,27 @@ class WorkerRuntimeTests(unittest.TestCase):
             for name in (
                 "packet.json",
                 "baseline.json",
+                "preimages.json",
                 "events.jsonl",
                 "changes.json",
+                "cumulative.diff",
+                "reverse.diff",
                 "validation.json",
                 "handoff.json",
                 "post-state.json",
                 "completed.json",
             ):
                 self.assertTrue((run_root / name).is_file(), name)
+            preimages = json.loads((run_root / "preimages.json").read_text())
+            source_preimage = next(
+                item for item in preimages if item["path"] == "src/example.py"
+            )
+            self.assertEqual(
+                (root / source_preimage["archive_path"]).read_text(),
+                "VALUE = 1\n",
+            )
+            self.assertIn("-VALUE = 1", (run_root / "cumulative.diff").read_text())
+            self.assertIn("+VALUE = 1", (run_root / "reverse.diff").read_text())
             task_state = json.loads(
                 (root / ".agent" / "tasks" / "test-1" / "state.json").read_text()
             )
@@ -276,6 +289,131 @@ class WorkerRuntimeTests(unittest.TestCase):
             runtime = RUNTIME.WorkerRuntime(root, packet_v2(), {"python": sys.executable}, FakeClient([]))
             with self.assertRaisesRegex(RUNTIME.WorkerError, "outside scope.read"):
                 runtime.read_file({"path": "outside.py"})
+
+    def test_packet_preserves_order_and_observable_contracts(self) -> None:
+        value = packet_v2()
+        value["required_order"] = ["run handler", "recheck lease", "commit"]
+        value["forbidden_orderings"] = ["recheck lease before handler"]
+        value["acceptance_scenarios"] = [{
+            "id": "stale-lease",
+            "text": "A stale lease rolls back without finalization.",
+            "observables": {"rollback_calls": 1, "commit_calls": 0},
+        }]
+        normalized = RUNTIME.validate_packet(value)
+        self.assertTrue(normalized["contract_check_required"])
+        self.assertEqual(normalized["required_order"][1], "recheck lease")
+        self.assertEqual(
+            normalized["acceptance_scenarios"][0]["observables"]["commit_calls"],
+            0,
+        )
+
+    def test_contract_check_and_changed_test_quality_gate(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            value = packet_v2()
+            value["required_order"] = ["edit", "validate"]
+            value["forbidden_orderings"] = ["validate before edit"]
+            value["acceptance_scenarios"] = [{
+                "id": "observable-test",
+                "text": "The test asserts the result.",
+                "observables": {"assertions": 1},
+            }]
+            runtime = RUNTIME.WorkerRuntime(
+                root, value, {"python": sys.executable}, FakeClient([])
+            )
+            runtime.write_lock.acquire()
+            try:
+                runtime._prepare_run_archive()
+                runtime.changed["tests/test_example.py"] = {
+                    "path": "tests/test_example.py",
+                    "operation": "modified",
+                    "sha256": "unused",
+                }
+                check = {
+                    "contract_check": {
+                        "required_behavior_ids": ["behavior-value"],
+                        "required_order_confirmed": True,
+                        "forbidden_orderings_absent": True,
+                        "observable_scenario_ids": ["observable-test"],
+                        "unrelated_changes": [],
+                    }
+                }
+                result = runtime.validate(check)
+            finally:
+                runtime.close()
+            self.assertEqual(result["status"], "failed")
+            diagnostic = result["validation"]["focused_tests"]["diagnostic"]
+            self.assertIn("has no assert", diagnostic["excerpt"])
+
+    def test_failed_replace_does_not_consume_repair_budget(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            runtime = RUNTIME.WorkerRuntime(
+                root, packet_v2(), {"python": sys.executable}, FakeClient([])
+            )
+            runtime.write_lock.acquire()
+            try:
+                runtime.pending_failed_validation = True
+                _, digest = runtime.editor.read_bytes("src/example.py")
+                with self.assertRaisesRegex(RUNTIME.SafeEditError, "not found"):
+                    runtime.safe_replace({
+                        "path": "src/example.py",
+                        "expected_sha256": digest,
+                        "find": "VALUE = 999\n",
+                        "replace": "VALUE = 2\n",
+                    })
+            finally:
+                runtime.close()
+            self.assertEqual(runtime.repairs, 0)
+            self.assertTrue(runtime.pending_failed_validation)
+
+    def test_first_validation_reserves_finish_turns(self) -> None:
+        class LateValidationClient:
+            def __init__(self) -> None:
+                self.turn = 0
+
+            def complete(self, _messages):
+                self.turn += 1
+                if self.turn < 4:
+                    return json.dumps({
+                        "action": "READ_FILE",
+                        "arguments": {"path": "src/example.py"},
+                    })
+                if self.turn == 4:
+                    return json.dumps({"action": "VALIDATE", "arguments": {}})
+                return json.dumps({
+                    "action": "FINISH_SUCCESS",
+                    "arguments": {"summary": ["Validated."], "remaining_uncertainty": []},
+                })
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            value = packet_v2()
+            value["limits"] = {
+                "max_model_turns": 4,
+                "repair_turn_reserve": 2,
+                "hard_max_model_turns": 6,
+            }
+            runtime = RUNTIME.WorkerRuntime(
+                root, value, {"python": sys.executable}, LateValidationClient()
+            )
+
+            def fake_command(argv: list[str]) -> dict:
+                for item in argv:
+                    if item.startswith("--junitxml="):
+                        Path(item.split("=", 1)[1]).write_text(
+                            '<testsuites><testsuite tests="1" failures="0" errors="0" skipped="0" /></testsuites>',
+                            encoding="utf-8",
+                        )
+                return {"status": "passed", "exit_code": 0, "output": "ok", "argv": argv}
+
+            with patch.object(runtime, "_run_command", side_effect=fake_command):
+                report = runtime.run()
+            self.assertEqual(report["status"], "ready_for_review")
+            self.assertEqual(report["runtime_facts"]["first_validation_turn"], 4)
 
     def test_control_files_are_never_writable(self) -> None:
         value = packet_v2()

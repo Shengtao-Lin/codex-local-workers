@@ -96,11 +96,14 @@ Managed Coder runs also hold one repository write lock, reject symlink/junction
 path components, create files exclusively, and atomically replace existing
 files after rechecking their hash. A validation timeout triggers process-tree
 termination; uncertain termination prevents further writes.
+Failed replacements return a bounded excerpt near the closest current line and
+do not consume a repair cycle unless an edit actually succeeds.
 
 Each Coder `run_id` owns an immutable archive under
 `.agent/tasks/<task_id>/runs/<run_id>/`. It contains the final packet, pre-run
 baseline, compact tool events, actual relevant changes, validation evidence,
-post-state, and handoff. Reusing a run id is blocked instead of overwriting the
+exact authorized-file preimages, forward/reverse diffs, post-state, and handoff.
+Reusing a run id is blocked instead of overwriting the
 old record. Task state keeps runtime facts separate from Primary-owned accepted
 decisions and open-issue conclusions.
 
@@ -137,6 +140,12 @@ Python syntax checks do not emit bytecode. Focused pytest produces JUnit counts;
 zero-test and all-skipped runs cannot become `ready_for_review`. Relevant source,
 test, and observed evidence facts are bound to the validation result and checked
 again when the worker tries to finish.
+Packets can express `required_order`, `forbidden_orderings`, and per-scenario
+`observables`. When present, `VALIDATE` requires a structured contract check.
+Validation failures return a compact traceback/assertion digest rather than
+forcing another broad file read. The base turn limit remains bounded, while a
+small separately capped reserve guarantees room to react after the first
+validation.
 
 These action restrictions are not an operating-system sandbox. Pytest executes
 trusted repository code, imports, `conftest.py`, and plugins with the actual

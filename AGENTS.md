@@ -40,6 +40,10 @@ that defines readable and writable scope, stable task/unit/revision identity,
 required behavior, acceptance criteria, validation profile, and focused tests.
 Include stable `acceptance_scenarios` for the normal path, important error path,
 and relevant boundary whenever they are distinct.
+For concurrency, transaction, or lifecycle-sensitive work, include explicit
+`required_order`, `forbidden_orderings`, and observable side effects. Prefer
+Primary-authored or Primary-reviewed critical tests; do not grant test write
+scope merely so Coder can reshape mocks around an implementation.
 Schema version 1 remains supported through explicit compatibility normalization.
 Invoke from the target repository root:
 
@@ -136,6 +140,9 @@ record; `last-*` reports and `current-task.json` are convenience pointers only.
 Runtime history records worker facts but never writes Primary acceptance. Zero
 tests, all-skipped focused tests, missing JUnit evidence, or source/test changes
 during or after validation cannot produce `ready_for_review`.
+Canonical run archives also retain exact authorized-file preimages plus forward
+and reverse diffs so Primary can recover one failed run without using a broad
+Git checkout or discarding pre-existing user changes.
 
 ## Efficiency policy
 
