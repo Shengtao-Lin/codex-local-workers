@@ -10,12 +10,35 @@
   "coder_min_p": 0.0,
   "coder_repeat_penalty": 1.0,
   "coder_max_tokens": 4096,
+  "reviewer_model": "qwen3-coder-30b-a3b-instruct-i1",
+  "reviewer_structured_output": true,
+  "reviewer_temperature": 0.1,
+  "reviewer_top_p": 0.9,
+  "reviewer_top_k": 40,
+  "reviewer_min_p": 0.0,
+  "reviewer_repeat_penalty": 1.0,
+  "reviewer_max_tokens": 4096,
   "python": ".\\.venv\\Scripts\\python.exe",
   "validation_profiles": {
     "python-focused": {
       "python": ".\\.venv\\Scripts\\python.exe",
       "compile": true,
       "pytest_argv": ["-B", "-m", "pytest"]
+    },
+    "python-strict": {
+      "python": ".\\.venv\\Scripts\\python.exe",
+      "compile": true,
+      "pytest_argv": ["-B", "-m", "pytest"],
+      "commands": [
+        {
+          "id": "ruff-format",
+          "argv": ["{python}", "-m", "ruff", "format", "--check", "src", "tests"]
+        },
+        {
+          "id": "ruff-check",
+          "argv": ["{python}", "-m", "ruff", "check", "src", "tests"]
+        }
+      ]
     }
   },
   "max_local_repairs": 2,
@@ -23,6 +46,9 @@
   "repair_turn_reserve": 8,
   "hard_max_model_turns": 32,
   "max_protocol_errors": 4,
+  "max_reviewer_turns": 16,
+  "max_reviewer_protocol_errors": 4,
+  "reviewer_initial_diff_chars": 24000,
   "require_assertions_in_changed_tests": true,
   "max_explorer_turns": 16,
   "max_explorer_file_reads": 8,
@@ -31,6 +57,7 @@
   "model_request_timeout_seconds": 180,
   "command_timeout_seconds": 180,
   "invocation_timeout_seconds": 900,
+  "reviewer_invocation_timeout_seconds": 600,
   "explorer_invocation_timeout_seconds": 600,
   "max_tool_output_chars": 16000
 }

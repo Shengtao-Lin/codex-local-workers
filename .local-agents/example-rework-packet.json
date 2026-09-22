@@ -1,0 +1,17 @@
+{
+  "schema_version": 2,
+  "task_id": "example-01",
+  "unit_id": "example-behavior",
+  "run_id": "example-01-a2",
+  "attempt": 2,
+  "plan_revision": 1,
+  "packet_revision": 2,
+  "parent_run_id": "example-01-a1",
+  "preserve_contract": true,
+  "review_feedback": [
+    {
+      "finding_id": "finding-001",
+      "text": "Apply the bounded correction described by the Local Reviewer."
+    }
+  ]
+}

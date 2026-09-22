@@ -72,13 +72,33 @@ class TaskPolicyTests(unittest.TestCase):
         state = {"recent_attempts": [attempt("failed", severity="unsafe")]}
         self.assertEqual(POLICY.evaluate_task_state(state)["decision"], "takeover")
 
-    def test_ready_for_review_waits_for_primary_without_counting_failure(self) -> None:
+    def test_ready_for_review_routes_to_local_reviewer_without_counting_failure(self) -> None:
         state = {"recent_attempts": [
             attempt("failed", signature="pytest:assertion"),
             attempt("failed", signature="pytest:assertion"),
             attempt("ready_for_review"),
         ]}
-        self.assertEqual(POLICY.evaluate_task_state(state)["decision"], "primary_review")
+        self.assertEqual(POLICY.evaluate_task_state(state)["decision"], "local_review")
+
+    def test_reviewer_pass_uses_recorded_risk_route(self) -> None:
+        item = attempt("pass_to_primary")
+        item.update({
+            "worker": "reviewer",
+            "review_route": "primary_lightweight_review",
+        })
+        state = {"recent_attempts": [item]}
+        self.assertEqual(
+            POLICY.evaluate_task_state(state)["decision"],
+            "primary_lightweight_review",
+        )
+
+    def test_reviewer_findings_route_to_bounded_rework(self) -> None:
+        item = attempt("rework")
+        item["worker"] = "reviewer"
+        state = {"recent_attempts": [item]}
+        self.assertEqual(
+            POLICY.evaluate_task_state(state)["decision"], "bounded_coder_rework"
+        )
 
     def test_runtime_policy_violation_triggers_takeover(self) -> None:
         state = {"recent_attempts": [attempt("policy_violation")]}

@@ -2,7 +2,9 @@
 
 Both workers call LM Studio's OpenAI-compatible chat endpoint directly.
 `explorer-runtime.py` exposes read-only repository actions;
-`worker-runtime.py` exposes bounded implementation and validation actions.
+`worker-runtime.py` exposes bounded implementation and validation actions; and
+`reviewer-runtime.py` performs an independent read-only review of completed
+Coder runs.
 
 ## Layout and compatibility
 
@@ -13,7 +15,10 @@ contains the Python entrypoints, runtime, configuration, and wrappers:
 - `local-explore.py`
 - `local-code.ps1`
 - `local-explore.ps1`
+- `local-review.py`
+- `local-review.ps1`
 - `explorer-runtime.py`
+- `reviewer-runtime.py`
 - `worker-runtime.py`
 - `safe-edit.py`
 - `run-state.py`
@@ -71,7 +76,22 @@ interpreter is configured outside their own root.
 The Coder exits zero only with `ready_for_review`, after runtime-observed syntax
 checks and focused pytest succeed after the final edit. `blocked` exits with code
 3, `policy_violation` with 4, and `interrupted` with 130. The Primary Agent must
-still review the actual diff and decide acceptance.
+then send the run through Local Reviewer and apply the packet's risk route.
+
+Create a unique review request from `example-review-request.json`, then run:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File ".local-agents\local-review.ps1" `
+  -Request ".agent\review-request.json" `
+  -Config ".local-agents\config.json" `
+  -Report ".agent\last-local-review-report.json"
+```
+
+Reviewer is strictly read-only and returns `pass_to_primary`, `rework`, or
+`escalate`. Small units route to Primary evidence acceptance, medium units to a
+lightweight Primary review, and high units to a full Primary review. High-risk
+feature integration still receives a final cumulative Primary review.
 
 Coder requests use LM Studio JSON Schema structured output by default. The
 schema guarantees one syntactically valid `{action, arguments}` object; the
@@ -98,6 +118,14 @@ files after rechecking their hash. A validation timeout triggers process-tree
 termination; uncertain termination prevents further writes.
 Failed replacements return a bounded excerpt near the closest current line and
 do not consume a repair cycle unless an edit actually succeeds.
+Reviewer can request only `READ_FILE`, `SEARCH`, and `REPORT`; it has no write
+action. It receives a fresh context and treats Coder prose as untrusted.
+
+Packets distinguish feature, unit, and integration risk. Primary decomposes a
+feature into cohesive implementation units and assigns owned contract ids.
+Contracts may set a `risk_floor`, preventing a critical invariant from being
+made cheap merely by splitting the work. `scope.readonly` explicitly identifies
+tests and context that Coder can inspect and execute but never modify.
 
 Each Coder `run_id` owns an immutable archive under
 `.agent/tasks/<task_id>/runs/<run_id>/`. It contains the final packet, pre-run
@@ -146,6 +174,13 @@ Validation failures return a compact traceback/assertion digest rather than
 forcing another broad file read. The base turn limit remains bounded, while a
 small separately capped reserve guarantees room to react after the first
 validation.
+Before syntax/tests, a deterministic diff-quality gate rejects newly introduced
+trailing whitespace, conflict markers, and missing final newlines with exact
+file/line diagnostics. Trusted validation profiles may add fixed argument-array
+commands such as Ruff; only actually executed checks appear in runtime evidence.
+Focused rework can use `parent_run_id` plus `preserve_contract: true`; the
+runtime inherits the parent's scope, risk, contract, tests, and limits and only
+accepts new identity/revision and review feedback fields.
 
 These action restrictions are not an operating-system sandbox. Pytest executes
 trusted repository code, imports, `conftest.py`, and plugins with the actual

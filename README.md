@@ -7,7 +7,9 @@ Codex remains the Primary Agent: it owns user intent, architecture, scope, Git
 operations, review, broader validation, and final acceptance. The local
 Explorer performs read-only repository investigation. The local Coder receives
 a schema-version-2 implementation packet and can only use bounded read, search,
-edit, and validation actions implemented by the runtime.
+edit, and validation actions implemented by the runtime. A separate read-only
+Local Reviewer examines actual diffs and runtime evidence before risk-routed
+Primary review.
 
 ## Why this exists
 
@@ -17,10 +19,12 @@ observed tests remain authoritative.
 
 ```text
 Codex Primary
+  -> feature decomposition + feature/unit/integration risk
   -> optional focused Explorer (gpt-oss)
-  -> bounded implementation packet
+  -> bounded implementation-unit packet
   -> local Coder (Qwen3-Coder)
-  -> Codex diff review and broader validation
+  -> deterministic gates + Local Reviewer
+  -> risk-routed Codex review and feature integration validation
   -> accept / rework / replan / takeover
 ```
 
@@ -69,6 +73,15 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
   -Report ".agent\last-local-coder-report.json"
 ```
 
+Review a completed Coder run:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File ".local-agents\local-review.ps1" `
+  -Request ".agent\review-request.json" `
+  -Report ".agent\last-local-review-report.json"
+```
+
 See [the local-agent guide](.local-agents/README.md) for the packet contract,
 review flow, security boundary, and exit statuses.
 
@@ -93,13 +106,13 @@ Pop-Location
 The Coder edit allowlist is enforced by the runtime, but validation executes
 trusted repository code with the Python process's real host permissions. This
 is orchestration and write-scope control, not an operating-system sandbox. Use
-it only with trusted local repositories and review every resulting diff.
+it only with trusted local repositories. Review depth follows explicit unit
+risk, and high-risk feature integration always receives final Primary review.
 
 ## Status
 
-S0-S4 of the improvement plan are implemented. The initial S5 quality baseline
-is complete: both direct Primary and local-Coder workflows reached 10/10 final
-acceptance, but the original local-Coder run required substantial rework and
-the experiment did not expose exact Codex token usage. See
-[`benchmarks/S5-RESULTS.md`](benchmarks/S5-RESULTS.md) before drawing efficiency
-conclusions or starting optional S6 reviewer experiments.
+S0-S5 and the first S6 orchestration layer are implemented. S6 adds
+feature/unit risk separation, deterministic diff-quality gates, explicit
+read-only scope, inherited rework packets, and a read-only Local Reviewer.
+Qwen is the default Reviewer; alternate models should remain shadow evaluation
+until benchmark evidence supports routing acceptance through them.

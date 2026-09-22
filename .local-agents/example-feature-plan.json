@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "task_id": "lease-fencing",
+  "feature_id": "lease-fencing",
+  "feature_risk": "high",
+  "integration_risk": "high",
+  "risk_reasons": [
+    "The feature changes transaction finalization ordering.",
+    "An incorrect implementation can commit success after lease loss."
+  ],
+  "units": [
+    {
+      "unit_id": "lease-test-support",
+      "risk": "medium",
+      "owner": "primary",
+      "dependencies": [],
+      "owned_contract_ids": [
+        "lease-event-order-evidence"
+      ],
+      "status": "planned"
+    },
+    {
+      "unit_id": "worker-success-finalization",
+      "risk": "high",
+      "owner": "local-coder",
+      "dependencies": [
+        "lease-test-support"
+      ],
+      "owned_contract_ids": [
+        "lease-check-after-handler",
+        "invalid-lease-rolls-back",
+        "success-only-after-valid-lease"
+      ],
+      "status": "planned"
+    },
+    {
+      "unit_id": "lease-documentation",
+      "risk": "small",
+      "owner": "local-coder",
+      "dependencies": [
+        "worker-success-finalization"
+      ],
+      "owned_contract_ids": [
+        "document-lease-fencing"
+      ],
+      "status": "planned"
+    }
+  ]
+}

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+from collections import Counter
 import difflib
 import fnmatch
 import importlib.util
@@ -200,6 +201,8 @@ class LMStudioClient:
         min_p: float = 0.0,
         repeat_penalty: float = 1.0,
         structured_output: bool = True,
+        action_schema: dict[str, Any] | None = None,
+        schema_name: str = "local_coder_action",
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.url = self.base_url + "/chat/completions"
@@ -212,6 +215,8 @@ class LMStudioClient:
         self.min_p = min_p
         self.repeat_penalty = repeat_penalty
         self.structured_output = structured_output
+        self.action_schema = action_schema or CODER_ACTION_SCHEMA
+        self.schema_name = schema_name
 
     def preflight(self) -> None:
         request = urllib.request.Request(self.base_url + "/models", method="GET")
@@ -246,9 +251,9 @@ class LMStudioClient:
             payload["response_format"] = {
                 "type": "json_schema",
                 "json_schema": {
-                    "name": "local_coder_action",
+                    "name": self.schema_name,
                     "strict": True,
-                    "schema": CODER_ACTION_SCHEMA,
+                    "schema": self.action_schema,
                 },
             }
         body = json.dumps(payload).encode("utf-8")
@@ -280,6 +285,87 @@ def load_json(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise WorkerError(f"JSON root must be an object: {path}")
     return value
+
+
+def resolve_inherited_packet(repo_root: Path, child: dict[str, Any]) -> dict[str, Any]:
+    parent_run_id = child.get("parent_run_id")
+    if parent_run_id is None:
+        return child
+    task_id = require_identifier(child.get("task_id"), "task_id")
+    unit_id = require_identifier(child.get("unit_id", task_id), "unit_id")
+    parent_run_id = require_identifier(parent_run_id, "parent_run_id")
+    run_id = require_identifier(child.get("run_id"), "run_id")
+    if run_id == parent_run_id:
+        raise WorkerError("run_id must differ from parent_run_id")
+    if child.get("preserve_contract") is not True:
+        raise WorkerError("inherited rework packets require preserve_contract=true")
+    allowed = {
+        "schema_version",
+        "task_id",
+        "unit_id",
+        "run_id",
+        "attempt",
+        "plan_revision",
+        "packet_revision",
+        "parent_run_id",
+        "preserve_contract",
+        "review_feedback",
+    }
+    extras = sorted(set(child) - allowed)
+    if extras:
+        raise WorkerError(
+            "inherited rework packet cannot override preserved fields: " + ", ".join(extras)
+        )
+    feedback = child.get("review_feedback")
+    if not isinstance(feedback, list) or not feedback:
+        raise WorkerError("inherited rework packet requires non-empty review_feedback")
+    parent_path = (
+        repo_root
+        / ".agent"
+        / "tasks"
+        / task_id
+        / "runs"
+        / parent_run_id
+        / "packet.json"
+    )
+    completed_path = parent_path.with_name("completed.json")
+    if not completed_path.is_file():
+        raise WorkerError("parent run is incomplete or missing completed.json")
+    parent = load_json(parent_path)
+    if parent.get("task_id") != task_id:
+        raise WorkerError("parent packet task_id does not match child")
+    if parent.get("unit_id", parent.get("task_id")) != unit_id:
+        raise WorkerError("parent packet unit_id does not match child")
+    parent_revision = parent.get("packet_revision", 1)
+    child_revision = child.get("packet_revision")
+    if not isinstance(child_revision, int) or child_revision <= parent_revision:
+        raise WorkerError("inherited packet_revision must be greater than the parent revision")
+    resolved = {
+        key: value for key, value in json.loads(json.dumps(parent)).items() if not key.startswith("_")
+    }
+    resolved.update(
+        {
+            "schema_version": 2,
+            "task_id": task_id,
+            "unit_id": unit_id,
+            "run_id": run_id,
+            "attempt": child.get("attempt", int(parent.get("attempt", 1)) + 1),
+            "plan_revision": child.get("plan_revision", parent.get("plan_revision", 1)),
+            "packet_revision": child_revision,
+            "parent_run_id": parent_run_id,
+            "preserve_contract": True,
+            "review_feedback": feedback,
+            "_inheritance": {
+                "parent_run_id": parent_run_id,
+                "parent_packet_sha256": RUN_STATE.sha256_bytes(
+                    json.dumps(parent, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+                        "utf-8"
+                    )
+                ),
+            },
+        }
+    )
+    return resolved
 
 
 def require_string(value: Any, name: str) -> str:
@@ -314,6 +400,22 @@ def path_matches_any(path: str, roots: list[str] | tuple[str, ...]) -> bool:
     return any(path_is_within(path, root) for root in roots)
 
 
+RISK_ORDER = {"small": 0, "medium": 1, "high": 2}
+
+
+def normalize_risk_level(value: Any, name: str) -> str:
+    level = require_string(value, name).lower()
+    aliases = {"s": "small", "m": "medium", "h": "high"}
+    level = aliases.get(level, level)
+    if level not in RISK_ORDER:
+        raise WorkerError(f"{name} must be small, medium, or high")
+    return level
+
+
+def scope_roots_overlap(left: str, right: str) -> bool:
+    return path_is_within(left, right) or path_is_within(right, left)
+
+
 def normalize_requirements(value: Any, name: str, prefix: str) -> list[dict[str, str]]:
     if not isinstance(value, list) or not value:
         raise WorkerError(f"{name} must be a non-empty array")
@@ -322,12 +424,15 @@ def normalize_requirements(value: Any, name: str, prefix: str) -> list[dict[str,
         if isinstance(item, str) and item.strip():
             normalized.append({"id": f"{prefix}-{index}", "text": item.strip()})
         elif isinstance(item, dict):
-            normalized.append(
-                {
-                    "id": require_string(item.get("id"), f"{name}[{index}].id"),
-                    "text": require_string(item.get("text"), f"{name}[{index}].text"),
-                }
-            )
+            normalized_item = {
+                "id": require_string(item.get("id"), f"{name}[{index}].id"),
+                "text": require_string(item.get("text"), f"{name}[{index}].text"),
+            }
+            if "risk_floor" in item:
+                normalized_item["risk_floor"] = normalize_risk_level(
+                    item["risk_floor"], f"{name}[{index}].risk_floor"
+                )
+            normalized.append(normalized_item)
         else:
             raise WorkerError(f"{name}[{index}] must be a string or id/text object")
     ids = [item["id"] for item in normalized]
@@ -375,6 +480,9 @@ def validate_packet(packet: dict[str, Any]) -> dict[str, Any]:
     packet["unit_id"] = require_identifier(
         packet.get("unit_id", packet["task_id"]), "unit_id"
     )
+    packet["feature_id"] = require_identifier(
+        packet.get("feature_id", packet["task_id"]), "feature_id"
+    )
     for field, default in (("attempt", 1), ("plan_revision", 1), ("packet_revision", 1)):
         value = packet.get(field, default)
         if not isinstance(value, int) or value < 1:
@@ -385,9 +493,10 @@ def validate_packet(packet: dict[str, Any]) -> dict[str, Any]:
         raise WorkerError("scope must be an object")
     if source_version == 1 and "read" not in scope:
         scope["read"] = ["."]
-    for field in ("read", "modify", "create", "forbidden"):
+    for field in ("read", "readonly", "modify", "create", "forbidden"):
         values = require_string_list(scope.get(field, []), f"scope.{field}")
         scope[field] = [normalize_scope_path(path) for path in values]
+    scope["read"] = sorted(set(scope["read"] + scope["readonly"]))
     if not scope["read"]:
         raise WorkerError("scope.read must contain at least one readable root")
     if set(scope["modify"]) & set(scope["create"]):
@@ -397,8 +506,13 @@ def validate_packet(packet: dict[str, Any]) -> dict[str, Any]:
             raise WorkerError(f"control path is never writable by Coder: {path}")
         if path_matches_any(path, scope["forbidden"]):
             raise WorkerError(f"writable path is forbidden: {path}")
+        if any(scope_roots_overlap(path, root) for root in scope["readonly"]):
+            raise WorkerError(f"writable path overlaps scope.readonly: {path}")
         if not path_matches_any(path, scope["read"]):
             raise WorkerError(f"writable path is outside scope.read: {path}")
+    for path in scope["readonly"]:
+        if any(scope_roots_overlap(path, root) for root in scope["forbidden"]):
+            raise WorkerError(f"scope.readonly path overlaps scope.forbidden: {path}")
     packet["focused_tests"] = [
         normalize_relative_path(path.split("::", 1)[0])
         + ("::" + path.split("::", 1)[1] if "::" in path else "")
@@ -409,7 +523,10 @@ def validate_packet(packet: dict[str, Any]) -> dict[str, Any]:
         if not path_matches_any(path, scope["read"]):
             raise WorkerError(f"focused test is outside scope.read: {path}")
         if path_matches_any(path, scope["forbidden"]):
-            raise WorkerError(f"focused test is forbidden: {path}")
+            raise WorkerError(
+                f"focused test cannot be forbidden: {path}. If it should be executable but "
+                "not editable, place it in scope.readonly and remove it from scope.forbidden"
+            )
     packet["required_behavior"] = normalize_requirements(
         packet.get("required_behavior"), "required_behavior", "behavior"
     )
@@ -423,6 +540,57 @@ def validate_packet(packet: dict[str, Any]) -> dict[str, Any]:
             for item in packet["acceptance_criteria"]
         ]
     packet["acceptance_scenarios"] = normalize_scenarios(scenario_source)
+    risk = packet.get("risk", {})
+    if not isinstance(risk, dict):
+        raise WorkerError("risk must be an object")
+    feature_risk = normalize_risk_level(
+        risk.get("feature", packet.get("feature_risk", "medium")), "risk.feature"
+    )
+    unit_risk = normalize_risk_level(
+        risk.get("unit", packet.get("unit_risk", feature_risk)), "risk.unit"
+    )
+    integration_risk = normalize_risk_level(
+        risk.get("integration", packet.get("integration_risk", feature_risk)),
+        "risk.integration",
+    )
+    reasons = require_string_list(risk.get("reasons", []), "risk.reasons")
+    packet["dependencies"] = [
+        require_identifier(value, "dependencies item")
+        for value in require_string_list(packet.get("dependencies", []), "dependencies")
+    ]
+    available_contract_ids = {
+        item["id"]
+        for field in ("required_behavior", "acceptance_criteria", "acceptance_scenarios")
+        for item in packet[field]
+    }
+    packet["owned_contract_ids"] = require_string_list(
+        packet.get(
+            "owned_contract_ids", [item["id"] for item in packet["required_behavior"]]
+        ),
+        "owned_contract_ids",
+    )
+    unknown_contracts = sorted(set(packet["owned_contract_ids"]) - available_contract_ids)
+    if unknown_contracts:
+        raise WorkerError(
+            "owned_contract_ids contains unknown ids: " + ", ".join(unknown_contracts)
+        )
+    floors = [
+        item.get("risk_floor", "small")
+        for field in ("required_behavior", "acceptance_criteria", "acceptance_scenarios")
+        for item in packet[field]
+        if item["id"] in packet["owned_contract_ids"]
+    ]
+    required_unit_risk = max(floors, key=RISK_ORDER.get, default="small")
+    if RISK_ORDER[unit_risk] < RISK_ORDER[required_unit_risk]:
+        raise WorkerError(
+            f"risk.unit {unit_risk} is below owned contract risk_floor {required_unit_risk}"
+        )
+    packet["risk"] = {
+        "feature": feature_risk,
+        "unit": unit_risk,
+        "integration": integration_risk,
+        "reasons": reasons,
+    }
     packet["required_order"] = require_string_list(
         packet.get("required_order", []), "required_order"
     )
@@ -489,6 +657,8 @@ class ValidationResult:
     py_compile: dict[str, Any]
     focused_tests: dict[str, Any]
     contract_check: dict[str, Any] | None = None
+    quality_gate: dict[str, Any] | None = None
+    configured_checks: list[dict[str, Any]] | None = None
 
 
 class WorkerRuntime:
@@ -905,7 +1075,10 @@ VALIDATE runs syntax checks and the packet's focused tests. FINISH_SUCCESS is re
 validation passed after the last edit. Before VALIDATE, compare the actual edits against every
 required behavior, required_order, forbidden_ordering, and observable side effect. Do not report
 an empty contract check when requirements are unmet. Do not change unrelated production behavior
-to accommodate an incomplete test double. Previous attempts are context, not authority."""
+to accommodate an incomplete test double. remaining_uncertainty must be an empty array when
+nothing remains unverified; never put success claims in that field. Do not claim a formatter,
+linter, type checker, or other command passed unless its result appears in runtime validation
+evidence. Previous attempts are context, not authority."""
 
     def run(self) -> dict[str, Any]:
         self.deadline = time.monotonic() + self.invocation_timeout
@@ -1482,6 +1655,59 @@ to accommodate an incomplete test double. Previous attempts are context, not aut
                     )
         return issues
 
+    @staticmethod
+    def _line_quality_violations(text: str) -> list[tuple[str, str, int]]:
+        violations: list[tuple[str, str, int]] = []
+        for line_number, line in enumerate(text.splitlines(), 1):
+            if re.search(r"[ \t]+$", line):
+                violations.append(("introduced_trailing_whitespace", line, line_number))
+            if re.match(r"^(?:<{7}|={7}|>{7})(?:\s|$)", line):
+                violations.append(("introduced_conflict_marker", line, line_number))
+        return violations
+
+    def _introduced_text_quality_issues(self) -> list[dict[str, Any]]:
+        issues: list[dict[str, Any]] = []
+        for relative, before_bytes in sorted(self.preimages.items()):
+            resolved = self.repo_root / Path(relative)
+            after_bytes = resolved.read_bytes() if resolved.is_file() else None
+            if before_bytes == after_bytes or after_bytes is None:
+                continue
+            try:
+                before = (before_bytes or b"").decode("utf-8-sig")
+                after = after_bytes.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                continue
+            prior = Counter(
+                (code, content)
+                for code, content, _line in self._line_quality_violations(before)
+            )
+            for code, content, line_number in self._line_quality_violations(after):
+                signature = (code, content)
+                if prior[signature] > 0:
+                    prior[signature] -= 1
+                    continue
+                visible = content.replace("\t", "→\t").replace(" ", "·")
+                issues.append(
+                    {
+                        "code": code,
+                        "path": relative,
+                        "line": line_number,
+                        "visible_content": visible[:500],
+                    }
+                )
+            if after and not after.endswith(("\n", "\r")) and (
+                not before or before.endswith(("\n", "\r"))
+            ):
+                issues.append(
+                    {
+                        "code": "introduced_missing_newline_at_eof",
+                        "path": relative,
+                        "line": len(after.splitlines()) or 1,
+                        "visible_content": "<missing newline at end of file>",
+                    }
+                )
+        return issues
+
     def _validation_observation(self, validation: ValidationResult) -> dict[str, Any]:
         focused = validation.focused_tests
         return {
@@ -1490,6 +1716,8 @@ to accommodate an incomplete test double. Previous attempts are context, not aut
             "repair_count": self.repairs,
             "remaining_repairs": max(0, self.max_repairs - self.repairs),
             "contract_check": validation.contract_check,
+            "quality_gate": validation.quality_gate,
+            "configured_checks": validation.configured_checks or [],
             "syntax": {
                 "status": validation.py_compile.get("status"),
                 "diagnostic": validation.py_compile.get("diagnostic"),
@@ -1510,6 +1738,39 @@ to accommodate an incomplete test double. Previous attempts are context, not aut
         if not python_path.is_file():
             raise WorkerError(f"project Python was not found: {python_path}")
         input_facts_before = self._validation_facts()
+        text_quality_issues = self._introduced_text_quality_issues()
+        if text_quality_issues:
+            quality_gate = {
+                "status": "failed",
+                "stage": "diff_quality",
+                "issues": text_quality_issues,
+            }
+            validation = ValidationResult(
+                "failed",
+                {"status": "not_run"},
+                {
+                    "status": "not_run",
+                    "stage": "diff_quality",
+                    "diagnostic": {
+                        "failed_test_ids": [],
+                        "excerpt": "\n".join(
+                            f"{item['path']}:{item['line']}: {item['code']} "
+                            f"{item['visible_content']}"
+                            for item in text_quality_issues
+                        )[:6000],
+                    },
+                },
+                contract_check,
+                quality_gate,
+            )
+            self.validation = validation
+            self.pending_failed_validation = True
+            self.validated_input_facts = None
+            self.archive.event(
+                "validation_finished",
+                {"status": "failed", "stage": "diff_quality", "edit_revision": self.edit_revision},
+            )
+            return {"status": "failed", "validation": self._validation_observation(validation)}
         test_quality_issues = self._changed_test_quality_issues()
         if test_quality_issues:
             validation = ValidationResult(
@@ -1524,6 +1785,7 @@ to accommodate an incomplete test double. Previous attempts are context, not aut
                     },
                 },
                 contract_check,
+                {"status": "passed", "issues": []},
             )
             self.validation = validation
             self.pending_failed_validation = True
@@ -1559,6 +1821,7 @@ to accommodate an incomplete test double. Previous attempts are context, not aut
                     },
                     {"status": "not_run"},
                     contract_check,
+                    {"status": "passed", "issues": []},
                 )
                 self.validation = validation
                 self.pending_failed_validation = True
@@ -1614,6 +1877,42 @@ to accommodate an incomplete test double. Previous attempts are context, not aut
         if not inputs_unchanged:
             status = "failed"
             test_result["output"] += "\nValidation inputs changed while checks were running."
+        configured_checks: list[dict[str, Any]] = []
+        configured_commands = profile.get("commands", [])
+        if not isinstance(configured_commands, list):
+            raise WorkerError("validation profile commands must be an array")
+        if status == "passed":
+            for index, command in enumerate(configured_commands, 1):
+                if not isinstance(command, dict):
+                    raise WorkerError(f"validation profile commands[{index}] must be an object")
+                check_id = require_identifier(
+                    command.get("id"), f"validation profile commands[{index}].id"
+                )
+                argv = command.get("argv")
+                if not isinstance(argv, list) or not argv or any(
+                    not isinstance(item, str) or not item for item in argv
+                ):
+                    raise WorkerError(
+                        f"validation profile commands[{index}].argv must be a non-empty string array"
+                    )
+                expanded = [
+                    item.replace("{python}", str(python_path)).replace(
+                        "{repo}", str(self.repo_root)
+                    )
+                    for item in argv
+                ]
+                result = self._run_command(expanded)
+                result["diagnostic"] = self._diagnostic(result.get("output", ""))
+                configured_checks.append({"id": check_id, **result})
+                if result["status"] != "passed":
+                    status = "failed"
+                    break
+        final_input_facts = self._validation_facts()
+        if final_input_facts != input_facts_before:
+            status = "failed"
+            inputs_unchanged = False
+            input_facts_after = final_input_facts
+            test_result["output"] += "\nValidation inputs changed while configured checks were running."
         validation = ValidationResult(
             status,
             {"status": "passed", "files": compile_results},
@@ -1625,6 +1924,8 @@ to accommodate an incomplete test double. Previous attempts are context, not aut
                 "input_facts": input_facts_after,
             },
             contract_check,
+            {"status": "passed", "issues": []},
+            configured_checks,
         )
         self.validation = validation
         if status == "passed":
@@ -1641,6 +1942,10 @@ to accommodate an incomplete test double. Previous attempts are context, not aut
                 "edit_revision": self.edit_revision,
                 "tests": junit.get("tests"),
                 "executed": junit.get("executed"),
+                "configured_checks": [
+                    {"id": item["id"], "status": item["status"]}
+                    for item in configured_checks
+                ],
             },
         )
         return {"status": status, "validation": self._validation_observation(validation)}
@@ -1706,6 +2011,7 @@ to accommodate an incomplete test double. Previous attempts are context, not aut
             "status": status,
             "identity": {
                 "task_id": self.packet["task_id"],
+                "feature_id": self.packet["feature_id"],
                 "unit_id": self.packet["unit_id"],
                 "run_id": self.packet["run_id"],
                 "attempt": self.packet["attempt"],
@@ -1714,6 +2020,7 @@ to accommodate an incomplete test double. Previous attempts are context, not aut
                 "source_packet_schema": self.packet["_source_schema_version"],
             },
             "task_id": self.packet["task_id"],
+            "feature_id": self.packet["feature_id"],
             "unit_id": self.packet["unit_id"],
             "run_id": self.packet["run_id"],
             "attempt": self.packet["attempt"],
@@ -1738,8 +2045,25 @@ to accommodate an incomplete test double. Previous attempts are context, not aut
                 "repair_turn_reserve": self.repair_turn_reserve,
                 "first_validation_turn": self.first_validation_turn,
             },
+            "runtime_evidence": {
+                "validation_status": self.validation.status if self.validation else None,
+                "quality_gate": self.validation.quality_gate if self.validation else None,
+                "configured_checks": (
+                    self.validation.configured_checks if self.validation else []
+                ),
+                "changed_file_count": len(changed_files),
+                "changed_paths": [item["path"] for item in changed_files],
+            },
+            "risk": self.packet["risk"],
+            "owned_contract_ids": self.packet["owned_contract_ids"],
+            "dependencies": self.packet["dependencies"],
+            "review_route": {
+                "small": "local_reviewer_then_primary_evidence_acceptance",
+                "medium": "local_reviewer_then_primary_lightweight_review",
+                "high": "local_reviewer_then_primary_full_review",
+            }[self.packet["risk"]["unit"]],
             "next_action_required": {
-                "ready_for_review": "primary_review",
+                "ready_for_review": "local_review",
                 "blocked": "primary_scope_or_environment_decision",
                 "failed": "primary_rework_or_takeover_decision",
                 "interrupted": "primary_inspect_partial_state",
@@ -1776,10 +2100,25 @@ def compact_handoff(report: dict[str, Any]) -> dict[str, Any]:
         if isinstance(item, dict)
     ]
 
+    def clip_sentence(value: Any, chars: int) -> str:
+        text = str(value)
+        if len(text) <= chars:
+            return text
+        room = max(1, chars - len(" ... [truncated]"))
+        prefix = text[:room]
+        matches = list(re.finditer(r"[.!?。！？](?:\s|$)", prefix))
+        if matches and matches[-1].end() >= room // 2:
+            prefix = prefix[: matches[-1].end()].rstrip()
+        else:
+            boundary = prefix.rfind(" ")
+            if boundary >= room // 2:
+                prefix = prefix[:boundary].rstrip()
+        return prefix + " ... [truncated]"
+
     def clipped_strings(values: Any, *, count: int = 6, chars: int = 500) -> list[str]:
         if not isinstance(values, list):
             return []
-        return [str(item)[:chars] for item in values[:count]]
+        return [clip_sentence(item, chars) for item in values[:count]]
 
     compact = {
         "schema_version": report.get("schema_version", 2),
@@ -1788,6 +2127,8 @@ def compact_handoff(report: dict[str, Any]) -> dict[str, Any]:
             key: report.get(key) for key in ("task_id", "unit_id", "run_id", "attempt")
         },
         "changed_files": changed,
+        "risk": report.get("risk"),
+        "review_route": report.get("review_route"),
         "worker_summary": clipped_strings(
             (report.get("worker_claims") or {}).get("summary", report.get("summary", []))
         ),
@@ -1801,12 +2142,14 @@ def compact_handoff(report: dict[str, Any]) -> dict[str, Any]:
             "errors": junit.get("errors"),
             "skipped": junit.get("skipped"),
             "inputs_unchanged": focused.get("inputs_unchanged"),
+            "configured_checks": validation.get("configured_checks") or [],
         },
         "blocked": report.get("blocked"),
         "interruption": report.get("interruption"),
         "failure_reason": report.get("failure_reason"),
         "failure_signature": report.get("failure_signature"),
         "next_action_required": report.get("next_action_required"),
+        "runtime_evidence": report.get("runtime_evidence", {}),
         "evidence_refs": report.get("evidence_refs", {}),
         "remaining_uncertainty": clipped_strings(report.get("remaining_uncertainty", [])),
         "primary_review_checklist": report.get("primary_review_checklist", {}),
@@ -1843,7 +2186,9 @@ def main() -> int:
     args = parser.parse_args()
     repo_root = Path.cwd().resolve()
     try:
-        packet = load_json(Path(args.packet).resolve())
+        packet = resolve_inherited_packet(
+            repo_root, load_json(Path(args.packet).resolve())
+        )
         config = load_json(Path(args.config).resolve())
         client = LMStudioClient(
             require_string(config.get("lmstudio_base_url"), "lmstudio_base_url"),

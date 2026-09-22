@@ -86,10 +86,30 @@ def evaluate_task_state(state: dict[str, Any]) -> dict[str, Any]:
         }
     if latest.get("result") == "ready_for_review":
         return {
-            "decision": "primary_review",
-            "reason": "the worker result is ready for independent Primary review",
+            "decision": "local_review",
+            "reason": "the Coder result passed runtime gates and needs independent Local Reviewer",
             "streaks": {},
         }
+    if latest.get("worker") == "reviewer":
+        if latest.get("result") == "pass_to_primary":
+            route = latest.get("review_route", "primary_full_review")
+            return {
+                "decision": route,
+                "reason": "Local Reviewer passed the unit; apply its risk-routed Primary review",
+                "streaks": {},
+            }
+        if latest.get("result") == "rework":
+            return {
+                "decision": "bounded_coder_rework",
+                "reason": "Local Reviewer produced structured findings for the same unit",
+                "streaks": {},
+            }
+        if latest.get("result") == "escalate":
+            return {
+                "decision": "primary_decision",
+                "reason": "Local Reviewer found architecture or safety uncertainty",
+                "streaks": {},
+            }
     if latest.get("result") in {"blocked", "interrupted"}:
         return {
             "decision": "primary_decision",

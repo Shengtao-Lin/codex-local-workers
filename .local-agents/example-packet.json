@@ -1,20 +1,35 @@
 {
   "schema_version": 2,
   "task_id": "example-01",
+  "feature_id": "example-feature",
   "unit_id": "example-behavior",
   "run_id": "example-01-a1",
   "attempt": 1,
   "plan_revision": 1,
   "packet_revision": 1,
+  "risk": {
+    "feature": "high",
+    "unit": "medium",
+    "integration": "high",
+    "reasons": [
+      "The feature has a sensitive integration boundary, while this unit is locally testable."
+    ]
+  },
+  "dependencies": [],
+  "owned_contract_ids": [
+    "behavior-1"
+  ],
   "goal": "Describe one concrete implementation outcome.",
   "scope": {
     "read": [
       "src",
       "tests"
     ],
-    "modify": [
-      "src/example.py",
+    "readonly": [
       "tests/test_example.py"
+    ],
+    "modify": [
+      "src/example.py"
     ],
     "create": [],
     "forbidden": []
@@ -22,7 +37,8 @@
   "required_behavior": [
     {
       "id": "behavior-1",
-      "text": "State the externally observable behavior."
+      "text": "State the externally observable behavior.",
+      "risk_floor": "medium"
     }
   ],
   "required_order": [

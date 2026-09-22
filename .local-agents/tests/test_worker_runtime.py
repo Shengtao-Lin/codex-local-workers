@@ -307,6 +307,80 @@ class WorkerRuntimeTests(unittest.TestCase):
             0,
         )
 
+    def test_packet_supports_readonly_scope_and_two_level_risk(self) -> None:
+        value = packet_v2()
+        value["feature_id"] = "lease-fencing"
+        value["scope"]["readonly"] = ["tests/test_example.py"]
+        value["risk"] = {
+            "feature": "high",
+            "unit": "medium",
+            "integration": "high",
+            "reasons": ["Feature integration is transaction-sensitive."],
+        }
+        value["required_behavior"][0]["risk_floor"] = "medium"
+        value["owned_contract_ids"] = ["behavior-value"]
+        normalized = RUNTIME.validate_packet(value)
+        self.assertEqual(normalized["risk"]["feature"], "high")
+        self.assertEqual(normalized["risk"]["unit"], "medium")
+        self.assertIn("tests/test_example.py", normalized["scope"]["read"])
+        self.assertIn("tests/test_example.py", normalized["scope"]["readonly"])
+
+    def test_unit_risk_cannot_be_below_owned_contract_floor(self) -> None:
+        value = packet_v2()
+        value["risk"] = {"feature": "high", "unit": "small", "integration": "high"}
+        value["required_behavior"][0]["risk_floor"] = "high"
+        with self.assertRaisesRegex(RUNTIME.WorkerError, "below owned contract risk_floor"):
+            RUNTIME.validate_packet(value)
+
+    def test_readonly_scope_cannot_overlap_writable_scope(self) -> None:
+        value = packet_v2()
+        value["scope"]["readonly"] = ["src"]
+        with self.assertRaisesRegex(RUNTIME.WorkerError, "overlaps scope.readonly"):
+            RUNTIME.validate_packet(value)
+
+    def test_diff_quality_gate_reports_only_introduced_whitespace(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            source = root / "src" / "example.py"
+            source.write_text("OLD = 1  \nVALUE = 1\n", encoding="utf-8")
+            runtime = RUNTIME.WorkerRuntime(
+                root, packet_v2(), {"python": sys.executable}, FakeClient([])
+            )
+            source.write_text("OLD = 1  \nVALUE = 2  \n", encoding="utf-8")
+            issues = runtime._introduced_text_quality_issues()
+            self.assertEqual(len(issues), 1)
+            self.assertEqual(issues[0]["code"], "introduced_trailing_whitespace")
+            self.assertEqual(issues[0]["line"], 2)
+
+    def test_inherited_rework_packet_preserves_parent_contract(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            parent = packet_v2()
+            parent_path = (
+                root / ".agent" / "tasks" / "test-1" / "runs" / "run-1" / "packet.json"
+            )
+            parent_path.parent.mkdir(parents=True)
+            parent_path.write_text(json.dumps(parent), encoding="utf-8")
+            parent_path.with_name("completed.json").write_text(
+                json.dumps({"status": "ready_for_review"}), encoding="utf-8"
+            )
+            child = {
+                "schema_version": 2,
+                "task_id": "test-1",
+                "unit_id": parent["unit_id"],
+                "run_id": "run-2",
+                "packet_revision": parent["packet_revision"] + 1,
+                "parent_run_id": "run-1",
+                "preserve_contract": True,
+                "review_feedback": [{"finding_id": "finding-1", "text": "Fix it."}],
+            }
+            resolved = RUNTIME.resolve_inherited_packet(root, child)
+            self.assertEqual(resolved["goal"], parent["goal"])
+            self.assertEqual(resolved["scope"], parent["scope"])
+            self.assertEqual(resolved["parent_run_id"], "run-1")
+            self.assertIn("parent_packet_sha256", resolved["_inheritance"])
+
     def test_contract_check_and_changed_test_quality_gate(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -414,6 +488,45 @@ class WorkerRuntimeTests(unittest.TestCase):
                 report = runtime.run()
             self.assertEqual(report["status"], "ready_for_review")
             self.assertEqual(report["runtime_facts"]["first_validation_turn"], 4)
+
+    def test_validation_profile_runs_trusted_configured_commands(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            config = {
+                "validation_profiles": {
+                    "python-focused": {
+                        "python": sys.executable,
+                        "compile": True,
+                        "pytest_argv": ["-B", "-m", "pytest"],
+                        "commands": [
+                            {"id": "ruff-check", "argv": ["{python}", "-m", "ruff", "check", "src"]}
+                        ],
+                    }
+                }
+            }
+            runtime = RUNTIME.WorkerRuntime(root, packet_v2(), config, FakeClient([]))
+            runtime.write_lock.acquire()
+            runtime._prepare_run_archive()
+
+            def fake_command(argv: list[str]) -> dict:
+                for item in argv:
+                    if item.startswith("--junitxml="):
+                        Path(item.split("=", 1)[1]).write_text(
+                            '<testsuites><testsuite tests="1" failures="0" errors="0" skipped="0" /></testsuites>',
+                            encoding="utf-8",
+                        )
+                return {"status": "passed", "exit_code": 0, "output": "ok", "argv": argv}
+
+            try:
+                with patch.object(runtime, "_run_command", side_effect=fake_command):
+                    result = runtime.validate({})
+            finally:
+                runtime.close()
+            self.assertEqual(result["status"], "passed")
+            self.assertEqual(
+                result["validation"]["configured_checks"][0]["id"], "ruff-check"
+            )
 
     def test_control_files_are_never_writable(self) -> None:
         value = packet_v2()

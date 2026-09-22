@@ -9,6 +9,7 @@ Required identity fields:
 
 - `schema_version`: `2`
 - `task_id`: stable top-level user task
+- `feature_id`: stable user-visible feature
 - `unit_id`: stable logical work unit across retries
 - `run_id`: unique invocation identity
 - `attempt`: invocation number for the unit
@@ -18,6 +19,7 @@ Required identity fields:
 Scope fields:
 
 - `scope.read`: readable files or directory roots
+- `scope.readonly`: explicit readable/executable paths that cannot be modified
 - `scope.modify`: existing files the Coder may change
 - `scope.create`: new files the Coder may create
 - `scope.forbidden`: paths excluded from reading and writing
@@ -28,6 +30,11 @@ never writable by Coder, even if a packet lists them.
 `required_behavior` and `acceptance_criteria` are arrays of stable `id`/`text`
 objects. `validation_profile` selects a trusted profile from `config.json`;
 workers cannot submit arbitrary shell strings.
+`risk` records independent `feature`, `unit`, and `integration` levels. Primary
+assigns each level as `small`, `medium`, or `high`. `owned_contract_ids` maps the
+unit to its relevant requirements; optional contract `risk_floor` values prevent
+the unit risk from being lower than a critical invariant. `dependencies` names
+other implementation units required before integration.
 `acceptance_scenarios` names the normal, important failure, and boundary cases
 Primary expects to review. Older packets without it receive compatibility
 scenarios derived from their acceptance criteria.
@@ -44,7 +51,8 @@ behavior/acceptance IDs, and the `python-focused` validation profile.
 ## Coder terminal states
 
 - `ready_for_review`: required runtime checks passed after the final worker edit;
-  Primary must still review and accept.
+  the next normal step is independent Local Reviewer, then risk-routed Primary
+  review and acceptance.
 - `blocked`: scope, dependency, environment, requirement, or state prevents safe
   continuation. A requested scope expansion is a proposal, not authorization.
 - `failed`: the invocation did not meet its automatic quality gate within its
@@ -117,6 +125,11 @@ Syntax validation uses Python `compile()` without producing `.pyc` files.
 Focused pytest runs with cache writes disabled and emits JUnit statistics. Zero
 collected tests, all-skipped/all-xfail results, missing JUnit evidence, command
 failure, or relevant input changes during validation all fail the quality gate.
+Before syntax/tests, the runtime rejects newly introduced trailing whitespace,
+conflict markers, and missing final newlines. Historical unchanged violations
+do not fail the unit. Trusted validation profiles may add fixed argument-array
+commands; their exact status is recorded as runtime evidence, and validation
+fails if those commands mutate relevant inputs.
 The runtime snapshots authorized files, focused tests, and observed evidence
 before/after validation and checks them again before `ready_for_review`.
 Validation observations sent back to the model contain a bounded diagnostic
@@ -164,6 +177,38 @@ Coder sampling parameters and its output limit are supplied by trusted config,
 not inherited from the LM Studio GUI. The default output limit is 4096 tokens.
 Structured output may be disabled through trusted config for backend
 compatibility, but doing so restores prompt-only JSON compliance.
+
+## S6 unit risk, inherited rework, and Local Reviewer
+
+Primary decomposes a feature into cohesive implementation units. Feature risk
+does not force every unit to use the same review depth, but atomic high-risk
+invariants remain in one high-risk unit. Small units route from Local Reviewer
+to Primary evidence acceptance, medium units to lightweight Primary review, and
+high units to full Primary diff review. High integration-risk features still
+receive a final cumulative Primary review.
+
+Focused rework may provide only new identity/revision, `parent_run_id`,
+`preserve_contract: true`, and non-empty `review_feedback`. Runtime loads the
+parent canonical packet from the same task/unit and inherits its goal, scope,
+risk, contracts, tests, validation profile, and limits. Other overrides are
+rejected, the child revision must increase, and the parent packet hash is stored
+in inheritance metadata.
+
+Local Reviewer has a separate LM Studio request and fresh context. It can only
+`READ_FILE`, `SEARCH`, and `REPORT`; it cannot edit or execute commands. It
+reviews the actual cumulative diff and runtime evidence, not Coder claims, and
+returns `pass_to_primary`, `rework`, or `escalate`. Immutable review archives
+are stored under:
+
+```text
+.agent/tasks/<task_id>/reviews/<review_id>/
+```
+
+Findings contain stable ids, severity, category, concrete evidence, optional
+file/line, affected owned contract, and a suggested bounded fix. Reviewer usage
+and decisions are appended to task state. Qwen is the default reviewer; an
+alternate model should remain shadow-only until benchmark evidence establishes
+acceptable miss and false-positive rates.
 
 ## Trust boundary
 

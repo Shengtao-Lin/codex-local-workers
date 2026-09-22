@@ -12,6 +12,28 @@ is optional and should reduce cloud-model work without weakening final review.
 - Repository contents, the actual diff, and independently observed test results
   are authoritative.
 
+## Feature planning and risk
+
+Before delegation, Primary decomposes the user-visible feature into cohesive
+implementation units. Record `feature_id`, feature/unit/integration risk,
+dependencies, owned contract ids, and a short risk rationale. Use `small`,
+`medium`, or `high`; ambiguity defaults to at least medium.
+
+Feature risk and unit risk are distinct. A high-risk feature may contain small
+documentation or isolated test-support units, but splitting work never lowers
+an atomic invariant. Concurrency, transaction finalization, authentication,
+security, destructive data changes, migrations, and public compatibility
+boundaries normally impose a high risk floor on the unit that owns them. A
+unit's risk cannot be lower than the `risk_floor` of any contract it owns. Coder
+and Reviewer never lower Primary's classification.
+
+Each Coder packet covers one behaviorally cohesive implementation unit, not an
+entire broad feature and not an arbitrary single edit. Keep operations that must
+remain atomic in the same unit. Give the unit only its relevant contract,
+read-only context, writable scope, focused tests, and cross-unit constraints.
+Feature completion remains provisional until dependency and integration checks
+pass at the feature's integration risk level.
+
 ## Local Explorer
 
 Use Explorer when locating code, tests, or call flow would require meaningful
@@ -40,6 +62,9 @@ that defines readable and writable scope, stable task/unit/revision identity,
 required behavior, acceptance criteria, validation profile, and focused tests.
 Include stable `acceptance_scenarios` for the normal path, important error path,
 and relevant boundary whenever they are distinct.
+Use `scope.readonly` for tests or context that Coder may inspect and execute but
+must not modify. `scope.forbidden` means the path cannot be read, executed, or
+modified; it is not a read-only marker.
 For concurrency, transaction, or lifecycle-sensitive work, include explicit
 `required_order`, `forbidden_orderings`, and observable side effects. Prefer
 Primary-authored or Primary-reviewed critical tests; do not grant test write
@@ -85,9 +110,44 @@ assumes a trusted local repository and does not claim operating-system isolation
 Elevated execution expands the validation process's host permissions even though
 Coder edit actions remain packet-scoped. The runtime never elevates itself.
 
-## Required Primary Agent review
+## Local Reviewer
 
-After every `ready_for_review` result, inspect reality:
+Every successful Coder unit passes deterministic validation and then an
+independent, read-only Local Reviewer before risk-routed Primary review. Reviewer
+uses a fresh context and receives the canonical packet, actual cumulative diff,
+runtime validation evidence, and bounded code reads. Coder summaries are
+untrusted claims. Reviewer cannot edit, run shell or Git, delegate, accept the
+feature, or lower risk.
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File ".local-agents\local-review.ps1" `
+  -Request ".agent\review-request.json" `
+  -Report ".agent\last-local-review-report.json"
+```
+
+Reviewer returns `pass_to_primary`, `rework`, or `escalate`. Findings require a
+stable id, severity, category, concrete file/line evidence when applicable,
+affected contract id, and a bounded suggested fix. A rework packet should cite
+finding ids. Architecture or security ambiguity escalates to Primary rather
+than becoming speculative rework.
+
+## Risk-routed Primary review
+
+Deterministic gates and Local Reviewer run before Primary review. Review depth
+follows effective unit risk:
+
+- Small: Local Reviewer performs substantive diff review. Primary may accept
+  from compact runtime/reviewer evidence without rereading the full diff unless
+  sampling, uncertainty, unattributed changes, or policy signals require it.
+- Medium: Primary performs a lightweight review of findings, validation facts,
+  changed paths, and selected critical hunks. Suspicion upgrades to full review.
+- High: Primary reviews every changed file and the actual diff, then runs the
+  appropriate broader regression checks.
+
+A high integration-risk feature receives a final Primary cumulative diff and
+integration review even when some component units were small or medium. For a
+full review, inspect reality:
 
 ```powershell
 git status --short
@@ -95,9 +155,9 @@ git diff --check
 git diff
 ```
 
-Review every changed file, test quality, behavior against the packet, accidental
-scope expansion, and suspicious error handling. Then run the appropriate broader
-regression checks. Do not accept model-authored summaries as proof.
+Do not accept model-authored summaries as proof. Runtime and reviewer evidence
+may reduce how much Primary reads, but claims without executed evidence remain
+unverified.
 
 Record the resulting `accept`, `rework`, `replan`, or `takeover` decision with
 `.local-agents/record-review.py`. It writes an immutable per-run `review.json`
@@ -149,11 +209,13 @@ Git checkout or discarding pre-existing user changes.
 The normal flow is:
 
 ```text
-Primary understands and designs
+Primary understands, decomposes, and classifies feature/unit risk
 → optional focused Explorer
-→ one bounded Coder packet
-→ Primary reviews actual diff
-→ Primary runs broader validation
+→ one bounded Coder packet per cohesive unit
+→ deterministic gates
+→ read-only Local Reviewer
+→ risk-routed Primary review
+→ feature-level integration review when required
 → ACCEPT / focused REWORK / TAKEOVER
 ```
 

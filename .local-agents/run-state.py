@@ -266,6 +266,8 @@ class RunArchive:
             "result": report.get("status"),
             "model_started": self.model_started,
             "failure_signature": report.get("failure_signature"),
+            "risk": report.get("risk"),
+            "review_route": report.get("review_route"),
             "progress": None,
             "recorded_at": utc_now(),
             "archive": self.run_root.relative_to(self.repo_root).as_posix(),

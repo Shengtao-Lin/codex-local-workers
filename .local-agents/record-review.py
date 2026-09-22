@@ -37,6 +37,34 @@ def load_object(path: Path) -> dict[str, Any]:
     return value
 
 
+def passing_local_review(
+    task_root: Path, task_id: str, unit_id: str, run_id: str
+) -> dict[str, Any] | None:
+    reviews_root = task_root / "reviews"
+    if not reviews_root.is_dir():
+        return None
+    for handoff_path in sorted(reviews_root.glob("*/handoff.json")):
+        try:
+            handoff = load_object(handoff_path)
+        except (OSError, ValueError):
+            continue
+        identity = handoff.get("identity", {})
+        completed_path = handoff_path.with_name("completed.json")
+        try:
+            completed = load_object(completed_path)
+        except (OSError, ValueError):
+            continue
+        if (
+            identity.get("task_id") == task_id
+            and identity.get("unit_id") == unit_id
+            and identity.get("run_id") == run_id
+            and handoff.get("decision") == "pass_to_primary"
+            and completed.get("decision") == "pass_to_primary"
+        ):
+            return handoff
+    return None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Record an immutable Primary review for a Coder run.")
     parser.add_argument("--task-id", required=True)
@@ -66,6 +94,13 @@ def main() -> int:
         unit_id = identity.get("unit_id")
         if not isinstance(unit_id, str):
             raise ValueError("handoff is missing unit identity")
+        local_review = passing_local_review(task_root, task_id, unit_id, run_id)
+        if (
+            args.decision == "accept"
+            and handoff.get("next_action_required") == "local_review"
+            and local_review is None
+        ):
+            raise ValueError("accept requires a passing Local Reviewer report for this run")
         reviews = state.setdefault("reviews", [])
         completed_units = state.setdefault("completed_units", [])
         attempts = state.setdefault("recent_attempts", [])
@@ -79,6 +114,11 @@ def main() -> int:
             "worker_status": completed.get("status"),
             "decision": args.decision,
             "summary": summary,
+            "local_review_id": (
+                (local_review.get("identity") or {}).get("review_id")
+                if local_review is not None
+                else None
+            ),
             "reviewed_at": RUN_STATE.utc_now(),
         }
         RUN_STATE.write_json_once(run_root / "review.json", review)
@@ -101,11 +141,28 @@ def main() -> int:
             "takeover": "takeover",
         }
         for attempt in reversed(attempts):
-            if isinstance(attempt, dict) and attempt.get("run_id") == run_id:
+            if (
+                isinstance(attempt, dict)
+                and attempt.get("run_id") == run_id
+                and attempt.get("worker") == "coder"
+            ):
                 attempt["primary_review"] = args.decision
                 attempt["result"] = result_by_decision[args.decision]
                 attempt["progress"] = True if args.decision == "accept" else False
                 break
+        attempts.append(
+            {
+                "run_id": run_id,
+                "unit_id": unit_id,
+                "worker": "primary",
+                "result": result_by_decision[args.decision],
+                "primary_review": args.decision,
+                "progress": True if args.decision == "accept" else False,
+                "recorded_at": review["reviewed_at"],
+            }
+        )
+        if len(attempts) > 50:
+            del attempts[:-50]
         state["updated_at"] = review["reviewed_at"]
         RUN_STATE.atomic_json(state_path, state)
         RUN_STATE.atomic_json(
