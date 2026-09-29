@@ -1194,6 +1194,37 @@ def test_feature_ready_requires_fresh_integration_archive(
     assert "changed after validation" in json.loads(capsys.readouterr().out)["reason"]
 
 
+def test_feature_inspection_rejects_duplicate_run_refs(
+    plan: dict, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    plan_path = tmp_path / "feature-plan.json"
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "coordinator-localization.py",
+            "--plan",
+            str(plan_path),
+            "--inspect-feature",
+            "--unit-id",
+            "worker-success-finalization",
+            "--run-ref",
+            "worker-success-finalization",
+            "lease-fencing",
+            "lease-a1",
+            "--run-ref",
+            "worker-success-finalization",
+            "lease-fencing",
+            "lease-a2",
+        ],
+    )
+    assert ROUTE.main() == 3
+    assert "duplicate run-ref" in json.loads(capsys.readouterr().out)["reason"]
+    assert not (tmp_path / ".agent").exists()
+
+
 def test_coordinator_memory_is_plan_bound_and_non_authoritative(plan: dict) -> None:
     state = CONTRACT.new_coordinator_state(plan)
     CONTRACT.validate_coordinator_state(plan, state)

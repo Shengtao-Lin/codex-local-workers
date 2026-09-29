@@ -1074,6 +1074,10 @@ supports cohesive-unit decomposition as the next implementation direction;
 it does not erase the unsplit first-call failures or establish the full
 two-round/multi-case release gate. See
 `benchmarks/SAMPLE-IDENTITY-SPLIT-COMPARISON.md`.
+Both archived snapshots can now replay the read-only CLI evidence gate with
+explicit run references; both remained eligible, while a missing or forged
+dependent-unit reference was rejected. This checks evidence freshness and
+identity, not a new model success or autonomous feature acceptance.
 
 Do not deploy the restricted route for unattended live units yet. Its current
 command is an opt-in Primary-supervised implementation slice.

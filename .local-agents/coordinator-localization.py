@@ -464,6 +464,9 @@ def main() -> int:
     parser.add_argument("--recover-terminal", action="store_true")
     parser.add_argument("--authorization", type=Path)
     parser.add_argument("--run-refs", type=Path)
+    parser.add_argument(
+        "--run-ref", nargs=3, action="append", metavar=("UNIT_ID", "TASK_ID", "RUN_ID")
+    )
     parser.add_argument("--config", type=Path, default=Path(__file__).with_name("config.json"))
     parser.add_argument("--state", type=Path)
     parser.add_argument(
@@ -479,14 +482,29 @@ def main() -> int:
     try:
         if sum((args.inspect_only, args.inspect_feature, args.recover_terminal)) > 1:
             parser.error("choose only one inspection or recovery mode")
+        if args.run_ref and not args.inspect_feature:
+            parser.error("--run-ref is only valid with --inspect-feature")
         if args.inspect_feature:
-            if args.unit_id is None or args.run_refs is None:
-                parser.error("--inspect-feature requires --unit-id and --run-refs")
+            if args.unit_id is None or (args.run_refs is None and not args.run_ref):
+                parser.error("--inspect-feature requires --unit-id and archive run references")
+            if args.run_refs is not None and args.run_ref:
+                parser.error("choose either --run-refs or repeated --run-ref")
+            if args.run_refs is not None:
+                run_refs = _object(args.run_refs)
+            else:
+                run_refs = {}
+                for unit_id, task_id, run_id in args.run_ref:
+                    unit_id = CONTRACT.identifier(unit_id, "run-ref unit_id")
+                    task_id = CONTRACT.identifier(task_id, "run-ref task_id")
+                    run_id = CONTRACT.identifier(run_id, "run-ref run_id")
+                    if unit_id in run_refs:
+                        raise ValueError(f"duplicate run-ref unit_id: {unit_id}")
+                    run_refs[unit_id] = {"task_id": task_id, "run_id": run_id}
             CONTRACT.validate_decision_transition(
                 plan,
                 {"decision": "FEATURE_READY", "unit_id": args.unit_id},
                 repo_root=root,
-                run_refs=_object(args.run_refs),
+                run_refs=run_refs,
             )
             print(
                 json.dumps(

@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "benchmarks"))
 SPEC = importlib.util.spec_from_file_location(
-    "sample_identity_split_route", ROOT / "benchmarks" / "sample_identity_split_route.py"
+    "sample_identity_split_route",
+    ROOT / "benchmarks" / "sample_identity_split_route.py",
 )
 assert SPEC is not None and SPEC.loader is not None
 SPLIT = importlib.util.module_from_spec(SPEC)
@@ -18,7 +22,11 @@ SPEC.loader.exec_module(SPLIT)
 def test_split_plan_owns_disjoint_contracts_and_protected_tests() -> None:
     base = {
         "required_behavior": [
-            {"id": f"behavior-{index}", "text": f"Behavior {index}", "risk_floor": "medium"}
+            {
+                "id": f"behavior-{index}",
+                "text": f"Behavior {index}",
+                "risk_floor": "medium",
+            }
             for index in range(1, 5)
         ],
         "acceptance_criteria": [
@@ -44,3 +52,35 @@ def test_split_plan_owns_disjoint_contracts_and_protected_tests() -> None:
             test.startswith(SPLIT.TEST + "::")
             for test in unit["packet_contract"]["required_focused_tests"]
         )
+
+
+def test_split_inspection_replays_both_run_refs_without_writing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    observed = []
+
+    def fake_run(root: Path, argv: list[str], timeout: int) -> SimpleNamespace:
+        observed.append((root, argv, timeout))
+        return SimpleNamespace(
+            returncode=0, stdout=json.dumps({"status": "eligible"}), stderr=""
+        )
+
+    monkeypatch.setattr(SPLIT.STABILITY, "run_command", fake_run)
+    result = SPLIT.inspect_feature(tmp_path)
+    assert result == {"inspection_exit": 0, "inspection": {"status": "eligible"}}
+    assert observed[0][0] == tmp_path
+    assert observed[0][2] == 30
+    argv = observed[0][1]
+    assert "--inspect-feature" in argv
+    assert argv.count("--run-ref") == 2
+    assert argv[-8:] == [
+        "--run-ref",
+        "fingerprint",
+        SPLIT.TASK_ID,
+        "fingerprint-a1",
+        "--run-ref",
+        "reuse-key",
+        SPLIT.TASK_ID,
+        "reuse-key-a1",
+    ]
+    assert list(tmp_path.iterdir()) == []

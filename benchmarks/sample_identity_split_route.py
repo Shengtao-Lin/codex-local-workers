@@ -355,9 +355,30 @@ def verify(root: Path, *, record_integration: bool = False) -> dict:
     return outcomes
 
 
+def inspect_feature(root: Path) -> dict:
+    """Replay the archive-backed gate without modifying a frozen snapshot."""
+    argv = [
+        sys.executable,
+        str(STABILITY.KIT / ".local-agents" / "coordinator-localization.py"),
+        "--plan",
+        str(root / ".agent" / "split-feature-plan.json"),
+        "--inspect-feature",
+        "--unit-id",
+        "reuse-key",
+    ]
+    for unit_id in UNITS:
+        argv.extend(("--run-ref", unit_id, TASK_ID, f"{unit_id}-a1"))
+    result = STABILITY.run_command(root, argv, 30)
+    try:
+        inspection = json.loads(result.stdout)
+    except ValueError:
+        inspection = {"output_tail": (result.stdout + result.stderr)[-1000:]}
+    return {"inspection_exit": result.returncode, "inspection": inspection}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("phase", choices=("first", "second", "verify"))
+    parser.add_argument("phase", choices=("first", "second", "verify", "inspect"))
     parser.add_argument("--workspace", type=Path)
     parser.add_argument("--record-integration", action="store_true")
     args = parser.parse_args()
@@ -370,15 +391,16 @@ def main() -> int:
         result = run_unit(root, "fingerprint")
     else:
         if args.workspace is None:
-            parser.error("second and verify require --workspace")
+            parser.error("second, verify and inspect require --workspace")
         root = args.workspace.resolve()
         if not (root / ".agent" / "split-feature-plan.json").is_file():
             parser.error("workspace has no split feature plan")
-        result = (
-            run_unit(root, "reuse-key")
-            if args.phase == "second"
-            else verify(root, record_integration=args.record_integration)
-        )
+        if args.phase == "second":
+            result = run_unit(root, "reuse-key")
+        elif args.phase == "verify":
+            result = verify(root, record_integration=args.record_integration)
+        else:
+            result = inspect_feature(root)
     print(
         json.dumps(
             {"workspace": str(root), "phase": args.phase, "result": result},
@@ -394,6 +416,8 @@ def main() -> int:
             )
             else 1
         )
+    if args.phase == "inspect":
+        return 0 if result["inspection_exit"] == 0 else 1
     return (
         0
         if result.get("route_exit") == 0 and result["independent_focused_passed"]
