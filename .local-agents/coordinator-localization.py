@@ -455,10 +455,12 @@ def recover_terminal_failed_unit(
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--plan", type=Path, required=True)
-    parser.add_argument("--packet", type=Path, required=True)
+    parser.add_argument("--packet", type=Path)
     parser.add_argument("--request", type=Path)
     parser.add_argument("--explorer-report", type=Path)
     parser.add_argument("--inspect-only", action="store_true")
+    parser.add_argument("--inspect-feature", action="store_true")
+    parser.add_argument("--unit-id")
     parser.add_argument("--recover-terminal", action="store_true")
     parser.add_argument("--authorization", type=Path)
     parser.add_argument("--run-refs", type=Path)
@@ -475,8 +477,31 @@ def main() -> int:
     plan = _object(args.plan)
     state_path = args.state or root / ".agent" / "coordinator" / plan["feature_id"] / "state.json"
     try:
-        if args.inspect_only and args.recover_terminal:
-            parser.error("choose either --inspect-only or --recover-terminal")
+        if sum((args.inspect_only, args.inspect_feature, args.recover_terminal)) > 1:
+            parser.error("choose only one inspection or recovery mode")
+        if args.inspect_feature:
+            if args.unit_id is None or args.run_refs is None:
+                parser.error("--inspect-feature requires --unit-id and --run-refs")
+            CONTRACT.validate_decision_transition(
+                plan,
+                {"decision": "FEATURE_READY", "unit_id": args.unit_id},
+                repo_root=root,
+                run_refs=_object(args.run_refs),
+            )
+            print(
+                json.dumps(
+                    {
+                        "status": "eligible_for_primary_final_review",
+                        "feature_id": plan["feature_id"],
+                        "primary_plan_sha256": CONTRACT.authority_fingerprint(plan),
+                        "next_action_required": "primary_final_review_and_explicit_decision",
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 0
+        if args.packet is None:
+            parser.error("dispatch, --inspect-only and --recover-terminal require --packet")
         if args.inspect_only:
             result = inspect_running_dispatch(
                 repo_root=root,

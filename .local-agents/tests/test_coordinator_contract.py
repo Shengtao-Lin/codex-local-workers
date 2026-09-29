@@ -4,6 +4,7 @@ import copy
 import hashlib
 import importlib.util
 import json
+import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -375,6 +376,81 @@ def test_restricted_route_rejects_semantic_capability_before_state_write(
                 unit_runner=unexpected_unit,
             )
         assert not state_path.exists()
+
+
+def test_restricted_route_rejects_missing_or_forged_dependency_before_dispatch(
+    packet_pair: tuple[dict, dict],
+) -> None:
+    plan, packet = packet_pair
+    prerequisite = copy.deepcopy(plan["units"][0])
+    prerequisite["unit_id"] = "prerequisite"
+    prerequisite["owned_contract_ids"] = ["behavior-2"]
+    prerequisite["dependencies"] = []
+    prerequisite["scope_authority"]["modify"] = ["src/prerequisite.py"]
+    plan["contracts"].append(
+        {"id": "behavior-2", "risk_floor": "high", "text": "Prerequisite is reviewed."}
+    )
+    plan["units"].append(prerequisite)
+    plan["units"][0]["dependencies"] = ["prerequisite"]
+    packet["dependencies"] = ["prerequisite"]
+    packet["primary_plan_sha256"] = CONTRACT.authority_fingerprint(plan)
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        source = root / "src" / "example.py"
+        source.parent.mkdir()
+        source.write_text("def target():\n    return 1\n", encoding="utf-8")
+        packet_path = root / "packet.json"
+        packet_path.write_text(json.dumps(packet), encoding="utf-8")
+        state_path = root / ".agent" / "coordinator" / "state.json"
+        request = {
+            "capability": "localization_only",
+            "task_id": packet["task_id"],
+            "unit_id": packet["unit_id"],
+            "question": "Where is target defined?",
+        }
+        report = {
+            "status": "success",
+            "explorer_mode": "locate",
+            "semantic_verdict": "not_evaluated",
+            "task": request["question"],
+            "task_id": packet["task_id"],
+            "uncertainties": [],
+            "source_refs": [
+                {
+                    "path": "src/example.py",
+                    "start_line": 1,
+                    "end_line": 1,
+                    "kind": "definition",
+                    "source_hash": hashlib.sha256(source.read_bytes()).hexdigest(),
+                    "quote": "def target():",
+                }
+            ],
+        }
+
+        def unexpected_unit(*_args: object) -> tuple[int, dict]:
+            raise AssertionError("Coder must not launch without Primary acceptance")
+
+        def route(run_refs: dict) -> None:
+            ROUTE.run_localization_unit(
+                repo_root=root,
+                plan=plan,
+                packet_path=packet_path,
+                request=request,
+                explorer_report=report,
+                state_path=state_path,
+                run_refs=run_refs,
+                config_path=root / "config.json",
+                coder_report_path=root / "coder.json",
+                review_report_path=root / "review.json",
+                unit_runner=unexpected_unit,
+            )
+
+        with pytest.raises(ValueError, match="dependencies are not accepted"):
+            route({})
+        with pytest.raises(FileNotFoundError):
+            route({"prerequisite": {"task_id": packet["task_id"], "run_id": "fake-a1"}})
+        assert not state_path.exists()
+        assert not (root / ".agent" / "coordinator" / plan["feature_id"] / "dispatches").exists()
 
 
 def test_route_crash_records_infra_and_requires_primary_recovery(
@@ -1006,7 +1082,9 @@ def test_primary_owned_unit_uses_fixed_plan_bound_review(plan: dict, tmp_path: P
         CONTRACT.accepted_units_from_archives(plan, tmp_path, {unit_id: {}})
 
 
-def test_feature_ready_requires_fresh_integration_archive(plan: dict, tmp_path: Path) -> None:
+def test_feature_ready_requires_fresh_integration_archive(
+    plan: dict, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
     plan["units"] = plan["units"][:1]
     plan["contracts"] = plan["contracts"][:1]
     unit_id = "lease-test-support"
@@ -1056,6 +1134,30 @@ def test_feature_ready_requires_fresh_integration_archive(plan: dict, tmp_path: 
         CONTRACT.validate_decision_transition(plan, decision, repo_root=tmp_path, run_refs=refs)
         == decision
     )
+    plan_path = tmp_path / "feature-plan.json"
+    refs_path = tmp_path / "run-refs.json"
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
+    refs_path.write_text(json.dumps(refs), encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "coordinator-localization.py",
+            "--plan",
+            str(plan_path),
+            "--inspect-feature",
+            "--unit-id",
+            unit_id,
+            "--run-refs",
+            str(refs_path),
+        ],
+    )
+    assert ROUTE.main() == 0
+    inspection = json.loads(capsys.readouterr().out)
+    assert inspection["status"] == "eligible_for_primary_final_review"
+    assert inspection["next_action_required"] == "primary_final_review_and_explicit_decision"
+    assert not (tmp_path / ".agent" / "coordinator" / plan["feature_id"]).exists()
     ready_state = CONTRACT.apply_coordinator_decision(
         plan,
         CONTRACT.new_coordinator_state(plan),
@@ -1088,6 +1190,8 @@ def test_feature_ready_requires_fresh_integration_archive(plan: dict, tmp_path: 
     source.write_text("assert False\n", encoding="utf-8")
     with pytest.raises(ValueError, match="changed after validation"):
         CONTRACT.validate_decision_transition(plan, decision, repo_root=tmp_path, run_refs=refs)
+    assert ROUTE.main() == 3
+    assert "changed after validation" in json.loads(capsys.readouterr().out)["reason"]
 
 
 def test_coordinator_memory_is_plan_bound_and_non_authoritative(plan: dict) -> None:
