@@ -1045,7 +1045,7 @@ def localization_has_relevant_evidence(
         expected = " ".join(mutation.after.split())
         if not any(
             ref.get("path") == mutation.target
-            and ref.get("kind") == "implementation"
+            and ref.get("kind") in {"implementation", "definition"}
             and expected in " ".join(str(ref.get("quote", "")).split())
             for ref in refs
         ):
