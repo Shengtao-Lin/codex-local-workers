@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "candidate_id": "v2.1-localization-route-split-1",
+  "candidate_id": "v2.1-localization-route-split-2",
   "capability": "localization_only_primary_supervised",
   "question_version": 2,
   "rounds": 2,
