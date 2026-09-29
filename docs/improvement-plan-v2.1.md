@@ -1079,6 +1079,15 @@ explicit run references; both remained eligible, while a missing or forged
 dependent-unit reference was rejected. This checks evidence freshness and
 identity, not a new model success or autonomous feature acceptance.
 
+Subsequent unknown-location route cells added three distinct behavior types:
+random seed zero, metadata-key length, and percentage selection. Each passed
+Explorer, first-call Coder, Reviewer, independent checks, and Primary review.
+The route runner now fingerprints runtime code, role config, Python version,
+and case input; strict summary rejects mixed or mid-run-changed provenance.
+Only the third cell used that manifest, so these results remain observational
+and do not substitute for the two-round/multi-case gate. See
+`benchmarks/LOCALIZATION-ROUTE-EXPANSION-V2.md`.
+
 Do not deploy the restricted route for unattended live units yet. Its current
 command is an opt-in Primary-supervised implementation slice.
 

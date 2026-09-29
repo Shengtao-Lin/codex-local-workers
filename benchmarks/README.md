@@ -99,6 +99,15 @@ diagnostic, not a measured miss rate or proof of general review reliability.
 
 ## S5 baseline benchmark
 
+For a future restricted-localization route cohort, run each frozen case with
+`python benchmarks/localization_route_smoke.py --case <name> --unknown-location`.
+Summarize explicitly selected `route-result.json` files with
+`python benchmarks/localization_route_summary.py <results...> --require-frozen-manifest`.
+The strict option rejects missing or mixed runtime/config provenance, changed
+runtime files during a cell, and changed inputs for repeated attempts of one
+case. It does not itself establish the 11+ type/two-round release gate or
+authenticate model weights behind a local model ID.
+
 Copy `config.example.json` to the ignored `config.local.json` and set its
 trusted Python interpreter before running local workers. Generated task
 workspaces and detailed local results are intentionally ignored; the aggregate

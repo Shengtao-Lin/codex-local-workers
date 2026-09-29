@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from collections import defaultdict
 from pathlib import Path
@@ -13,6 +14,13 @@ def read_json(path: Path) -> dict:
     if not isinstance(value, dict):
         raise TypeError(f"expected a JSON object: {path}")
     return value
+
+
+def manifest_hash(manifest: dict) -> str:
+    encoded = json.dumps(
+        manifest, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def rework_runs(workspace: Path, case: str) -> list[dict]:
@@ -75,13 +83,17 @@ def rework_runs(workspace: Path, case: str) -> list[dict]:
     return sorted(observations, key=lambda item: item["attempt"])
 
 
-def summarize(results: list[dict], *, question_version: int) -> dict:
+def summarize(
+    results: list[dict], *, question_version: int, require_frozen_manifest: bool = False
+) -> dict:
     if not results:
         raise ValueError("at least one route result is required")
     workspaces = set()
     by_case: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
     counts: dict[str, int] = defaultdict(int)
     cells = []
+    runtime_sha256: str | None = None
+    case_input_sha256: dict[str, str] = {}
     for item in results:
         workspace = Path(item["workspace"]).resolve()
         case = item["case"]
@@ -96,6 +108,30 @@ def summarize(results: list[dict], *, question_version: int) -> dict:
             raise ValueError(
                 "mixed or missing question versions cannot form one cohort"
             )
+        if require_frozen_manifest:
+            provenance = item.get("provenance")
+            if not isinstance(provenance, dict):
+                raise ValueError("frozen cohort requires provenance for every cell")
+            runtime_hash = provenance.get("runtime_sha256")
+            case_hash = provenance.get("case_input_sha256")
+            manifest = provenance.get("runtime_manifest")
+            if (
+                not isinstance(runtime_hash, str)
+                or not isinstance(case_hash, str)
+                or len(case_hash) != 64
+                or not isinstance(manifest, dict)
+                or runtime_hash != manifest_hash(manifest)
+                or item.get("runtime_changed_during_run") is not False
+            ):
+                raise ValueError(
+                    "frozen cohort has incomplete or changed runtime provenance"
+                )
+            if runtime_sha256 is not None and runtime_hash != runtime_sha256:
+                raise ValueError("frozen cohort mixes runtime or role configuration")
+            if case in case_input_sha256 and case_hash != case_input_sha256[case]:
+                raise ValueError(f"frozen cohort changes the input for case: {case}")
+            runtime_sha256 = runtime_hash
+            case_input_sha256[case] = case_hash
         route = item.get("route") or {}
         unit = route.get("unit_result") or {}
         review_attempts = unit.get("review_attempts") or []
@@ -151,6 +187,8 @@ def summarize(results: list[dict], *, question_version: int) -> dict:
     return {
         "assessment": "observational_only_not_v1_2_or_v2_1_gate",
         "question_version": question_version,
+        "frozen_manifest_checked": require_frozen_manifest,
+        "runtime_sha256": runtime_sha256,
         "attempts": len(cells),
         "distinct_cases": len(by_case),
         "counts": dict(counts),
@@ -163,11 +201,13 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("results", nargs="+", type=Path)
     parser.add_argument("--question-version", type=int, default=2)
+    parser.add_argument("--require-frozen-manifest", action="store_true")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     summary = summarize(
         [read_json(path) for path in args.results],
         question_version=args.question_version,
+        require_frozen_manifest=args.require_frozen_manifest,
     )
     rendered = json.dumps(summary, ensure_ascii=False, indent=2) + "\n"
     if args.output is not None:

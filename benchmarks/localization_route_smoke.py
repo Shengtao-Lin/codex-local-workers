@@ -4,11 +4,43 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import sys
 import uuid
+from dataclasses import asdict
 
 import stability_e2e as STABILITY
+
+
+def _sha256_json(value: object) -> str:
+    encoded = json.dumps(
+        value, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def runtime_manifest(config: dict) -> dict:
+    """Bind a route cell to the kit code, role config, and Python version."""
+    paths = [
+        STABILITY.KIT / "benchmarks" / "stability_e2e.py",
+        STABILITY.KIT / "benchmarks" / "localization_route_smoke.py",
+        *(STABILITY.KIT / ".local-agents").glob("*.py"),
+        *(STABILITY.KIT / ".local-agents").glob("*.ps1"),
+    ]
+    files = {
+        path.relative_to(STABILITY.KIT).as_posix(): hashlib.sha256(
+            path.read_bytes()
+        ).hexdigest()
+        for path in sorted(paths)
+    }
+    manifest = {
+        "schema_version": 1,
+        "files": files,
+        "role_config_sha256": _sha256_json(config),
+        "python_version": list(sys.version_info[:3]),
+    }
+    return {"runtime_sha256": _sha256_json(manifest), "runtime_manifest": manifest}
 
 
 def primary_plan_for_packet(packet: dict) -> dict:
@@ -69,6 +101,7 @@ def main() -> int:
         )
     )
     source_config["explorer_mode"] = "locate"
+    provenance = runtime_manifest(source_config)
     variant = "unknown" if args.unknown_location else "known"
     root = STABILITY.WORK / f"route-{variant}-{uuid.uuid4().hex[:12]}" / case.name
     config_path, packet_path = STABILITY.prepare(case, root, source_config)
@@ -124,6 +157,13 @@ def main() -> int:
         )
     else:
         question = STABILITY.explorer_task(case, test_path, "locate")
+    provenance["case_input_sha256"] = _sha256_json(
+        {
+            "case": asdict(case),
+            "question": question,
+            "unknown_location": args.unknown_location,
+        }
+    )
     request_path = root / ".agent" / "localization-request.json"
     STABILITY.write_json(
         request_path,
@@ -191,6 +231,11 @@ def main() -> int:
             "independent_format_passed": None,
             "independent_lint_passed": None,
             "qualified_pass": False,
+            "provenance": provenance,
+            "runtime_changed_during_run": (
+                runtime_manifest(source_config)["runtime_sha256"]
+                != provenance["runtime_sha256"]
+            ),
         }
         STABILITY.write_json(root / "route-result.json", result)
         print(json.dumps(result, ensure_ascii=False))
@@ -243,6 +288,11 @@ def main() -> int:
         "independent_tests_passed": independent.returncode == 0,
         "independent_format_passed": fmt.returncode == 0,
         "independent_lint_passed": lint.returncode == 0,
+        "provenance": provenance,
+        "runtime_changed_during_run": (
+            runtime_manifest(source_config)["runtime_sha256"]
+            != provenance["runtime_sha256"]
+        ),
     }
     result["qualified_pass"] = (
         result["baseline_failed"]
@@ -252,6 +302,7 @@ def main() -> int:
         and result["independent_tests_passed"]
         and result["independent_format_passed"]
         and result["independent_lint_passed"]
+        and not result["runtime_changed_during_run"]
     )
     STABILITY.write_json(root / "route-result.json", result)
     print(json.dumps(result, ensure_ascii=False))
