@@ -1088,25 +1088,42 @@ finding or concluding the current question is answered."""
                         or str(exc).startswith("citations.")
                     )
                 ):
-                    self.finish_repair_pending = True
-                    self.finish_repair_used = True
-                    observation["next_step"] = (
-                        "Correct FINISH_SUCCESS now. Supply citations as objects with "
-                        "path, integer line, and claim, one for every path named in the "
-                        "error. claim must be a nonempty string explaining that observed "
-                        "line, not a field named text or quote. Use only lines from "
-                        "READ_FILE. Do not read or search again."
-                    )
-                    if self.mode == "locate":
-                        observation["next_step"] = (
-                            "Correct FINISH_SUCCESS once using only source_refs and uncertainties. "
-                            "Each reference needs path, integer start_line/end_line, and kind "
-                            "implementation/test/caller/definition. Use already read lines. "
-                            "Both limits apply together: at most 6 references AND at most 80 "
-                            "total lines, summing end_line - start_line + 1 for every reference. "
-                            "Keep controlling values and relevant assertions; omit optional "
-                            "context ranges rather than citing whole files."
+                    needs_read = self.mode == "locate" and (
+                        str(exc).startswith("source_refs contain unread lines:")
+                        or (
+                            str(exc).startswith("source_refs missing required paths:")
+                            and any(
+                                path.strip() not in self.read_files
+                                for path in str(exc).split(":", 1)[1].split(",")
+                            )
                         )
+                    )
+                    if needs_read:
+                        observation["next_step"] = (
+                            "READ_FILE the missing source/test lines named in the error, "
+                            "then retry FINISH_SUCCESS with observed line ranges. "
+                            "A SEARCH hit alone is not a cited read."
+                        )
+                    else:
+                        self.finish_repair_pending = True
+                        self.finish_repair_used = True
+                        observation["next_step"] = (
+                            "Correct FINISH_SUCCESS now. Supply citations as objects with "
+                            "path, integer line, and claim, one for every path named in the "
+                            "error. claim must be a nonempty string explaining that observed "
+                            "line, not a field named text or quote. Use only lines from "
+                            "READ_FILE. Do not read or search again."
+                        )
+                        if self.mode == "locate":
+                            observation["next_step"] = (
+                                "Correct FINISH_SUCCESS once using only source_refs and uncertainties. "
+                                "Each reference needs path, integer start_line/end_line, and kind "
+                                "implementation/test/caller/definition. Use already read lines. "
+                                "Both limits apply together: at most 6 references AND at most 80 "
+                                "total lines, summing end_line - start_line + 1 for every reference. "
+                                "Keep controlling values and relevant assertions; omit optional "
+                                "context ranges rather than citing whole files."
+                            )
                 if self.protocol_errors >= self.max_protocol_errors:
                     self.diagnostic_event(
                         "turn",
@@ -1184,7 +1201,11 @@ finding or concluding the current question is answered."""
                     )
                 )
             observation["remaining_model_turns"] = self.max_turns - _turn - 1
-            if observation["remaining_model_turns"] <= 2 and not self.finish_repair_pending:
+            if (
+                observation["remaining_model_turns"] <= 2
+                and not self.finish_repair_pending
+                and "next_step" not in observation
+            ):
                 observation["next_step"] = (
                     "Finish now with evidence or explicit uncertainty. "
                     "Do not start another broad search."
@@ -1784,6 +1805,15 @@ finding or concluding the current question is answered."""
         missing = {normalize_relative_path(path) for path in required} - present
         if missing:
             raise ExplorerError("source_refs missing required paths: " + ", ".join(sorted(missing)))
+        if self.config.get("explorer_require_test_assertion_citation", False):
+            if not any(
+                ref["kind"] == "test"
+                and ("assert " in ref["quote"] or "pytest.raises(" in ref["quote"])
+                for ref in materialized
+            ):
+                raise ExplorerError(
+                    "source_refs need a read test assertion line (assert or pytest.raises)"
+                )
         report = self.report(
             "success",
             relevant_files=[

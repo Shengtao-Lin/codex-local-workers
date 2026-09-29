@@ -145,6 +145,59 @@ class RepeatedMalformedAfterEvidenceClient:
         )
 
 
+class LocateEvidenceRepairClient:
+    def __init__(self) -> None:
+        self.native_tools = RUNTIME.EXPLORER_TOOLS
+        self.native_tool_choice = "auto"
+        self.allowed_tools: list[list[str]] = []
+
+    def complete(self, _messages: list[dict[str, str]]) -> str:
+        self.allowed_tools.append([tool["function"]["name"] for tool in self.native_tools])
+        step = len(self.allowed_tools)
+        if step == 1:
+            return json.dumps(
+                {
+                    "action": "FINISH_SUCCESS",
+                    "source_refs": [
+                        {
+                            "path": "greeting.py",
+                            "start_line": 1,
+                            "end_line": 1,
+                            "kind": "implementation",
+                        }
+                    ],
+                    "uncertainties": [],
+                }
+            )
+        if step <= 3:
+            return json.dumps(
+                {
+                    "action": "READ_FILE",
+                    "path": "greeting.py" if step == 2 else "tests/test_greeting.py",
+                }
+            )
+        return json.dumps(
+            {
+                "action": "FINISH_SUCCESS",
+                "source_refs": [
+                    {
+                        "path": "greeting.py",
+                        "start_line": 1,
+                        "end_line": 1,
+                        "kind": "implementation",
+                    },
+                    {
+                        "path": "tests/test_greeting.py",
+                        "start_line": 2,
+                        "end_line": 2,
+                        "kind": "test",
+                    },
+                ],
+                "uncertainties": [],
+            }
+        )
+
+
 class ExplorerRuntimeTests(unittest.TestCase):
     def test_globstar_does_not_hide_root_level_test_directory(self) -> None:
         with TemporaryDirectory() as directory:
@@ -251,6 +304,59 @@ class ExplorerRuntimeTests(unittest.TestCase):
                 RUNTIME.ExplorerRuntime(
                     root, "Locate.", {"explorer_mode": "typo"}, AdaptiveExplorerClient()
                 )
+
+    def test_localization_unread_finish_can_read_before_terminal_retry(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            (root / "tests" / "test_greeting.py").write_text(
+                "from greeting import build_greeting\nassert build_greeting() is None\n",
+                encoding="utf-8",
+            )
+            client = LocateEvidenceRepairClient()
+            runtime = RUNTIME.ExplorerRuntime(
+                root,
+                "Locate implementation and assertion.",
+                {
+                    "explorer_mode": "locate",
+                    "explorer_required_citation_paths": ["tests/test_greeting.py"],
+                    "explorer_require_test_assertion_citation": True,
+                },
+                client,
+            )
+            report = runtime.run()
+            self.assertEqual(report["status"], "success")
+            self.assertEqual(report["budget_usage"]["protocol_errors"], 1)
+            self.assertIn("READ_FILE", client.allowed_tools[1])
+            self.assertFalse(runtime.finish_repair_used)
+
+    def test_localization_requires_actual_test_assertion_citation_when_configured(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            (root / "tests" / "test_greeting.py").write_text(
+                "from greeting import build_greeting\nassert build_greeting() is None\n",
+                encoding="utf-8",
+            )
+            runtime = RUNTIME.ExplorerRuntime(
+                root,
+                "Locate implementation and assertion.",
+                {"explorer_mode": "locate", "explorer_require_test_assertion_citation": True},
+                FailIfCalledClient(),
+            )
+            runtime.read_file({"path": "greeting.py"})
+            runtime.read_file({"path": "tests/test_greeting.py"})
+            refs = [
+                {"path": "greeting.py", "start_line": 1, "end_line": 1, "kind": "implementation"},
+                {"path": "tests/test_greeting.py", "start_line": 1, "end_line": 1, "kind": "test"},
+            ]
+            with self.assertRaisesRegex(RUNTIME.ExplorerError, "test assertion line"):
+                runtime.finish_success({"source_refs": refs, "uncertainties": []})
+            refs[1]["start_line"] = refs[1]["end_line"] = 2
+            self.assertEqual(
+                runtime.finish_success({"source_refs": refs, "uncertainties": []})["status"],
+                "success",
+            )
 
     def test_citation_shape_recovery_is_one_shot_and_enforced_before_dispatch(self) -> None:
         for repair_action in ("FINISH_SUCCESS", "READ_FILE"):

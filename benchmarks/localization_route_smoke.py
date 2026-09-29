@@ -145,6 +145,7 @@ def main() -> int:
     if args.unknown_location:
         config = json.loads(config_path.read_text(encoding="utf-8"))
         config["explorer_required_citation_paths"] = [test_path]
+        config["explorer_require_test_assertion_citation"] = True
         STABILITY.write_json(config_path, config)
         symbols = (
             "content_fingerprint and score_reuse_key"

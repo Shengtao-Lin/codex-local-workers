@@ -122,7 +122,7 @@ def test_tied_timestamp_is_deterministic():
         '    metadata_value = output_mapping.get("metadata", {})\n',
         "    metadata_value = {}\n",
         "def messages_output",
-        "Mapping-shaped adapter output must preserve metadata entries while still validating message payloads and rejecting non-mapping metadata.",
+        "Mapping-shaped adapter output must preserve metadata entries, default omitted metadata to an empty mapping, and still validate message payloads and reject non-mapping metadata.",
         """import pytest
 
 from agent_runtime.adapters.mapping import messages_output
@@ -135,6 +135,11 @@ def test_mapping_preserves_metadata():
     result = messages_output({"messages": [MESSAGE], "metadata": {"latency_ms": 7}}, None)
     assert result.messages[0].role == "assistant"
     assert result.metadata == {"latency_ms": 7}
+
+
+def test_omitted_metadata_defaults_to_empty_mapping():
+    result = messages_output({"messages": [MESSAGE]}, None)
+    assert result.metadata == {}
 
 
 def test_nonmapping_metadata_rejected():

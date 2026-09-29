@@ -191,6 +191,7 @@ def prepare() -> Path:
         STABILITY.write_json(root / ".agent" / f"split-{unit_id}-packet.json", packet)
         config = read_json(config_path)
         config["explorer_required_citation_paths"] = [TEST]
+        config["explorer_require_test_assertion_citation"] = True
         STABILITY.write_json(root / ".agent" / f"split-{unit_id}-config.json", config)
     baseline = STABILITY.run_command(
         root, [sys.executable, "-m", "pytest", TEST, "-q"], 90

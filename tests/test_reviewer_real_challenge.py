@@ -60,3 +60,15 @@ def test_metadata_variant_requires_prefixed_key_branch(tmp_path: Path) -> None:
         source,
         "metadata",
     )
+
+
+def test_clean_control_requires_pass_without_findings() -> None:
+    assert CHALLENGE.clean_control_passed(
+        {"decision": "pass_to_primary", "findings": []}
+    )
+    assert not CHALLENGE.clean_control_passed({"decision": "rework", "findings": []})
+    assert not CHALLENGE.clean_control_passed(
+        {"decision": "pass_to_primary", "findings": [{"id": "spurious"}]}
+    )
+    for key in ("", "a" * 128, "a" * 129):
+        assert (not key or len(key) > 128) == (not key or 128 < len(key))
