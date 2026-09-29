@@ -12,8 +12,10 @@ import importlib.util
 import json
 import sys
 import uuid
+from dataclasses import asdict
 from pathlib import Path
 
+import localization_route_smoke as ROUTE
 import stability_e2e as STABILITY
 
 CASE = next(case for case in STABILITY.CASES if case.name == "sample-identity")
@@ -131,11 +133,33 @@ def feature_plan(base_packet: dict) -> dict:
     }
 
 
+def split_provenance() -> dict:
+    source_config = read_json(STABILITY.KIT / ".local-agents" / "config.json")
+    source_config["explorer_mode"] = "locate"
+    return {
+        **ROUTE.runtime_manifest(source_config),
+        "case_input_sha256": ROUTE._sha256_json(
+            {"case": asdict(CASE), "units": UNITS, "variant": "dependent-split"}
+        ),
+    }
+
+
+def require_frozen_provenance(root: Path) -> None:
+    recorded = read_json(root / ".agent" / "split-provenance.json")
+    current = split_provenance()
+    if (
+        recorded.get("runtime_sha256") != current["runtime_sha256"]
+        or recorded.get("case_input_sha256") != current["case_input_sha256"]
+    ):
+        raise ValueError("split fixture runtime, role config, or case input changed")
+
+
 def prepare() -> Path:
     source_config = read_json(STABILITY.KIT / ".local-agents" / "config.json")
     source_config["explorer_mode"] = "locate"
     root = STABILITY.WORK / f"route-split-{uuid.uuid4().hex[:12]}" / CASE.name
     config_path, packet_path = STABILITY.prepare(CASE, root, source_config)
+    STABILITY.write_json(root / ".agent" / "split-provenance.json", split_provenance())
     base_packet = read_json(packet_path)
     plan = feature_plan(base_packet)
     contracts = plan["contracts"]
@@ -182,6 +206,7 @@ def prepare() -> Path:
 
 
 def run_unit(root: Path, unit_id: str) -> dict:
+    require_frozen_provenance(root)
     choice = UNITS[unit_id]
     plan_path = root / ".agent" / "split-feature-plan.json"
     if unit_id == "reuse-key":
@@ -281,6 +306,7 @@ def run_unit(root: Path, unit_id: str) -> dict:
 
 
 def verify(root: Path, *, record_integration: bool = False) -> dict:
+    require_frozen_provenance(root)
     outcomes = {}
     checks = []
     for name, argv in {

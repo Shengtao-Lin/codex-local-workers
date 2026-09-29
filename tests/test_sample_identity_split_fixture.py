@@ -84,3 +84,14 @@ def test_split_inspection_replays_both_run_refs_without_writing(
         "reuse-key-a1",
     ]
     assert list(tmp_path.iterdir()) == []
+
+
+def test_split_phases_reject_changed_frozen_provenance(tmp_path: Path) -> None:
+    path = tmp_path / ".agent" / "split-provenance.json"
+    SPLIT.STABILITY.write_json(path, SPLIT.split_provenance())
+    SPLIT.require_frozen_provenance(tmp_path)
+    changed = SPLIT.read_json(path)
+    changed["case_input_sha256"] = "0" * 64
+    SPLIT.STABILITY.write_json(path, changed)
+    with pytest.raises(ValueError, match="runtime, role config, or case input changed"):
+        SPLIT.require_frozen_provenance(tmp_path)

@@ -24,7 +24,9 @@ def runtime_manifest(config: dict) -> dict:
     """Bind a route cell to the kit code, role config, and Python version."""
     paths = [
         STABILITY.KIT / "benchmarks" / "stability_e2e.py",
-        STABILITY.KIT / "benchmarks" / "localization_route_smoke.py",
+        STABILITY.KIT / "benchmarks" / "sample_identity_split_route.py",
+        STABILITY.KIT / "benchmarks" / "localization-cohort-v2.1.json",
+        *(STABILITY.KIT / "benchmarks").glob("localization_route_*.py"),
         *(STABILITY.KIT / ".local-agents").glob("*.py"),
         *(STABILITY.KIT / ".local-agents").glob("*.ps1"),
     ]

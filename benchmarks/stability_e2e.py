@@ -597,6 +597,91 @@ def test_nonzero_seed_and_input_order():
         """,
     ),
     Case(
+        "guardrail-casefold",
+        (
+            Source(
+                "runtime",
+                "src/agent_runtime/errors.py",
+                "816b4db2a9e569429901df290acb30dad45b362002ce1a4a934f2afc65267e7a",
+            ),
+            Source(
+                "runtime",
+                "src/agent_runtime/models.py",
+                "608a31dd2a09692a380dfe5ba0d9eb97accb1f7420f6d47d1e96d454b7666577",
+            ),
+            Source(
+                "runtime",
+                "src/agent_runtime/hooks/__init__.py",
+                "b4771a39421a7cccefda34a2c7bbfbef42320ed1e8368663f352f9805557d11c",
+            ),
+            Source(
+                "runtime",
+                "src/agent_runtime/hooks/base.py",
+                "396b410b87db527636ce6ea042a699632be8c14bdba41aaac7797201b313d1e9",
+            ),
+            Source(
+                "runtime",
+                "src/agent_runtime/hooks/guardrails.py",
+                "3b02c3bc76b265330c3c1e95bec0aacf8efc8ceee9f4c1ad8d3df80e95159581",
+            ),
+            Source(
+                "runtime",
+                "src/agent_runtime/telemetry/__init__.py",
+                "10e97be492dd0a800ca1a18e4788a6d3498b93c4601ecae1467b5edf0aa257bb",
+            ),
+            Source(
+                "runtime",
+                "src/agent_runtime/telemetry/tracing.py",
+                "eab9a9b40ab1cf8f684e81caf7d175d0c91c0efda3fb4953b07bb978ea656f8a",
+            ),
+        ),
+        "src/agent_runtime/hooks/guardrails.py",
+        "                    text = part.text.casefold()\n",
+        "                    text = part.text\n",
+        "class PhraseBlockGuardrail",
+        "PhraseBlockGuardrail matches configured non-empty phrases against text case-insensitively after trimming and normalization. Mixed-case matching blocks with configured_phrase; unrelated text remains allowed, and empty phrase sets are rejected.",
+        """import asyncio
+from uuid import uuid4
+
+import pytest
+
+from agent_runtime.hooks.guardrails import PhraseBlockGuardrail
+from agent_runtime.models import Message, RuntimeContext, TextContent
+
+
+def evaluate(guardrail, text):
+    context = RuntimeContext(run_id=uuid4(), thread_id=uuid4())
+    message = Message(role="user", content=[TextContent(text=text)])
+    return asyncio.run(guardrail.evaluate([message], context=context))
+
+
+def test_mixed_case_phrase_blocks():
+    guardrail = PhraseBlockGuardrail(["  ForBiDdEn  "])
+    result = evaluate(guardrail, "This contains fOrBiDdEn material")
+    assert result.allowed is False
+    assert result.reason_code == "configured_phrase"
+    assert evaluate(guardrail, "FORBIDDEN").allowed is False
+
+
+def test_nonmatching_text_remains_allowed():
+    assert evaluate(PhraseBlockGuardrail(["forbidden"]), "ordinary text").allowed is True
+
+
+def test_empty_phrase_configuration_is_rejected():
+    with pytest.raises(ValueError, match="non-empty"):
+        PhraseBlockGuardrail(["  "])
+""",
+        contract_behaviors=(
+            "Configured phrases are trimmed and case-folded; every TextContent part is case-folded before substring matching, and a match returns allowed=False with reason_code configured_phrase.",
+            "Nonmatching text remains allowed and an all-empty configured phrase set raises ValueError.",
+        ),
+        contract_scenarios=(
+            "Mixed-case configured phrases match mixed-case message text and block.",
+            "A nonmatching message remains allowed and an empty phrase set is rejected.",
+        ),
+        risk="high",
+    ),
+    Case(
         "mapping-message-sequence",
         (
             Source(
