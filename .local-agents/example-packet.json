@@ -20,6 +20,9 @@
     "behavior-1"
   ],
   "goal": "Describe one concrete implementation outcome.",
+  "implementation_guidance": [
+    "Prefer to reuse the existing helper if it preserves the observable contract."
+  ],
   "scope": {
     "read": [
       "src",
@@ -29,11 +32,28 @@
       "tests/test_example.py"
     ],
     "modify": [
-      "src/example.py"
+      "src/example.py",
+      "src/example_api.py"
     ],
-    "create": [],
+    "create": [
+      "tests/test_example_supplement.py"
+    ],
     "forbidden": []
   },
+  "edit_targets": [
+    {
+      "path": "src/example.py",
+      "anchor": "def example_behavior",
+      "line_hint": 1
+    },
+    {
+      "path": "src/example_api.py",
+      "anchor": "def call_example_behavior"
+    }
+  ],
+  "supplemental_tests": [
+    "tests/test_example_supplement.py"
+  ],
   "required_behavior": [
     {
       "id": "behavior-1",
@@ -80,15 +100,17 @@
   ],
   "validation_profile": "python-focused",
   "focused_tests": [
-    "tests/test_example.py"
+    "tests/test_example.py",
+    "tests/test_example_supplement.py"
   ],
   "explorer_findings": [],
   "review_feedback": [],
   "limits": {
     "max_local_repairs": 2,
-    "max_model_turns": 24,
-    "repair_turn_reserve": 8,
-    "hard_max_model_turns": 32,
+    "max_model_turns": 28,
+    "repair_turn_reserve": 10,
+    "prevalidation_edit_turn_reserve": 6,
+    "hard_max_model_turns": 40,
     "max_protocol_errors": 4,
     "command_timeout_seconds": 180
   }

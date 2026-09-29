@@ -15,13 +15,37 @@ SPEC.loader.exec_module(SAFE_EDIT)
 
 
 class SafeEditTests(unittest.TestCase):
+    def test_replace_line_preserves_newlines_and_requires_current_hash(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "src" / "example.py"
+            target.parent.mkdir()
+            target.write_bytes(b"one\r\ntwo\r\n")
+            editor = SAFE_EDIT.SafeEditor(
+                root, allowed_modify=["src/example.py"], allowed_create=[]
+            )
+            _, digest = editor.read_bytes("src/example.py")
+            editor.replace_line("src/example.py", 2, "three", digest)
+            self.assertEqual(target.read_bytes(), b"one\r\nthree\r\n")
+            with self.assertRaisesRegex(SAFE_EDIT.SafeEditError, "changed since it was read"):
+                editor.replace_line("src/example.py", 1, "four", digest)
+            _, current = editor.read_bytes("src/example.py")
+            with self.assertRaisesRegex(SAFE_EDIT.SafeEditError, "one line"):
+                editor.replace_line("src/example.py", 1, "four\nfive", current)
+            target.write_bytes(b"one\rtwo\r")
+            _, cr_digest = editor.read_bytes("src/example.py")
+            editor.replace_line("src/example.py", 1, "three", cr_digest)
+            self.assertEqual(target.read_bytes(), b"three\rtwo\r")
+
     def test_replace_requires_authorized_path_and_current_hash(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
             target = root / "src" / "example.py"
             target.parent.mkdir()
             target.write_bytes(b"one\r\ntwo\r\n")
-            editor = SAFE_EDIT.SafeEditor(root, allowed_modify=["src/example.py"], allowed_create=[])
+            editor = SAFE_EDIT.SafeEditor(
+                root, allowed_modify=["src/example.py"], allowed_create=[]
+            )
             _, digest = editor.read_bytes("src/example.py")
             result = editor.replace("src/example.py", "two\n", "three\n", digest)
             self.assertEqual(result["operation"], "modified")
@@ -48,12 +72,28 @@ class SafeEditTests(unittest.TestCase):
     def test_create_refuses_unlisted_and_existing_paths(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
-            editor = SAFE_EDIT.SafeEditor(root, allowed_modify=[], allowed_create=["tests/new_test.py"])
+            editor = SAFE_EDIT.SafeEditor(
+                root, allowed_modify=[], allowed_create=["tests/new_test.py"]
+            )
             with self.assertRaisesRegex(SAFE_EDIT.SafeEditError, "not authorized"):
                 editor.create("src/no.py", "x")
             editor.create("tests/new_test.py", "x\n")
             with self.assertRaisesRegex(SAFE_EDIT.SafeEditError, "overwrite"):
                 editor.create("tests/new_test.py", "y\n")
+
+    def test_created_file_can_be_replaced_only_by_same_editor_run(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            editor = SAFE_EDIT.SafeEditor(root, allowed_modify=[], allowed_create=["src/new.py"])
+            editor.create("src/new.py", "VALUE = 1\n")
+            _, digest = editor.read_bytes("src/new.py")
+            result = editor.replace("src/new.py", "VALUE = 1", "VALUE = 2", digest)
+            self.assertEqual(result["operation"], "modified")
+            self.assertEqual((root / "src/new.py").read_text(), "VALUE = 2\n")
+            next_run = SAFE_EDIT.SafeEditor(root, allowed_modify=[], allowed_create=["src/new.py"])
+            _, current_digest = next_run.read_bytes("src/new.py")
+            with self.assertRaisesRegex(SAFE_EDIT.SafeEditError, "not authorized"):
+                next_run.replace("src/new.py", "VALUE = 2", "VALUE = 3", current_digest)
 
     def test_path_escape_and_non_normal_paths_are_rejected(self) -> None:
         with TemporaryDirectory() as directory:

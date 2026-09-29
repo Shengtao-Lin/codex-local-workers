@@ -28,7 +28,9 @@ def _threshold(policy: dict[str, Any], name: str) -> int:
 def _same_unit(history: list[dict[str, Any]], latest: dict[str, Any]) -> list[dict[str, Any]]:
     worker = latest.get("worker")
     unit_id = latest.get("unit_id")
-    return [item for item in history if item.get("worker") == worker and item.get("unit_id") == unit_id]
+    return [
+        item for item in history if item.get("worker") == worker and item.get("unit_id") == unit_id
+    ]
 
 
 def _trailing_no_progress(items: list[dict[str, Any]]) -> int:
@@ -142,7 +144,9 @@ def evaluate_task_state(state: dict[str, Any]) -> dict[str, Any]:
             "reason": "Coder repeatedly failed the same implementation quality gate",
             "streaks": streaks,
         }
-    if worker == "explorer" and quality_failures >= _threshold(policy, "explorer_quality_threshold"):
+    if worker == "explorer" and quality_failures >= _threshold(
+        policy, "explorer_quality_threshold"
+    ):
         return {
             "decision": "fallback_primary",
             "reason": "Explorer repeatedly failed to provide acceptable evidence",

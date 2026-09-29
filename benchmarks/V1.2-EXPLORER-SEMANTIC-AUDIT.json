@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "batch": "benchmarks/work/stability-v1/batch-ca7bba3a4104",
+  "runner_sha256": "B822FAF77AD1E057A8248B566477BF2089986A7D45A87B7967FEBC770FFCCC87",
+  "reviewer": "Primary Agent",
+  "standard": "Correct source-predicted outcome versus protected-test expectation for every distinct contract-relevant path; real citations alone do not qualify.",
+  "ratings": [
+    {"round": 1, "case": "selection-order", "status": "correct"},
+    {"round": 1, "case": "mapping-metadata", "status": "correct"},
+    {"round": 1, "case": "metadata-limit", "status": "incomplete", "reason": "Did not establish the full boundary discrepancy."},
+    {"round": 1, "case": "reviewer-citation", "status": "correct"},
+    {"round": 1, "case": "internal-trace", "status": "correct"},
+    {"round": 1, "case": "sample-identity", "status": "failed", "reason": "No valid Explorer final report."},
+    {"round": 1, "case": "scorer-unused-binding", "status": "correct"},
+    {"round": 1, "case": "selection-percentage", "status": "correct"},
+    {"round": 1, "case": "metadata-key-length", "status": "incomplete", "reason": "Did not diagnose the 129-character input against the actual 1024 guard."},
+    {"round": 1, "case": "selection-random-seed", "status": "correct"},
+    {"round": 1, "case": "mapping-message-sequence", "status": "incorrect", "reason": "False str/bytes Sequence claim and wrong exception prediction."},
+    {"round": 2, "case": "selection-order", "status": "correct"},
+    {"round": 2, "case": "mapping-metadata", "status": "correct"},
+    {"round": 2, "case": "metadata-limit", "status": "correct"},
+    {"round": 2, "case": "reviewer-citation", "status": "correct"},
+    {"round": 2, "case": "internal-trace", "status": "correct"},
+    {"round": 2, "case": "sample-identity", "status": "incomplete", "reason": "Second-file score reuse diagnosis omitted."},
+    {"round": 2, "case": "scorer-unused-binding", "status": "correct"},
+    {"round": 2, "case": "selection-percentage", "status": "correct"},
+    {"round": 2, "case": "metadata-key-length", "status": "incomplete", "reason": "Did not diagnose the 129-character input against the actual 1024 guard."},
+    {"round": 2, "case": "selection-random-seed", "status": "correct"},
+    {"round": 2, "case": "mapping-message-sequence", "status": "correct"}
+  ]
+}

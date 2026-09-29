@@ -18,6 +18,20 @@ SPEC.loader.exec_module(RUN_STATE)
 
 
 class RunStateTests(unittest.TestCase):
+    def test_repo_globstar_matches_zero_or_many_directories(self) -> None:
+        for path, pattern, expected in (
+            ("tests/test_a.py", "**/tests/test_a.py", True),
+            ("nested/tests/test_a.py", "**/tests/test_a.py", True),
+            ("src/a.py", "src/**/*.py", True),
+            ("src/deep/a.py", "src/**/*.py", True),
+            ("src/a.py", "*.py", True),
+            ("src/a.txt", "**/*.py", False),
+            ("src/a.py", "tests/**/*.py", False),
+            ("src/a.py", "**/src/**/a.py", True),
+        ):
+            with self.subTest(path=path, pattern=pattern):
+                self.assertEqual(RUN_STATE.matches_repo_glob(path, pattern), expected)
+
     def test_git_commands_use_containing_repo_as_process_local_safe_directory(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -28,9 +42,7 @@ class RunStateTests(unittest.TestCase):
             with patch.object(RUN_STATE.subprocess, "run", return_value=completed) as called:
                 result = RUN_STATE._run_git(nested, ["rev-parse", "HEAD"])
             argv = called.call_args.args[0]
-            self.assertEqual(
-                argv[:3], ["git", "-c", f"safe.directory={root.as_posix()}"]
-            )
+            self.assertEqual(argv[:3], ["git", "-c", f"safe.directory={root.as_posix()}"])
             self.assertEqual(argv[3:5], ["-C", str(nested)])
             self.assertTrue(result["available"])
 

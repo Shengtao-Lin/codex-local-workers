@@ -32,7 +32,7 @@ Codex Primary
 
 - `.local-agents/`: Python runtimes, PowerShell wrappers, protocol, and tests.
 - `example/`: small integration example.
-- `benchmarks/`: reproducible S5 A/B benchmark harness and aggregate results.
+- `benchmarks/`: historical S5 A/B benchmark and read-only paired real-task scorecard.
 - `docs/design-brief.md`: original architecture brief.
 - `docs/improvement-plan-v1.md`: staged implementation and evaluation plan.
 - `AGENTS.md`: operating rules for Codex Primary.
@@ -45,6 +45,22 @@ Requirements:
 - Python 3.11 or newer
 - LM Studio with an OpenAI-compatible local server
 - pytest in the target repository's trusted virtual environment
+
+To install into another repository, preview the file list first. The installer
+copies only project-local runtime files and `AGENTS.md`; it never copies
+`config.json`, `.agent` logs, or kit-only benchmark tests, and refuses to overwrite a
+different existing file (including an existing `AGENTS.md`).
+
+```powershell
+python scripts/install_local_agents.py --target F:\path\to\target-repo
+python scripts/install_local_agents.py --target F:\path\to\target-repo --apply
+```
+
+Review any conflicts and merge them manually. A `legacy_kit_tests` entry means
+an older kit-only test remains in the target; the installer reports but never
+deletes it. After checking its content, remove or relocate that stale copy so
+target self-tests can collect cleanly. The target's local configuration must be
+created or updated separately; do not replace an existing one.
 
 Create the local configuration:
 
@@ -64,7 +80,15 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
   -Task "Trace how configuration reaches request handling."
 ```
 
-Run a bounded Coder packet:
+Run a bounded Coder packet with automatic handoff to read-only Reviewer:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File ".local-agents\local-unit.ps1" `
+  -Packet ".agent\implementation-packet.json"
+```
+
+For diagnostic manual routing, run Coder directly:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass `
@@ -87,10 +111,18 @@ review flow, security boundary, and exit statuses.
 
 ## Tests
 
-The runtime boundary suite has no third-party dependencies:
+Most runtime tests use only the standard library; the real-HTTP end-to-end test
+uses pytest and skips if the selected interpreter lacks it:
 
 ```powershell
 python -m unittest discover -s .local-agents\tests -v
+```
+
+The source kit also has integration and installer tests that are not copied to
+targets:
+
+```powershell
+python -m unittest discover -s tests -p "test_*.py" -v
 ```
 
 The integration example uses pytest:
@@ -116,3 +148,11 @@ feature/unit risk separation, deterministic diff-quality gates, explicit
 read-only scope, inherited rework packets, and a read-only Local Reviewer.
 Qwen is the default Reviewer; alternate models should remain shadow evaluation
 until benchmark evidence supports routing acceptance through them.
+The current S6 candidate also includes anchored Coder packets, bounded
+context replay, progress-aware turn reserves, and an HTTP-to-pytest E2E test.
+An opt-in disposable live LM Studio smoke is available at
+`benchmarks/live_smoke.py`; its result is distinct from the deterministic E2E
+and from the real-task paired evaluation.
+The S5 benchmark is historical; no measured Primary-token saving or real-service
+PostgreSQL/MLflow result has been established for this candidate. See
+[the real-task evaluation guide](benchmarks/REAL-TASK-EVAL.md) for the next gate.

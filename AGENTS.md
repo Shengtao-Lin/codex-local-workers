@@ -31,8 +31,20 @@ Each Coder packet covers one behaviorally cohesive implementation unit, not an
 entire broad feature and not an arbitrary single edit. Keep operations that must
 remain atomic in the same unit. Give the unit only its relevant contract,
 read-only context, writable scope, focused tests, and cross-unit constraints.
+An implementation unit may span multiple source files and supplemental tests
+when the behavior crosses those files. Primary specifies externally observable
+outcomes, invariants, and genuine sequencing requirements, not a preferred
+code shape or edit sequence. `implementation_guidance` is advisory; Coder may
+choose another in-scope implementation that satisfies the hard contract.
+For each existing writable file, give Coder a stable symbol/anchor and optional
+line hint in `edit_targets`; the hint is not proof of current location. If a
+Coder fails without validating, narrow the next packet before raising turn
+limits. Use the inherited rework traceback for focused repairs.
 Feature completion remains provisional until dependency and integration checks
 pass at the feature's integration risk level.
+When a value is accepted by one unit and interpreted by another, include a
+feature-level round-trip or rejection test for the exact input form. Unit tests
+alone do not establish cross-unit compatibility.
 
 ## Local Explorer
 
@@ -44,12 +56,30 @@ must remain focused and independently bounded.
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass `
   -File ".local-agents\local-explore.ps1" `
-  -Task "<focused read-only investigation>"
+  -Task "<focused read-only investigation>" `
+  -TaskId "<stable task_id>"
 ```
 
 Explorer is strictly read-only and calls LM Studio directly. Do not use it for
 obvious or already-located changes. Condense useful findings into the Coder
 implementation packet; never forward a large raw exploration transcript.
+Explorer searches are literal by default; request regex mode explicitly only
+when needed. A malformed regex or a failed search is not evidence that code is
+absent; reconcile any positive matches and files already read before accepting
+an absence claim. A positive match for another symbol does not by itself refute
+a scoped, negative search for the exact missing symbol; state the search scope
+and remaining uncertainty instead of claiming the whole repository is empty.
+Ask one concrete unanswered question per call and name likely paths or symbols
+when known. If a call ends without useful evidence, inspect its observed files
+and failure reason before retrying; narrow the next question or take over.
+Do not repeat the same investigation simply with a fresh run id. Explorer
+rejects identical reads/searches within a call and stops after repeated
+no-evidence actions. A cited test must be a real file the Explorer read.
+When diagnosing failures, follow `diagnostic_log` in the Explorer report (or
+task history) to the bounded per-call trace before trying a revised question.
+Pass the stable `task_id` even before the first Coder call so Explorer usage and
+its complete per-call report attach to the intended task. Without `-TaskId`,
+an early Explorer call is still logged but may not appear in task-level usage.
 
 ## Local Coder
 
@@ -62,6 +92,12 @@ that defines readable and writable scope, stable task/unit/revision identity,
 required behavior, acceptance criteria, validation profile, and focused tests.
 Include stable `acceptance_scenarios` for the normal path, important error path,
 and relevant boundary whenever they are distinct.
+Before choosing `validation_profile`, inspect the target repository's existing
+formatter/linter configuration. If Ruff or another project check is required,
+configure it in the trusted profile before the first Coder call; a focused
+pytest pass alone is not acceptance. Do not assume the example `python-focused`
+profile covers project-specific checks.
+
 Use `scope.readonly` for tests or context that Coder may inspect and execute but
 must not modify. `scope.forbidden` means the path cannot be read, executed, or
 modified; it is not a read-only marker.
@@ -69,8 +105,17 @@ For concurrency, transaction, or lifecycle-sensitive work, include explicit
 `required_order`, `forbidden_orderings`, and observable side effects. Prefer
 Primary-authored or Primary-reviewed critical tests; do not grant test write
 scope merely so Coder can reshape mocks around an implementation.
+List Coder-owned test additions in `supplemental_tests` and `focused_tests`,
+granting only those exact paths writable scope. Keep critical acceptance tests
+in `scope.readonly`. Coder may write meaningful assertions, make multiple edits,
+validate, and repair within its bounded call; passing tests and Coder confidence
+alone never authorize acceptance. A contract conflict, suspected outdated test,
+or missing scope uses `REQUEST_CONTRACT_REVISION` with verified source or
+validation evidence or a concrete scope request. It returns `blocked`, not a
+worker-quality failure. Primary resolves the disagreement and revises the
+packet; Coder may not silently change the contract or protected tests.
 Schema version 1 remains supported through explicit compatibility normalization.
-Invoke from the target repository root:
+For diagnostic direct Coder invocation from the target repository root:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass `
@@ -87,6 +132,51 @@ changes whose coordination cost exceeds direct implementation.
 One Coder call is one bounded implementation packet, not one edit. Within that
 call the worker may perform multiple authorized reads, searches, creates,
 replacements, validations, and up to the configured number of repair cycles.
+After `SAFE_CREATE`, Coder may read and `SAFE_REPLACE` that exact new file in
+the same call using its current hash; creation never grants permission to edit
+an existing file or a file created by a previous call.
+A repeated read of already-observed lines from unchanged file content returns
+a compact `already_read` observation without charging the protocol-error budget.
+Three consecutive duplicate reads stop the unit as no progress; new ranges and
+reads after an edit remain available within the per-file-version safety limit.
+Before the first edit or validation, eight consecutive reads/searches with no
+new source lines stop as `no_new_evidence_before_edit`, even if the worker
+alternates repeated reads and searches. Narrow the next packet rather than
+replaying it unchanged.
+This limit is not a task-level call cap. Invalid `VALIDATE` contract-check types
+receive a packet-specific field-shape hint, not automatic confirmation.
+When a target file is longer than the default read window, use `SEARCH` for the
+exact symbol and then read the returned line range. A missed `SAFE_REPLACE`
+needs a new search/read of the target area before a narrower edit; repeated
+full-file reads do not repair a mismatch. Coder must search before claiming a
+function or endpoint does not exist. The Primary should provide known symbols
+or line ranges in the packet when available.
+After a failed focused test run, use each JUnit failure's own message and
+location to choose a minimal edit. The runtime groups matching
+JUnit failures into an early `repair_focus` with the source location and next
+edit guidance. A `NameError` gets `TYPE_CHECKING` import guidance only when the
+changed source confirms that exact name is imported under that guard. Failed
+validation followed by a read/search with no new evidence repeats the repair
+focus and asks for an edit at its source location. Newly introduced executable `NotImplementedError` raises a
+non-blocking draft warning; TODO comments alone do not fail a call. After a
+failed validation, new source evidence is still allowed, but four consecutive
+reads/searches without new evidence stop with the last repair focus for a
+narrower rework packet. Two identical focused-test failures without
+an intervening edit stop early for Primary to compare the assertion with the
+intended contract; an outdated test is not assumed. Three matching failures
+across edits also stop the call. Every validation attempt
+has an immutable `validation-attempt-N.json`, including attempts later
+invalidated by edits. After `SAFE_REPLACE` misses a target, oversized further
+replacements of that file are rejected; locate and edit a smaller current
+block. Edit responses identify newly introduced diff-quality issues by path
+and line before another validation call. For a failed configured static check,
+use its exact rule/path/line to make a minimal correction before broad rereads;
+an unused binding should be removed without dropping a needed expression.
+Ruff `F821` also exposes the missing symbol as an early repair focus even when
+focused tests passed. A no-evidence read after that failure repeats the static
+check repair focus rather than falling back to test-only guidance.
+Coder `SEARCH` is literal by default, including parentheses in symbols; use
+`mode: "regex"` only when a regular expression is actually required.
 A larger user task may use multiple sequential Coder packets for separate
 implementation steps and later focused rework.
 
@@ -118,6 +208,27 @@ uses a fresh context and receives the canonical packet, actual cumulative diff,
 runtime validation evidence, and bounded code reads. Coder summaries are
 untrusted claims. Reviewer cannot edit, run shell or Git, delegate, accept the
 feature, or lower risk.
+Primary's listed obligations are a minimum, not an exhaustive review script.
+Reviewer independently reads changed implementation and focused tests, follows
+relevant callers/error paths/side effects, and raises concrete defects or test
+gaps that Primary did not anticipate. If evidence conflicts with Primary's
+contract, Reviewer escalates with evidence for Primary to decide. It may
+recommend additional tests but cannot claim to have executed them.
+
+The normal invocation runs one Coder unit and automatically dispatches its
+verified canonical archive to Reviewer without a Primary relay:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File ".local-agents\local-unit.ps1" `
+  -Packet ".agent\implementation-packet.json"
+```
+
+The trusted handoff gate checks run identity, actual validation/JUnit and
+configured checks, changed-path attribution, and unchanged validation inputs.
+Failures return to Primary; an automatic handoff is never automatic acceptance.
+Use the direct `local-review.ps1` command below for diagnostics or an existing
+Coder archive. Substantive Primary review follows Reviewer by risk.
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass `
@@ -131,6 +242,33 @@ stable id, severity, category, concrete file/line evidence when applicable,
 affected contract id, and a bounded suggested fix. A rework packet should cite
 finding ids. Architecture or security ambiguity escalates to Primary rather
 than becoming speculative rework.
+For ordering-sensitive units, a pass must use the Reviewer-provided constraint
+IDs. Required order cites read source lines; forbidden order may cite read
+source or the actual cumulative diff, including whole-diff absence checks.
+A pass must also acknowledge each configured check's
+actual runtime result. Neither acknowledgement replaces Primary's risk-routed
+review. For high-risk units, a pass additionally requires one source-backed
+`contract_review` entry per owned required behavior, with an actually displayed
+source line and exact quote. In inherited rework, Primary may add a structured
+`review_feedback` item with `finding_id`, owned `contract_id`, `text`,
+`source_anchor`, and `verify_in_review: true`; this adds a focused review
+obligation at any risk level whose quoted line must contain the anchor.
+Untagged historical
+notes add no obligation. Put essential invariants explicitly in
+`required_behavior`; an anchor and passing tests alone do not prove semantics.
+Reviewer `SEARCH` is limited to packet-readable roots and skips excluded or
+reparse paths. On an invalid report, use the returned legal obligation and
+constraint IDs, suggested source read, or exact `source_citation` correction
+instead of resubmitting the same REPORT. Quote mismatches include bounded
+`citation_fixes` for each affected obligation; the invalid REPORT is not echoed
+back as a model example. Reviewer checks structured-output compatibility before
+substantive review and uses plain JSON only after a successful fallback probe.
+A non-JSON startup response receives
+a concrete JSON action example; repeated invalid output still fails closed.
+Three consecutive duplicate reads stop an unproductive review. When a report
+cites an unread source line or mismatched quote, the runtime supplies that
+bounded, read-only source range for the next attempt; the invalid report is
+not accepted.
 
 ## Risk-routed Primary review
 
@@ -183,10 +321,19 @@ change history.
   takeover instead of waiting for a streak threshold.
 - If the remaining problem is architectural or ambiguous, the Primary Agent may
   take over earlier based on judgment.
+- For a non-unsafe mechanical failure, prefer one narrower anchored packet or
+  inherited rework using the archived failure traceback before an early Primary
+  takeover. Do not spend extra turns on an unchanged failure signature.
 - Workers never request Git operations and the runtime never changes Git state
   or rolls back files. The trusted runtime may read HEAD/status for baseline
   evidence. The Primary Agent decides whether partial changes should be retained,
   corrected, or reverted after inspecting the diff.
+
+Explorer and Reviewer are read-only; do not create a new Git stash before each
+of their calls solely as a checkpoint. Before a Coder write, preserve important
+pre-existing user changes with a deliberate, named, recoverable checkpoint when
+needed. The Coder run archive already stores authorized-file preimages and
+forward/reverse diffs; do not repeatedly stash large unrelated untracked trees.
 
 Only one managed Coder writer may hold `.agent/local-worker-write.lock` at a
 time. Do not silently delete a stale or unreadable lock: inspect its metadata and
@@ -225,12 +372,19 @@ active task belongs in task memory. Track task-level call totals, failure
 signatures, progress, and quality-gate streaks in `.agent/current-task.json`.
 Per-invocation runtime limits apply independently to every worker call and are
 safety boundaries, not task-level fallback triggers.
+For reliability work, `diagnostic_logging` is enabled by default; set it to
+`false` in `.local-agents/config.json` once no longer needed. Diagnostic events
+record action metadata and response hashes, never raw source or model output.
 
 Normal Coder output is a compact handoff. Read the canonical run archive only
 for files/evidence needed by the current review or when the compact result shows
 failure, uncertainty, truncation, or unattributed changes. Explorer may reuse an
 exact prior task only when its runtime reports a valid unchanged-repository cache
 hit; otherwise treat it as a new exploration.
+Successful Explorer findings also provide bounded path hints for later questions
+when their individual file hashes still match. Hints are navigation only, never
+proof; Coder receives only hints inside its readable scope. Changed files
+invalidate their prior hints without discarding unrelated valid observations.
 
 Increment informational Explorer/Coder totals when a worker reaches its first
 model turn, whether it later succeeds or fails. Totals do not cause fallback.

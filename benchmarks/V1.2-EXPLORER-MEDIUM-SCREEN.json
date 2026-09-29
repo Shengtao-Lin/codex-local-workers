@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "batch": "benchmarks/work/stability-v1/candidate-explorer-cb0f164dd476",
+  "result": "benchmarks/results/explorer-candidates/candidate-20260927T205114Z-91b7b7.json",
+  "reviewer": "Primary Agent",
+  "model": "openai/gpt-oss-20b",
+  "reasoning_effort": "medium",
+  "max_output_tokens": 4096,
+  "context_length": 32768,
+  "scope": "one-round diagnostic candidate screen; not a release audit",
+  "ratings": [
+    {"case": "selection-order", "status": "correct"},
+    {"case": "mapping-metadata", "status": "incorrect", "reason": "The report falsely claims str/bytes message containers raise TypeError at the Sequence guard; they pass that guard and fail later element validation."},
+    {"case": "metadata-limit", "status": "incomplete", "reason": "Lists the source byte limit and test expectations without predicting the unpatched 16,384-byte outcome or explicitly resolving the conflict."},
+    {"case": "reviewer-citation", "status": "incomplete", "reason": "Only cites the branch and assertion; does not compare the active constant and encoded input to predict the outcome."},
+    {"case": "internal-trace", "status": "correct"},
+    {"case": "sample-identity", "status": "incomplete", "reason": "Diagnoses sample_id in both functions but omits the labels and source_metadata assertions, whose requirements differ between fingerprint and reuse key."},
+    {"case": "scorer-unused-binding", "status": "correct"},
+    {"case": "selection-percentage", "status": "correct"},
+    {"case": "metadata-key-length", "status": "correct"},
+    {"case": "selection-random-seed", "status": "correct"},
+    {"case": "mapping-message-sequence", "status": "correct"}
+  ]
+}

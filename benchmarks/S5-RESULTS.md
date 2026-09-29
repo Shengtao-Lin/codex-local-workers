@@ -1,5 +1,10 @@
 # S5 baseline results
 
+> Historical S5 evidence only. This run predates the current S6 Local Reviewer,
+> anchored packets, diagnostic traces, and end-to-end regression suite. Its
+> reviewer-routing decision below is not the current operating policy, and
+> these numbers must not be used to claim savings for the current version.
+
 Measured on 2026-09-22 with the ten-task Python corpus described in
 `README.md`. This is a diagnostic baseline, not evidence that the same result
 generalizes to large repositories or other languages.
@@ -40,7 +45,7 @@ reviewer model.
   failed A/task-06 output predates that fix and is summarized here rather than
   present as an immutable result file.
 
-## S5 decision
+## Historical S5 decision (superseded by S6 operation)
 
 The bounded runtime and Primary quality gate are viable, but the current data
 does not yet prove Codex usage savings. Keep the local reviewer disabled. The

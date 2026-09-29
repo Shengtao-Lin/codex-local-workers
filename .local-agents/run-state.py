@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
 import os
@@ -22,6 +23,68 @@ def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def matches_repo_glob(relative: str, pattern: str) -> bool:
+    """Preserve legacy fnmatch filters and let ** match zero path components.
+
+    This filters an already scope-checked path; it is never path authorization.
+    Dynamic programming bounds globstar matching instead of expanding combinations.
+    """
+    relative = relative.replace("\\", "/")
+    pattern = pattern.replace("\\", "/")
+    if fnmatch.fnmatch(relative, pattern) or fnmatch.fnmatch(relative.rsplit("/", 1)[-1], pattern):
+        return True
+    parts = relative.split("/")
+    previous = [True] + [False] * len(parts)
+    for segment in pattern.split("/"):
+        current = [previous[0] if segment == "**" else False] + [False] * len(parts)
+        for index, part in enumerate(parts, 1):
+            current[index] = (
+                previous[index] or current[index - 1]
+                if segment == "**"
+                else previous[index - 1] and fnmatch.fnmatch(part, segment)
+            )
+        previous = current
+    return previous[-1]
+
+
+def diagnostic_facts(
+    action: str | None,
+    arguments: dict[str, Any],
+    response: str,
+    observation: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Bounded action metadata, never source text or raw model output."""
+    facts: dict[str, Any] = {
+        "action": action,
+        "response_chars": len(response),
+        "response_sha256": sha256_bytes(response.encode("utf-8", errors="replace")),
+    }
+    path = arguments.get("path")
+    if isinstance(path, str):
+        facts["path"] = path[:300]
+    for key in ("start_line", "end_line"):
+        if isinstance(arguments.get(key), int):
+            facts[key] = arguments[key]
+    for key in ("query", "find", "replace", "content"):
+        value = arguments.get(key)
+        if isinstance(value, str):
+            facts[f"{key}_chars"] = len(value)
+            facts[f"{key}_sha256"] = sha256_bytes(value.encode("utf-8", errors="replace"))
+    if observation is not None:
+        facts["status"] = observation.get("status")
+        for key in ("total_lines", "start_line", "end_line"):
+            if isinstance(observation.get(key), int):
+                facts[key] = observation[key]
+        for key in ("results", "files"):
+            if isinstance(observation.get(key), list):
+                facts[f"{key}_count"] = len(observation[key])
+        if isinstance(observation.get("content"), str):
+            facts["content_chars"] = len(observation["content"])
+        if isinstance(observation.get("error_code"), str):
+            facts["error_code"] = observation["error_code"][:100]
+    return facts
+
+
 def file_fact(path: Path, relative: str) -> dict[str, Any]:
     if not path.exists():
         return {"path": relative, "exists": False, "sha256": None, "size": None}
@@ -41,8 +104,7 @@ def file_fact(path: Path, relative: str) -> dict[str, Any]:
 
 def facts_for_paths(repo_root: Path, paths: Iterable[str]) -> dict[str, dict[str, Any]]:
     return {
-        relative: file_fact(repo_root / Path(relative), relative)
-        for relative in sorted(set(paths))
+        relative: file_fact(repo_root / Path(relative), relative) for relative in sorted(set(paths))
     }
 
 
@@ -85,15 +147,16 @@ def _run_git(repo_root: Path, args: list[str]) -> dict[str, Any]:
 
 def git_snapshot(repo_root: Path) -> dict[str, Any]:
     head = _run_git(repo_root, ["rev-parse", "--verify", "HEAD"])
-    status = _run_git(
-        repo_root, ["status", "--porcelain=v1", "--untracked-files=all", "-z"]
-    )
+    status = _run_git(repo_root, ["status", "--porcelain=v1", "--untracked-files=all", "-z"])
     if not head.get("available") or not status.get("available"):
         return {
             "is_repository": False,
             "head": None,
             "status_entries": [],
-            "diagnostic": head.get("stderr") or status.get("stderr") or head.get("error") or status.get("error"),
+            "diagnostic": head.get("stderr")
+            or status.get("stderr")
+            or head.get("error")
+            or status.get("error"),
         }
     entries = [item for item in status["stdout"].split("\0") if item]
     return {

@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "protocol_version": "v1.2",
+  "roles": {
+    "Explorer": {
+      "allowed": {
+        "bounded_read": [".local-agents/tests/test_explorer_runtime.py::ExplorerRuntimeTests::test_read_only_exploration_returns_evidence_backed_report"],
+        "literal_and_regex_search": [".local-agents/tests/test_explorer_runtime.py::ExplorerRuntimeTests::test_search_defaults_to_literal_and_regex_requires_explicit_mode"],
+        "trace": [".local-agents/tests/test_explorer_runtime.py::ExplorerRuntimeTests::test_trace_returns_definition_and_call_edges_with_line_evidence"]
+      },
+      "prohibited": {
+        "mutation_shell": [".local-agents/tests/test_explorer_runtime.py::ExplorerRuntimeTests::test_explorer_capability_schema_is_read_only"],
+        "scope_escape": [".local-agents/tests/test_explorer_runtime.py::ExplorerRuntimeTests::test_path_escape_is_rejected"]
+      }
+    },
+    "Coder": {
+      "allowed": {
+        "bounded_read_search": [".local-agents/tests/test_worker_runtime.py::WorkerRuntimeTests::test_coder_search_is_literal_by_default_and_regex_is_explicit"],
+        "safe_create_replace_validate": [".local-agents/tests/test_worker_runtime.py::WorkerRuntimeTests::test_one_unit_can_edit_two_sources_and_supplemental_test"]
+      },
+      "prohibited": {
+        "shell_git_delegation": [".local-agents/tests/test_worker_runtime.py::WorkerRuntimeTests::test_coder_capability_schema_excludes_shell_git_and_delegation"],
+        "scope_escape": [".local-agents/tests/test_worker_runtime.py::WorkerRuntimeTests::test_runtime_rejects_out_of_scope_edit"],
+        "control_file_write": [".local-agents/tests/test_worker_runtime.py::WorkerRuntimeTests::test_control_files_are_never_writable"]
+      }
+    },
+    "Reviewer": {
+      "allowed": {
+        "bounded_read_report": [".local-agents/tests/test_reviewer_runtime.py::ReviewerRuntimeTests::test_reviewer_can_read_but_never_has_write_actions"],
+        "search": [".local-agents/tests/test_reviewer_runtime.py::ReviewerRuntimeTests::test_default_search_aggregates_declared_read_roots"],
+        "approved_execution": [".local-agents/tests/test_reviewer_runtime.py::ReviewerRuntimeTests::test_approved_execution_uses_only_registered_ids_and_fixed_argv"]
+      },
+      "prohibited": {
+        "edit_shell_git_delegation": [".local-agents/tests/test_reviewer_runtime.py::ReviewerRuntimeTests::test_reviewer_capability_schema_excludes_edits_shell_git_and_delegation"],
+        "unregistered_execution": [".local-agents/tests/test_reviewer_runtime.py::ReviewerRuntimeTests::test_approved_execution_uses_only_registered_ids_and_fixed_argv"]
+      }
+    }
+  }
+}

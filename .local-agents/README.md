@@ -17,6 +17,8 @@ contains the Python entrypoints, runtime, configuration, and wrappers:
 - `local-explore.ps1`
 - `local-review.py`
 - `local-review.ps1`
+- `local-unit.py`
+- `local-unit.ps1`
 - `explorer-runtime.py`
 - `reviewer-runtime.py`
 - `worker-runtime.py`
@@ -34,6 +36,14 @@ compatibility entry, but project operation must not depend on that global path.
 
 ## Setup and requirements
 
+For another repository, use `python scripts/install_local_agents.py --target
+<repo>` from the kit root to preview, then add `--apply` after reviewing the
+file list. It excludes `.agent`, local `config.json`, and caches; worker runtime
+tests remain included and can run in the target without `benchmarks/` or `scripts/`.
+It refuses differing existing files rather than overwriting them; merge an
+existing target `AGENTS.md` manually. Run the installer from the source kit;
+the target does not need a copy of `scripts/install_local_agents.py`.
+
 Create the local configuration before the first invocation:
 
 ```powershell
@@ -42,11 +52,28 @@ Copy-Item .local-agents\config.example.json .local-agents\config.json
 
 - Windows PowerShell
 - LM Studio listening at the URL in `config.json`
-- the configured Qwen model loaded or available in LM Studio
+- the configured Coder and Reviewer models loaded or available in LM Studio
 - target repository virtual environment at `.\.venv\Scripts\python.exe`
 - pytest installed in that environment
 
 The runtime itself uses only the Python standard library.
+
+## Local verification before copying to another repository
+
+Run all runtime tests with a Python environment that has pytest installed:
+
+```powershell
+python -m unittest discover -s .local-agents/tests -p "test_*.py" -v
+```
+
+`test_e2e_pipeline.py` starts a scripted loopback LM Studio-compatible HTTP
+server and exercises the real Explorer, Coder, inherited rework, pytest
+validation, run archives, and Reviewer CLIs. Its focused fixture covers normal,
+error, and boundary inputs. It skips if the invoking Python has no pytest;
+check the test summary for skips. This deterministic E2E checks the protocol and
+orchestration, not the quality of a live model or an external PostgreSQL/MLflow
+deployment. Real-service smoke tests remain separate and should use disposable
+resources.
 
 ## Invocation
 
@@ -59,7 +86,23 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
   -Report ".agent\last-local-explorer-report.json"
 ```
 
-Create a Coder packet based on `example-packet.json`, then run:
+Create a Coder packet based on `example-packet.json`, then run the normal
+Coder → validated automatic Reviewer path:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File ".local-agents\local-unit.ps1" `
+  -Packet ".agent\implementation-packet.json"
+```
+
+The dispatcher verifies canonical validation, path attribution, and unchanged
+validation inputs before starting Reviewer. For LM Studio Muse, the current
+configuration uses `reviewer_native_tools: true`: the model emits one bounded
+OpenAI tool call, which the runtime normalizes into the same allowlisted action
+protocol. A Reviewer request error or model-request timeout still permits one
+fresh-review-id retry after rechecking the handoff; both attempts remain in the
+unit result. It does not accept on behalf of Primary. Use direct
+Coder invocation for diagnostics:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass `
@@ -75,8 +118,15 @@ interpreter is configured outside their own root.
 
 The Coder exits zero only with `ready_for_review`, after runtime-observed syntax
 checks and focused pytest succeed after the final edit. `blocked` exits with code
-3, `policy_violation` with 4, and `interrupted` with 130. The Primary Agent must
-then send the run through Local Reviewer and apply the packet's risk route.
+3, `policy_violation` with 4, and `interrupted` with 130. After direct Coder
+invocation, Primary must send the run through Reviewer and apply the risk route.
+One packet may cover a cohesive multi-file behavior. Put critical acceptance
+tests in `scope.readonly`; list Coder-writable tests in `supplemental_tests` and
+`focused_tests`. `implementation_guidance` may suggest an approach without
+making it mandatory. Coder can iterate edits and tests within the bounded call.
+For a conflicting contract, suspected outdated test, or missing scope, Coder
+sends `REQUEST_CONTRACT_REVISION` with observed evidence and returns `blocked`
+for a Primary decision; this is neither success nor a quality failure.
 
 Create a unique review request from `example-review-request.json`, then run:
 
@@ -107,9 +157,9 @@ path after considering the repository and command.
 
 ## Protocol and security boundary
 
-Explorer can request only `LIST_FILES`, `SEARCH`, `READ_FILE`, and finish actions.
+Explorer can request only `LIST_FILES`, `SEARCH`, `READ_FILE`, `TRACE`, and finish actions.
 Coder can request only `READ_FILE`, `SEARCH`, `SAFE_CREATE`, `SAFE_REPLACE`,
-`VALIDATE`, and finish actions. Neither worker can construct commands. Coder
+`SAFE_REPLACE_LINE`, `VALIDATE`, and finish actions. Neither worker can construct commands. Coder
 writes are restricted to the packet's exact create/modify allowlists. Existing
 files require an exact unique replacement and a current SHA-256 read token.
 Managed Coder runs also hold one repository write lock, reject symlink/junction
@@ -118,8 +168,10 @@ files after rechecking their hash. A validation timeout triggers process-tree
 termination; uncertain termination prevents further writes.
 Failed replacements return a bounded excerpt near the closest current line and
 do not consume a repair cycle unless an edit actually succeeds.
-Reviewer can request only `READ_FILE`, `SEARCH`, and `REPORT`; it has no write
-action. It receives a fresh context and treats Coder prose as untrusted.
+Reviewer can request only `READ_FILE`, `SEARCH`, registered
+`RUN_APPROVED_TEST`/`RUN_APPROVED_STATIC_CHECK`, and `REPORT`; it has no write
+action. Native tool transport does not expand this allowlist. It receives a
+fresh context and treats Coder prose as untrusted.
 
 Packets distinguish feature, unit, and integration risk. Primary decomposes a
 feature into cohesive implementation units and assigns owned contract ids.
@@ -205,3 +257,15 @@ Run the zero-dependency boundary tests with:
 ```powershell
 python -m unittest discover -s .local-agents\tests -v
 ```
+# Explicit Explorer capability modes (experimental localization)
+
+`explorer_mode` defaults to `investigate`, preserving the existing research
+report protocol. Opt-in `locate` returns selected source/test ranges, not an
+execution prediction. The runtime materializes exact quotes and hashes from
+unchanged, actually displayed source. Reports explicitly mark semantic
+diagnosis `not_evaluated`; do not use them as proof that tests pass or that a
+proposed repair is correct. Primary/Coder/Reviewer retain their responsibilities.
+The locator accepts at most six references and 80 total displayed lines, with
+one bounded final-report correction. Missing evidence fails closed. The two
+modes have separate exact-task cache keys. Qualification results must name the
+mode; success in `locate` does not qualify `investigate` for autonomous routing.

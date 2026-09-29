@@ -29,21 +29,38 @@ class RecordReviewTests(unittest.TestCase):
                 json.dumps({"status": "ready_for_review"}), encoding="utf-8"
             )
             (run_root / "handoff.json").write_text(
-                json.dumps({
-                    "identity": {"task_id": "task-1", "unit_id": "unit-1", "run_id": "run-1"},
-                    "next_action_required": "local_review",
-                }),
+                json.dumps(
+                    {
+                        "identity": {"task_id": "task-1", "unit_id": "unit-1", "run_id": "run-1"},
+                        "next_action_required": "local_review",
+                    }
+                ),
                 encoding="utf-8",
             )
             state_path = root / ".agent" / "tasks" / "task-1" / "state.json"
             state_path.write_text(
-                json.dumps({"task_id": "task-1", "reviews": [], "completed_units": [], "recent_attempts": []}),
+                json.dumps(
+                    {
+                        "task_id": "task-1",
+                        "reviews": [],
+                        "completed_units": [],
+                        "recent_attempts": [],
+                    }
+                ),
                 encoding="utf-8",
             )
             argv = [
-                "record-review.py", "--task-id", "task-1", "--run-id", "run-1",
-                "--decision", "accept", "--summary", "No local review yet.",
-                "--repo", str(root),
+                "record-review.py",
+                "--task-id",
+                "task-1",
+                "--run-id",
+                "run-1",
+                "--decision",
+                "accept",
+                "--summary",
+                "No local review yet.",
+                "--repo",
+                str(root),
             ]
             output = io.StringIO()
             with patch.object(sys, "argv", argv), contextlib.redirect_stdout(output):
@@ -54,32 +71,37 @@ class RecordReviewTests(unittest.TestCase):
     def test_accept_review_is_immutable_and_updates_primary_state(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
+            (root / "src").mkdir()
+            (root / "src" / "example.py").write_text("VALUE = 2\n", encoding="utf-8")
             run_root = root / ".agent" / "tasks" / "task-1" / "runs" / "run-1"
             run_root.mkdir(parents=True)
             (run_root / "completed.json").write_text(
                 json.dumps({"status": "ready_for_review"}), encoding="utf-8"
             )
             (run_root / "handoff.json").write_text(
-                json.dumps({
-                    "identity": {"task_id": "task-1", "unit_id": "unit-1", "run_id": "run-1"},
-                    "next_action_required": "local_review",
-                }),
+                json.dumps(
+                    {
+                        "identity": {"task_id": "task-1", "unit_id": "unit-1", "run_id": "run-1"},
+                        "next_action_required": "local_review",
+                        "changed_files": [{"path": "src/example.py"}],
+                    }
+                ),
                 encoding="utf-8",
             )
-            local_review_root = (
-                root / ".agent" / "tasks" / "task-1" / "reviews" / "review-1"
-            )
+            local_review_root = root / ".agent" / "tasks" / "task-1" / "reviews" / "review-1"
             local_review_root.mkdir(parents=True)
             (local_review_root / "handoff.json").write_text(
-                json.dumps({
-                    "decision": "pass_to_primary",
-                    "identity": {
-                        "task_id": "task-1",
-                        "unit_id": "unit-1",
-                        "run_id": "run-1",
-                        "review_id": "review-1",
-                    },
-                }),
+                json.dumps(
+                    {
+                        "decision": "pass_to_primary",
+                        "identity": {
+                            "task_id": "task-1",
+                            "unit_id": "unit-1",
+                            "run_id": "run-1",
+                            "review_id": "review-1",
+                        },
+                    }
+                ),
                 encoding="utf-8",
             )
             (local_review_root / "completed.json").write_text(
@@ -87,29 +109,38 @@ class RecordReviewTests(unittest.TestCase):
             )
             state_path = root / ".agent" / "tasks" / "task-1" / "state.json"
             state_path.write_text(
-                json.dumps({
-                    "task_id": "task-1",
-                    "completed_units": [],
-                    "reviews": [],
-                    "open_issues": [],
-                    "usage": {"coder_calls": 1, "explorer_calls": 0},
-                    "recent_attempts": [{
-                        "run_id": "run-1",
-                        "unit_id": "unit-1",
-                        "worker": "coder",
-                        "result": "ready_for_review",
-                        "progress": None,
-                    }],
-                }),
+                json.dumps(
+                    {
+                        "task_id": "task-1",
+                        "completed_units": [],
+                        "reviews": [],
+                        "open_issues": [],
+                        "usage": {"coder_calls": 1, "explorer_calls": 0},
+                        "recent_attempts": [
+                            {
+                                "run_id": "run-1",
+                                "unit_id": "unit-1",
+                                "worker": "coder",
+                                "result": "ready_for_review",
+                                "progress": None,
+                            }
+                        ],
+                    }
+                ),
                 encoding="utf-8",
             )
             argv = [
                 "record-review.py",
-                "--task-id", "task-1",
-                "--run-id", "run-1",
-                "--decision", "accept",
-                "--summary", "Primary verified behavior and evidence.",
-                "--repo", str(root),
+                "--task-id",
+                "task-1",
+                "--run-id",
+                "run-1",
+                "--decision",
+                "accept",
+                "--summary",
+                "Primary verified behavior and evidence.",
+                "--repo",
+                str(root),
             ]
             with patch.object(sys, "argv", argv), contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(REVIEW.main(), 0)
@@ -121,6 +152,8 @@ class RecordReviewTests(unittest.TestCase):
             self.assertEqual(state["completed_units"][-1]["run_id"], "run-1")
             review = json.loads((run_root / "review.json").read_text(encoding="utf-8"))
             self.assertEqual(review["local_review_id"], "review-1")
+            map_data = json.loads((root / ".agent" / "repo-map.json").read_text(encoding="utf-8"))
+            self.assertEqual(map_data["accepted_changes"][0]["path"], "src/example.py")
             with patch.object(sys, "argv", argv), contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(REVIEW.main(), 2)
             self.assertEqual((run_root / "review.json").read_bytes(), review_bytes)

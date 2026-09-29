@@ -8,7 +8,6 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-
 SCRIPT_DIR = Path(__file__).resolve().parent
 EXCLUDED_PARTS = {
     ".agent",
@@ -23,7 +22,9 @@ EXCLUDED_PARTS = {
 
 
 def load_run_state() -> Any:
-    spec = importlib.util.spec_from_file_location("local_worker_cache_state", SCRIPT_DIR / "run-state.py")
+    spec = importlib.util.spec_from_file_location(
+        "local_worker_cache_state", SCRIPT_DIR / "run-state.py"
+    )
     if spec is None or spec.loader is None:
         raise RuntimeError("could not load run-state.py")
     module = importlib.util.module_from_spec(spec)
@@ -42,20 +43,48 @@ def _load_object(path: Path) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
-def record_explorer_start(repo_root: Path, task: str) -> str | None:
+def record_explorer_start(repo_root: Path, task: str, task_id: str | None = None) -> str | None:
     current_path = repo_root / ".agent" / "current-task.json"
     current = _load_object(current_path)
-    if current is None:
-        return None
-    state_ref = current.get("task_state")
-    if not isinstance(state_ref, str):
-        return None
-    state_path = repo_root / Path(state_ref)
+    if task_id is not None:
+        if (
+            not task_id
+            or not task_id[0].isascii()
+            or not task_id[0].isalnum()
+            or not all(char.isascii() and (char.isalnum() or char in "._-") for char in task_id)
+        ):
+            raise ValueError(
+                "task_id must contain only letters, digits, dot, underscore, or hyphen"
+            )
+        state_path = repo_root / ".agent" / "tasks" / task_id / "state.json"
+        if not state_path.is_file():
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            RUN_STATE.write_json_once(
+                state_path,
+                {
+                    "schema_version": 1,
+                    "task_id": task_id,
+                    "execution_history": [],
+                    "recent_attempts": [],
+                    "usage": {"coder_calls": 0, "explorer_calls": 0},
+                },
+            )
+    else:
+        if current is None or not isinstance(current.get("task_state"), str):
+            return None
+        state_path = repo_root / Path(current["task_state"])
     state = _load_object(state_path)
     if state is None:
         return None
+    if task_id is not None and state.get("task_id") != task_id:
+        raise ValueError("task state identity does not match task_id")
     run_id = f"explorer-{uuid.uuid4().hex[:12]}"
-    unit_id = current.get("unit_id") or state.get("current_unit_id") or "exploration"
+    unit_id = (
+        (current or {}).get("unit_id")
+        if (current or {}).get("task_id") == state.get("task_id")
+        else None
+    )
+    unit_id = unit_id or state.get("current_unit_id") or "exploration"
     entry = {
         "run_id": run_id,
         "unit_id": unit_id,
@@ -70,7 +99,11 @@ def record_explorer_start(repo_root: Path, task: str) -> str | None:
     history = state.setdefault("execution_history", [])
     attempts = state.setdefault("recent_attempts", [])
     usage = state.setdefault("usage", {"coder_calls": 0, "explorer_calls": 0})
-    if not isinstance(history, list) or not isinstance(attempts, list) or not isinstance(usage, dict):
+    if (
+        not isinstance(history, list)
+        or not isinstance(attempts, list)
+        or not isinstance(usage, dict)
+    ):
         return None
     history.append(entry.copy())
     attempts.append(entry)
@@ -80,21 +113,37 @@ def record_explorer_start(repo_root: Path, task: str) -> str | None:
     usage.setdefault("coder_calls", 0)
     state["updated_at"] = RUN_STATE.utc_now()
     RUN_STATE.atomic_json(state_path, state)
-    current["usage"] = usage
-    current["recent_attempts"] = attempts
-    current["updated_at"] = state["updated_at"]
-    RUN_STATE.atomic_json(current_path, current)
+    if (
+        current is not None
+        and current.get("task_state") == state_path.relative_to(repo_root).as_posix()
+    ):
+        current["usage"] = usage
+        current["recent_attempts"] = attempts
+        current["updated_at"] = state["updated_at"]
+        RUN_STATE.atomic_json(current_path, current)
     return run_id
 
 
-def record_explorer_finish(repo_root: Path, run_id: str | None, report: dict[str, Any]) -> None:
+def record_explorer_finish(
+    repo_root: Path, run_id: str | None, report: dict[str, Any], task_id: str | None = None
+) -> None:
     if run_id is None:
         return
+    if task_id is not None and (
+        not task_id
+        or not task_id[0].isascii()
+        or not task_id[0].isalnum()
+        or not all(char.isascii() and (char.isalnum() or char in "._-") for char in task_id)
+    ):
+        raise ValueError("task_id must be a safe identifier")
     current_path = repo_root / ".agent" / "current-task.json"
     current = _load_object(current_path)
-    if current is None or not isinstance(current.get("task_state"), str):
+    if task_id is not None:
+        state_path = repo_root / ".agent" / "tasks" / task_id / "state.json"
+    elif current is not None and isinstance(current.get("task_state"), str):
+        state_path = repo_root / Path(current["task_state"])
+    else:
         return
-    state_path = repo_root / Path(current["task_state"])
     state = _load_object(state_path)
     if state is None:
         return
@@ -109,13 +158,21 @@ def record_explorer_finish(repo_root: Path, run_id: str | None, report: dict[str
             if isinstance(item, dict) and item.get("run_id") == run_id:
                 item["result"] = status
                 item["failure_signature"] = signature
+                if isinstance(report.get("diagnostic_log"), str):
+                    item["diagnostic_log"] = report["diagnostic_log"]
+                if isinstance(report.get("diagnostic_report"), str):
+                    item["diagnostic_report"] = report["diagnostic_report"]
                 item["completed_at"] = RUN_STATE.utc_now()
                 break
     state["updated_at"] = RUN_STATE.utc_now()
     RUN_STATE.atomic_json(state_path, state)
-    current["recent_attempts"] = state.get("recent_attempts", [])
-    current["updated_at"] = state["updated_at"]
-    RUN_STATE.atomic_json(current_path, current)
+    if (
+        current is not None
+        and current.get("task_state") == state_path.relative_to(repo_root).as_posix()
+    ):
+        current["recent_attempts"] = state.get("recent_attempts", [])
+        current["updated_at"] = state["updated_at"]
+        RUN_STATE.atomic_json(current_path, current)
 
 
 def task_key(task: str) -> str:
@@ -189,6 +246,195 @@ class EvidenceCache:
             if actual != expected:
                 return None
         return json.loads(json.dumps(report))
+
+    def navigation_hints(
+        self,
+        *,
+        task_id: str | None = None,
+        readable: list[str] | None = None,
+        forbidden: list[str] | None = None,
+        max_entries: int = 3,
+        max_files: int = 8,
+    ) -> list[dict[str, Any]]:
+        """Return bounded prior Explorer notes only for unchanged, readable files."""
+        entries = list(self._load()["entries"].values())
+        entries = [item for item in entries if isinstance(item, dict)]
+        entries.sort(
+            key=lambda item: (
+                (isinstance(item.get("report"), dict) and item["report"].get("task_id") == task_id)
+                if task_id
+                else False,
+                str(item.get("created_at", "")),
+            ),
+            reverse=True,
+        )
+        hints: list[dict[str, Any]] = []
+        used_paths: set[str] = set()
+        root_key = os.path.normcase(str(self.repo_root))
+        accepted = self._load().get("accepted_changes", [])
+        if isinstance(accepted, list):
+            for item in reversed(accepted):
+                if len(used_paths) >= max_files:
+                    break
+                if not isinstance(item, dict):
+                    continue
+                relative = item.get("path")
+                expected = item.get("sha256")
+                if not isinstance(relative, str) or not isinstance(expected, str):
+                    continue
+                if readable is not None and not any(
+                    root == "." or relative == root or relative.startswith(root.rstrip("/") + "/")
+                    for root in readable
+                ):
+                    continue
+                if forbidden and any(
+                    relative == root or relative.startswith(root.rstrip("/") + "/")
+                    for root in forbidden
+                ):
+                    continue
+                candidate = (self.repo_root / relative).resolve()
+                try:
+                    if os.path.commonpath((root_key, os.path.normcase(str(candidate)))) != root_key:
+                        continue
+                    if hashlib.sha256(candidate.read_bytes()).hexdigest() != expected:
+                        continue
+                except (OSError, ValueError):
+                    continue
+                if relative not in used_paths:
+                    used_paths.add(relative)
+                    hints.append(
+                        {
+                            "source_task_id": item.get("task_id"),
+                            "source_question": "Accepted implementation; inspect current code for semantics.",
+                            "files": [
+                                {
+                                    "path": relative,
+                                    "sha256": expected,
+                                    "prior_reason": "Primary accepted a change to this path.",
+                                }
+                            ],
+                        }
+                    )
+                if len(hints) >= max_entries:
+                    return hints
+        for entry in entries:
+            if len(hints) >= max_entries or len(used_paths) >= max_files:
+                break
+            report = entry.get("report")
+            if not isinstance(report, dict) or report.get("status") != "success":
+                continue
+            observed = report.get("observed_hashes")
+            if not isinstance(observed, dict):
+                continue
+            files: list[dict[str, str]] = []
+            relevant_files = report.get("relevant_files")
+            if not isinstance(relevant_files, list):
+                continue
+            for item in relevant_files:
+                if len(used_paths) + len(files) >= max_files:
+                    break
+                if not isinstance(item, dict):
+                    continue
+                relative = item.get("path")
+                if (
+                    not isinstance(relative, str)
+                    or not relative
+                    or relative in used_paths
+                    or any(
+                        part in {"", ".", ".."} or part in EXCLUDED_PARTS
+                        for part in relative.replace("\\", "/").split("/")
+                    )
+                    or not isinstance(observed.get(relative), str)
+                ):
+                    continue
+                if readable is not None and not any(
+                    root == "." or relative == root or relative.startswith(root.rstrip("/") + "/")
+                    for root in readable
+                ):
+                    continue
+                if forbidden and any(
+                    relative == root or relative.startswith(root.rstrip("/") + "/")
+                    for root in forbidden
+                ):
+                    continue
+                candidate = (self.repo_root / relative).resolve()
+                try:
+                    if os.path.commonpath((root_key, os.path.normcase(str(candidate)))) != root_key:
+                        continue
+                    if (
+                        not candidate.is_file()
+                        or hashlib.sha256(candidate.read_bytes()).hexdigest() != observed[relative]
+                    ):
+                        continue
+                except (OSError, ValueError):
+                    continue
+                files.append(
+                    {
+                        "path": relative,
+                        "sha256": observed[relative],
+                        "prior_reason": str(item.get("reason", ""))[:180],
+                    }
+                )
+            if files:
+                used_paths.update(item["path"] for item in files)
+                hints.append(
+                    {
+                        "source_task_id": report.get("task_id"),
+                        "source_question": str(report.get("task", ""))[:180],
+                        "files": files,
+                    }
+                )
+        return hints
+
+    def record_accepted_paths(self, task_id: str, run_id: str, paths: list[str]) -> bool:
+        """Index accepted changed paths, never model-authored semantics."""
+        records = []
+        root_key = os.path.normcase(str(self.repo_root))
+        for relative in paths:
+            if not isinstance(relative, str) or not relative or "\\" in relative:
+                continue
+            if any(
+                part in {"", ".", ".."} or part in EXCLUDED_PARTS for part in relative.split("/")
+            ):
+                continue
+            candidate = (self.repo_root / relative).resolve()
+            try:
+                if os.path.commonpath((root_key, os.path.normcase(str(candidate)))) != root_key:
+                    continue
+                records.append(
+                    {
+                        "task_id": task_id,
+                        "run_id": run_id,
+                        "path": relative,
+                        "sha256": hashlib.sha256(candidate.read_bytes()).hexdigest(),
+                        "accepted_at": RUN_STATE.utc_now(),
+                    }
+                )
+            except (OSError, ValueError):
+                continue
+        if not records:
+            return False
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            descriptor = os.open(self.lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            return False
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(f"{os.getpid()}\n".encode("ascii"))
+            cache = self._load()
+            existing = cache.get("accepted_changes", [])
+            if not isinstance(existing, list):
+                existing = []
+            cache["accepted_changes"] = (existing + records)[-50:]
+            cache["updated_at"] = RUN_STATE.utc_now()
+            RUN_STATE.atomic_json(self.path, cache)
+            return True
+        finally:
+            try:
+                self.lock_path.unlink()
+            except FileNotFoundError:
+                pass
 
     def store(self, task: str, fingerprint: dict[str, Any], report: dict[str, Any]) -> bool:
         if not fingerprint.get("cacheable") or report.get("status") != "success":

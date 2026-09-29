@@ -2,7 +2,9 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$Task,
 
-    [string]$Report
+    [string]$Report,
+
+    [string]$TaskId
 )
 
 $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
@@ -20,6 +22,9 @@ if (Test-Path -LiteralPath $ProjectPython -PathType Leaf) {
 $Arguments = @($Runtime, "--task", $Task)
 if ($Report) {
     $Arguments += @("--report", $Report)
+}
+if ($TaskId) {
+    $Arguments += @("--task-id", $TaskId)
 }
 
 & $Python @Arguments

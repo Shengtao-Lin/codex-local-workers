@@ -4,7 +4,6 @@ import argparse
 import importlib.util
 import json
 import re
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -13,7 +12,9 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 
 
 def load_run_state() -> Any:
-    spec = importlib.util.spec_from_file_location("local_worker_review_state", SCRIPT_DIR / "run-state.py")
+    spec = importlib.util.spec_from_file_location(
+        "local_worker_review_state", SCRIPT_DIR / "run-state.py"
+    )
     if spec is None or spec.loader is None:
         raise RuntimeError("could not load run-state.py")
     module = importlib.util.module_from_spec(spec)
@@ -22,6 +23,17 @@ def load_run_state() -> Any:
 
 
 RUN_STATE = load_run_state()
+
+
+def load_evidence_cache() -> Any:
+    spec = importlib.util.spec_from_file_location(
+        "local_worker_review_evidence", SCRIPT_DIR / "evidence-cache.py"
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("could not load evidence-cache.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def identifier(value: str, name: str) -> str:
@@ -66,7 +78,9 @@ def passing_local_review(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Record an immutable Primary review for a Coder run.")
+    parser = argparse.ArgumentParser(
+        description="Record an immutable Primary review for a Coder run."
+    )
     parser.add_argument("--task-id", required=True)
     parser.add_argument("--run-id", required=True)
     parser.add_argument(
@@ -104,7 +118,11 @@ def main() -> int:
         reviews = state.setdefault("reviews", [])
         completed_units = state.setdefault("completed_units", [])
         attempts = state.setdefault("recent_attempts", [])
-        if not isinstance(reviews, list) or not isinstance(completed_units, list) or not isinstance(attempts, list):
+        if (
+            not isinstance(reviews, list)
+            or not isinstance(completed_units, list)
+            or not isinstance(attempts, list)
+        ):
             raise ValueError("task review fields must be arrays")
         review = {
             "schema_version": 1,
@@ -180,6 +198,20 @@ def main() -> int:
                 "updated_at": review["reviewed_at"],
             },
         )
+        if args.decision == "accept":
+            changed_files = handoff.get("changed_files", [])
+            if isinstance(changed_files, list):
+                paths = [
+                    item["path"]
+                    for item in changed_files
+                    if isinstance(item, dict) and isinstance(item.get("path"), str)
+                ]
+                try:
+                    load_evidence_cache().EvidenceCache(repo_root).record_accepted_paths(
+                        task_id, run_id, paths
+                    )
+                except (OSError, ValueError):
+                    pass  # Navigation hints are best-effort; the review is already recorded.
     except (OSError, ValueError, RUN_STATE.RunStateError) as exc:
         print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False))
         return 2

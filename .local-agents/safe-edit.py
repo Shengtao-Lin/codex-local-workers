@@ -57,6 +57,7 @@ class SafeEditor:
         self.repo_root = repo_root.resolve()
         self.allowed_modify = {normalize_relative_path(path) for path in allowed_modify}
         self.allowed_create = {normalize_relative_path(path) for path in allowed_create}
+        self.created_this_run: set[str] = set()
         self.mutation_guard = mutation_guard
 
     def _assert_no_reparse_components(self, relative: str) -> None:
@@ -144,6 +145,7 @@ class SafeEditor:
             self._write_new_file(path, output)
         except FileExistsError as exc:
             raise SafeEditError(f"refusing to overwrite existing file: {relative}") from exc
+        self.created_this_run.add(relative)
         return {"path": relative, "sha256": sha256_bytes(output), "operation": "created"}
 
     def replace(
@@ -155,7 +157,7 @@ class SafeEditor:
     ) -> dict[str, str]:
         self._assert_mutation_allowed()
         relative, path = self.resolve(raw_path)
-        if relative not in self.allowed_modify:
+        if relative not in self.allowed_modify and relative not in self.created_this_run:
             raise SafeEditError(f"file is not authorized for modification: {relative}")
         if not path.is_file():
             raise SafeEditError(f"file does not exist: {relative}")
@@ -202,9 +204,7 @@ class SafeEditor:
                 )
             start = max(0, best_index - 3)
             end = min(len(lines), best_index + 4)
-            context = "\n".join(
-                f"{index + 1}: {lines[index]}" for index in range(start, end)
-            )
+            context = "\n".join(f"{index + 1}: {lines[index]}" for index in range(start, end))
             raise SafeEditError(
                 "target block was not found",
                 details={
@@ -215,12 +215,65 @@ class SafeEditor:
                 },
             )
         if occurrences != 1:
-            raise SafeEditError(
-                f"target block occurs {occurrences} times; refusing ambiguous edit"
-            )
+            raise SafeEditError(f"target block occurs {occurrences} times; refusing ambiguous edit")
 
         updated = text.replace(find, replacement, 1).encode("utf-8")
         output = (b"\xef\xbb\xbf" + updated) if bom else updated
+        self._assert_no_reparse_components(relative)
+        if sha256_bytes(path.read_bytes()) != current_sha256:
+            raise SafeEditError(
+                f"file changed during edit preparation: {relative}; read it again before editing"
+            )
+        self._atomic_replace(path, output)
+        return {"path": relative, "sha256": sha256_bytes(output), "operation": "modified"}
+
+    def replace_line(
+        self,
+        raw_path: str,
+        line_number: int,
+        replacement: str,
+        expected_sha256: str,
+    ) -> dict[str, str]:
+        self._assert_mutation_allowed()
+        relative, path = self.resolve(raw_path)
+        if relative not in self.allowed_modify and relative not in self.created_this_run:
+            raise SafeEditError(f"file is not authorized for modification: {relative}")
+        if not path.is_file():
+            raise SafeEditError(f"file does not exist: {relative}")
+        if type(line_number) is not int or line_number < 1:
+            raise SafeEditError("line must be a positive integer")
+        if not isinstance(replacement, str) or "\n" in replacement or "\r" in replacement:
+            raise SafeEditError("line replacement must be one line of text")
+        if len(replacement) > 2000:
+            raise SafeEditError("line replacement is too long")
+        raw = path.read_bytes()
+        current_sha256 = sha256_bytes(raw)
+        if current_sha256 != expected_sha256:
+            raise SafeEditError(
+                f"file changed since it was read: {relative}; read it again before editing"
+            )
+        bom = raw.startswith(b"\xef\xbb\xbf")
+        try:
+            text = (raw[3:] if bom else raw).decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise SafeEditError(f"file is not UTF-8: {relative}") from exc
+        lines = text.splitlines(keepends=True)
+        if line_number > len(lines):
+            raise SafeEditError(f"line is outside the file: {relative} line {line_number}")
+        old = lines[line_number - 1]
+        ending = (
+            "\r\n"
+            if old.endswith("\r\n")
+            else "\n"
+            if old.endswith("\n")
+            else "\r"
+            if old.endswith("\r")
+            else ""
+        )
+        if old.removesuffix(ending) == replacement:
+            raise SafeEditError("line replacement makes no change")
+        lines[line_number - 1] = replacement + ending
+        output = (b"\xef\xbb\xbf" if bom else b"") + "".join(lines).encode("utf-8")
         self._assert_no_reparse_components(relative)
         if sha256_bytes(path.read_bytes()) != current_sha256:
             raise SafeEditError(

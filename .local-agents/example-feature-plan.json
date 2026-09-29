@@ -1,5 +1,6 @@
 {
   "schema_version": 1,
+  "plan_revision": 1,
   "task_id": "lease-fencing",
   "feature_id": "lease-fencing",
   "feature_risk": "high",
@@ -7,6 +8,13 @@
   "risk_reasons": [
     "The feature changes transaction finalization ordering.",
     "An incorrect implementation can commit success after lease loss."
+  ],
+  "contracts": [
+    {"id": "lease-event-order-evidence", "risk_floor": "medium", "text": "Protected tests record handler, lease check, rollback, and commit order."},
+    {"id": "lease-check-after-handler", "risk_floor": "high", "text": "After the handler returns, check the current lease before finalizing."},
+    {"id": "invalid-lease-rolls-back", "risk_floor": "high", "text": "An invalid lease rolls back without committing success or failure."},
+    {"id": "success-only-after-valid-lease", "risk_floor": "high", "text": "Commit success only after the post-handler lease check succeeds."},
+    {"id": "document-lease-fencing", "risk_floor": "small", "text": "Document the post-handler lease check and rollback behavior."}
   ],
   "units": [
     {
@@ -17,6 +25,13 @@
       "owned_contract_ids": [
         "lease-event-order-evidence"
       ],
+      "scope_authority": {
+        "read_roots": ["src/agent_runtime", "tests/test_lease_fencing.py"],
+        "modify": ["tests/test_lease_fencing.py"],
+        "create": [],
+        "readonly": [],
+        "forbidden": [".agent", "AGENTS.md"]
+      },
       "status": "planned"
     },
     {
@@ -31,6 +46,26 @@
         "invalid-lease-rolls-back",
         "success-only-after-valid-lease"
       ],
+      "scope_authority": {
+        "read_roots": ["src/agent_runtime", "tests/test_lease_fencing.py"],
+        "modify": ["src/agent_runtime/worker.py"],
+        "create": [],
+        "readonly": ["tests/test_lease_fencing.py"],
+        "forbidden": [".agent", "AGENTS.md"]
+      },
+      "packet_contract": {
+        "acceptance_criteria": [
+          {"id": "lease-tests", "text": "Protected lease-fencing tests pass."}
+        ],
+        "acceptance_scenarios": [
+          {"id": "valid-lease", "text": "Valid lease commits success after the handler and lease check.", "observables": {"commit_calls": 1}},
+          {"id": "lost-lease", "text": "Lost lease rolls back without finalization.", "observables": {"commit_calls": 0}}
+        ],
+        "required_order": ["Run the handler.", "Check the current lease.", "Commit success only after a valid lease."],
+        "forbidden_orderings": ["Do not finalize before the post-handler lease check."],
+        "validation_profile": "python-focused",
+        "required_focused_tests": ["tests/test_lease_fencing.py"]
+      },
       "status": "planned"
     },
     {
@@ -43,6 +78,25 @@
       "owned_contract_ids": [
         "document-lease-fencing"
       ],
+      "scope_authority": {
+        "read_roots": ["docs/lease-fencing.md", "tests/test_lease_fencing.py"],
+        "modify": [],
+        "create": ["docs/lease-fencing.md"],
+        "readonly": ["tests/test_lease_fencing.py"],
+        "forbidden": [".agent", "AGENTS.md"]
+      },
+      "packet_contract": {
+        "acceptance_criteria": [
+          {"id": "lease-docs", "text": "Documentation states the lease check and rollback behavior."}
+        ],
+        "acceptance_scenarios": [
+          {"id": "documented-loss", "text": "The document explains the lost-lease outcome.", "observables": {"rollback_documented": true}}
+        ],
+        "required_order": [],
+        "forbidden_orderings": [],
+        "validation_profile": "python-focused",
+        "required_focused_tests": ["tests/test_lease_fencing.py"]
+      },
       "status": "planned"
     }
   ]
