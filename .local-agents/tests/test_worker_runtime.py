@@ -581,6 +581,99 @@ class WorkerRuntimeTests(unittest.TestCase):
                 )
             self.assertEqual(runtime.repairs, 0)
 
+    def test_failed_validation_edit_shape_and_noop_reach_current_validation(self) -> None:
+        class RepairReplayClient:
+            def __init__(self) -> None:
+                self.step = 0
+                self.source_hash = ""
+
+            def complete(self, messages: list[dict[str, str]]) -> str:
+                self.step += 1
+                observations = [
+                    json.loads(item["content"].split("\n", 1)[1])
+                    for item in messages
+                    if item["role"] == "user" and item["content"].startswith("OBSERVATION\n")
+                ]
+                if self.step == 1:
+                    action = {"action": "READ_FILE", "arguments": {"path": "src/example.py"}}
+                elif self.step == 2:
+                    self.source_hash = observations[-1]["sha256"]
+                    action = {"action": "VALIDATE", "arguments": {}}
+                elif self.step == 3:
+                    action = {
+                        "action": "SAFE_REPLACE",
+                        "arguments": {
+                            "path": "src/example.py",
+                            "expected_sha256": self.source_hash,
+                            "find": "VALUE = 1\n",
+                            "replace": "VALUE = 2  \n",
+                        },
+                    }
+                elif self.step == 4:
+                    action = {"action": "READ_FILE", "arguments": {"path": "src/example.py"}}
+                elif self.step == 5:
+                    self.source_hash = observations[-1]["sha256"]
+                    action = {
+                        "action": "SAFE_REPLACE_LINE",
+                        "arguments": {
+                            "path": "src/example.py",
+                            "expected_sha256": self.source_hash,
+                            "line": 1,
+                            "replacement": "VALUE = 2\nOTHER = 3",
+                        },
+                    }
+                elif self.step == 6:
+                    action = {
+                        "action": "SAFE_REPLACE",
+                        "arguments": {
+                            "path": "src/example.py",
+                            "expected_sha256": self.source_hash,
+                            "find": "VALUE = 2  ",
+                            "replace": "VALUE = 2",
+                        },
+                    }
+                elif self.step == 7:
+                    action = {
+                        "action": "SAFE_REPLACE",
+                        "arguments": {
+                            "path": "src/example.py",
+                            "expected_sha256": self.source_hash,
+                            "find": "VALUE = 2",
+                            "replace": "VALUE = 2",
+                        },
+                    }
+                elif self.step == 8:
+                    self.assertion = observations[-1]["required_next_action"]
+                    action = {"action": "VALIDATE", "arguments": {}}
+                else:
+                    action = {
+                        "action": "FINISH_SUCCESS",
+                        "arguments": {
+                            "summary": ["Validated current draft."],
+                            "remaining_uncertainty": [],
+                        },
+                    }
+                return json.dumps(action)
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            (root / "tests" / "test_example.py").write_text(
+                "import runpy\n\ndef test_value():\n    assert runpy.run_path('src/example.py')['VALUE'] == 2\n",
+                encoding="utf-8",
+            )
+            value = packet_v2()
+            value["limits"] = {"max_model_turns": 14}
+            client = RepairReplayClient()
+            runtime = RUNTIME.WorkerRuntime(root, value, {"python": sys.executable}, client)
+            report = runtime.run()
+            self.assertEqual(report["status"], "ready_for_review")
+            self.assertEqual(client.assertion, "VALIDATE")
+            self.assertEqual(runtime.protocol_errors, 0)
+            self.assertEqual(runtime.validation_count, 2)
+            self.assertFalse(runtime.noop_validation_pending)
+            self.assertEqual((root / "src/example.py").read_text(), "VALUE = 2\n")
+
     def test_placeholder_warning_only_for_new_executable_raise(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)

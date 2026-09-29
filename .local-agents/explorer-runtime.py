@@ -736,6 +736,8 @@ class ExplorerRuntime:
         self.no_progress_streak = 0
         self.finish_repair_pending = False
         self.finish_repair_used = False
+        self.required_citation_read: str | None = None
+        self.required_citation_read_rejections = 0
         self.max_no_progress_streak = int(config.get("max_explorer_no_progress_streak", 3))
         self.read_hashes: dict[str, str] = {}
         self.read_observations: dict[str, str] = {}
@@ -1019,11 +1021,38 @@ finding or concluding the current question is answered."""
             envelope: dict[str, Any] | None = None
             try:
                 envelope = parse_action(raw)
+                warnings = []
                 if finish_only and envelope["action"] != "FINISH_SUCCESS":
                     raise ExplorerError("report-only recovery permits only FINISH_SUCCESS")
-                warnings = envelope["warnings"]
-                self.protocol_normalizations += len(warnings)
-                observation, final = self.execute(envelope["action"], envelope["arguments"])
+                if self.required_citation_read is not None:
+                    expected_path = self.required_citation_read
+                    if (
+                        envelope["action"] != "READ_FILE"
+                        or envelope["arguments"].get("path") != expected_path
+                    ):
+                        self.required_citation_read_rejections += 1
+                        if self.required_citation_read_rejections >= 2:
+                            raise ExplorerError(
+                                "required citation READ_FILE was ignored twice: " + expected_path
+                            )
+                        observation = {
+                            "status": "rejected",
+                            "error": "required_citation_read_not_taken",
+                            "next_step": (
+                                "Next action exactly READ_FILE with path " + expected_path
+                            ),
+                        }
+                        final = None
+                    else:
+                        self.required_citation_read = None
+                        self.required_citation_read_rejections = 0
+                        warnings = envelope["warnings"]
+                        self.protocol_normalizations += len(warnings)
+                        observation, final = self.execute(envelope["action"], envelope["arguments"])
+                else:
+                    warnings = envelope["warnings"]
+                    self.protocol_normalizations += len(warnings)
+                    observation, final = self.execute(envelope["action"], envelope["arguments"])
                 if warnings and final is None:
                     observation["protocol_warnings"] = warnings
             except (ExplorerError, OSError, UnicodeDecodeError, re.error) as exc:
@@ -1176,6 +1205,30 @@ finding or concluding the current question is answered."""
                 self.no_progress_streak = 0 if evidence else self.no_progress_streak + 1
             else:
                 self.no_progress_streak += 1
+            if (
+                self.mode == "locate"
+                and envelope is not None
+                and envelope["action"] == "SEARCH"
+                and observation.get("status") == "ok"
+                and not observation.get("results")
+                and self.required_citation_read is None
+            ):
+                for candidate in self.config.get("explorer_required_citation_paths", []):
+                    if not isinstance(candidate, str):
+                        continue
+                    try:
+                        relative, required_file = self.resolve(candidate)
+                    except ExplorerError:
+                        continue
+                    if relative not in self.read_files and required_file.is_file():
+                        self.required_citation_read = relative
+                        self.required_citation_read_rejections = 0
+                        observation["next_step"] = (
+                            "Content search found no matches. The required citation file exists; "
+                            "next action exactly READ_FILE with path " + relative + "."
+                        )
+                        self.no_progress_streak = 0
+                        break
             if self.finish_repair_pending:
                 # One invalid terminal report is a formatting error, not another
                 # repository investigation. Allow its single report-only retry

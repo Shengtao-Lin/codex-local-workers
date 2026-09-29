@@ -95,6 +95,17 @@ def post_edit_progress_schema(base: dict[str, Any]) -> dict[str, Any]:
     return schema
 
 
+def validation_only_action_schema(base: dict[str, Any]) -> dict[str, Any]:
+    """After a no-op edit, require validation of the current draft or explicit exit."""
+    schema = json.loads(json.dumps(base))
+    schema["properties"]["action"]["enum"] = [
+        "VALIDATE",
+        "FINISH_BLOCKED",
+        "REQUEST_CONTRACT_REVISION",
+    ]
+    return schema
+
+
 def _load_safe_edit() -> Any:
     spec = importlib.util.spec_from_file_location(
         "local_worker_safe_edit", SCRIPT_DIR / "safe-edit.py"
@@ -1121,6 +1132,9 @@ class WorkerRuntime:
         self.duplicate_read_streak = 0
         self.duplicate_read_count = 0
         self.noop_repair_attempts = 0
+        self.multiline_shape_repair_revisions: set[tuple[str, int]] = set()
+        self.noop_validation_nudge_revisions: set[int] = set()
+        self.noop_validation_pending = False
         self.repair_supervision_states: set[tuple[int, int]] = set()
         self.repair_evidence_action_counts: dict[tuple[int, int], int] = {}
         self.post_edit_evidence_counts: dict[int, int] = {}
@@ -1625,7 +1639,18 @@ while removing only the unused binding. Previous attempts are context, not autho
                     and getattr(self.client, "structured_output", False)
                     and isinstance(original_action_schema, dict)
                 )
-                if repair_only_turn:
+                validation_only_turn = (
+                    self.noop_validation_pending
+                    and getattr(self.client, "structured_output", False)
+                    and isinstance(original_action_schema, dict)
+                )
+                if validation_only_turn:
+                    self.client.action_schema = validation_only_action_schema(
+                        original_action_schema
+                    )
+                    self.client.schema_name = "local_coder_validate_current_draft"
+                    self.archive.event("noop_validation_gate", {"turn": _turn})
+                elif repair_only_turn:
                     self.client.action_schema = repair_only_action_schema(
                         original_action_schema, supervised_repair["required_next_action"]
                     )
@@ -1683,7 +1708,7 @@ while removing only the unused binding. Previous attempts are context, not autho
                 finally:
                     if isinstance(original_timeout, (int, float)):
                         self.client.timeout = original_timeout
-                    if repair_only_turn or post_edit_progress_turn:
+                    if validation_only_turn or repair_only_turn or post_edit_progress_turn:
                         self.client.action_schema = original_action_schema
                         self.client.schema_name = original_schema_name
                 messages.append({"role": "assistant", "content": raw})
@@ -1696,6 +1721,16 @@ while removing only the unused binding. Previous attempts are context, not autho
                     required_path = (
                         required_repair.get("required_path") if required_repair else None
                     )
+                    if self.noop_validation_pending and action["action"] not in {
+                        "VALIDATE",
+                        "FINISH_BLOCKED",
+                        "REQUEST_CONTRACT_REVISION",
+                    }:
+                        raise WorkerError(
+                            "current edited draft requires VALIDATE after a no-op replacement"
+                        )
+                    if action["action"] == "VALIDATE":
+                        self.noop_validation_pending = False
                     if self._validated_terminal_state() and action["action"] != "FINISH_SUCCESS":
                         self._assert_validation_current()
                         if self.terminal_nudge_revision != self.edit_revision:
@@ -2110,13 +2145,46 @@ while removing only the unused binding. Previous attempts are context, not autho
                         )
                         and not self.observable_scenario_shape_repair_used
                     )
+                    edit_shape_key = (
+                        (action["arguments"].get("path"), self.edit_revision)
+                        if action is not None
+                        else (None, self.edit_revision)
+                    )
+                    multiline_shape_repair = (
+                        action is not None
+                        and action["action"] == "SAFE_REPLACE_LINE"
+                        and str(exc) == "line replacement must be one line of text"
+                        and bool(getattr(exc, "details", {}).get("edit_format_repair"))
+                        and edit_shape_key not in self.multiline_shape_repair_revisions
+                    )
+                    if multiline_shape_repair:
+                        self.multiline_shape_repair_revisions.add(edit_shape_key)
+                        self.archive.event(
+                            "multiline_edit_shape_repair",
+                            {"turn": _turn, "path": edit_shape_key[0]},
+                        )
+                    noop_validation_nudge = (
+                        action is not None
+                        and action["action"] == "SAFE_REPLACE"
+                        and str(exc).startswith("SAFE_REPLACE find and replace are identical")
+                        and bool(self.changed)
+                        and self.validation is None
+                        and self.edit_revision not in self.noop_validation_nudge_revisions
+                    )
+                    if noop_validation_nudge:
+                        self.noop_validation_nudge_revisions.add(self.edit_revision)
+                        self.noop_validation_pending = True
+                        self.archive.event(
+                            "noop_validation_nudge",
+                            {"turn": _turn, "edit_revision": self.edit_revision},
+                        )
                     if scenario_shape_repair:
                         self.observable_scenario_shape_repair_used = True
                         self.archive.event(
                             "observable_scenario_shape_repair",
                             {"turn": _turn},
                         )
-                    else:
+                    elif not multiline_shape_repair and not noop_validation_nudge:
                         self.protocol_errors += 1
                     error_code = self._error_code(exc)
                     details = getattr(exc, "details", {})
@@ -2137,6 +2205,20 @@ while removing only the unused binding. Previous attempts are context, not autho
                     }
                     if details:
                         observation["details"] = details
+                    if noop_validation_nudge:
+                        observation["required_next_action"] = "VALIDATE"
+                        observation["next_step"] = (
+                            "No edit ran. Validate the current changed draft now with the "
+                            "packet's contract_check, or explicitly block if the contract cannot "
+                            "be confirmed. Validation will report any remaining quality issues."
+                        )
+                        observation["validate_repair"] = {
+                            "example": {
+                                "action": "VALIDATE",
+                                "arguments": {"contract_check": self.contract_check_template()},
+                            },
+                            "instruction": "Confirm only obligations supported by the current diff.",
+                        }
                     if action is not None and action["action"] == "VALIDATE":
                         observation["validate_repair"] = {
                             "example": {

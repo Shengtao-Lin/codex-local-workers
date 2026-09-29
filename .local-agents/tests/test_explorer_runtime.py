@@ -198,6 +198,48 @@ class LocateEvidenceRepairClient:
         )
 
 
+class RequiredTestReadClient:
+    def __init__(self, repeat_search: bool = False) -> None:
+        self.repeat_search = repeat_search
+        self.step = 0
+        self.messages_seen: list[list[dict[str, str]]] = []
+
+    def complete(self, messages: list[dict[str, str]]) -> str:
+        self.messages_seen.append(list(messages))
+        self.step += 1
+        if self.step == 1:
+            action = {"action": "READ_FILE", "path": "greeting.py"}
+        elif self.step == 2 or (self.repeat_search and self.step == 3):
+            action = {
+                "action": "SEARCH",
+                "path": "tests",
+                "query": "test_greeting",
+                "glob": "**/*.py",
+            }
+        elif self.step == 3 or (self.repeat_search and self.step == 4):
+            action = {"action": "READ_FILE", "path": "tests/test_greeting.py"}
+        else:
+            action = {
+                "action": "FINISH_SUCCESS",
+                "source_refs": [
+                    {
+                        "path": "greeting.py",
+                        "start_line": 1,
+                        "end_line": 1,
+                        "kind": "implementation",
+                    },
+                    {
+                        "path": "tests/test_greeting.py",
+                        "start_line": 2,
+                        "end_line": 2,
+                        "kind": "test",
+                    },
+                ],
+                "uncertainties": [],
+            }
+        return json.dumps(action)
+
+
 class ExplorerRuntimeTests(unittest.TestCase):
     def test_globstar_does_not_hide_root_level_test_directory(self) -> None:
         with TemporaryDirectory() as directory:
@@ -329,6 +371,41 @@ class ExplorerRuntimeTests(unittest.TestCase):
             self.assertEqual(report["budget_usage"]["protocol_errors"], 1)
             self.assertIn("READ_FILE", client.allowed_tools[1])
             self.assertFalse(runtime.finish_repair_used)
+
+    def test_empty_content_search_requires_read_of_known_test_file(self) -> None:
+        for repeat_search in (False, True):
+            with self.subTest(repeat_search=repeat_search), TemporaryDirectory() as directory:
+                root = Path(directory)
+                self.make_tree(root)
+                (root / "tests" / "test_greeting.py").write_text(
+                    "from greeting import build_greeting\nassert build_greeting() is None\n",
+                    encoding="utf-8",
+                )
+                client = RequiredTestReadClient(repeat_search)
+                runtime = RUNTIME.ExplorerRuntime(
+                    root,
+                    "Locate the implementation and the test assertion.",
+                    {
+                        "explorer_mode": "locate",
+                        "explorer_required_citation_paths": ["tests/test_greeting.py"],
+                        "explorer_require_test_assertion_citation": True,
+                    },
+                    client,
+                )
+                report = runtime.run()
+                self.assertEqual(report["status"], "success")
+                self.assertEqual(runtime.search_count, 1)
+                self.assertEqual(runtime.read_files, {"greeting.py", "tests/test_greeting.py"})
+                self.assertIn(
+                    "READ_FILE with path tests/test_greeting.py",
+                    client.messages_seen[2][-1]["content"],
+                )
+                if repeat_search:
+                    self.assertEqual(runtime.required_citation_read_rejections, 0)
+                    self.assertIn(
+                        "required_citation_read_not_taken",
+                        client.messages_seen[3][-1]["content"],
+                    )
 
     def test_localization_requires_actual_test_assertion_citation_when_configured(self) -> None:
         with TemporaryDirectory() as directory:
