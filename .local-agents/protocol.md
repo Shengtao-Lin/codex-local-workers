@@ -87,6 +87,9 @@ SHA-256, an integer line number already shown by READ_FILE or SEARCH at that
 hash, and a single replacement line without a newline. It preserves the file's
 line endings and BOM, rejects a no-op, and remains subject to focused validation
 and independent review. It does not grant edits to unread or forbidden paths.
+An empty line replacement blanks that line and leaves neighboring lines in
+place. To remove a statement, use an exact `SAFE_REPLACE` with empty `replace`;
+never copy the next statement into the removed statement's line.
 Coder `SEARCH` treats the query as literal text by default; `mode: "regex"`
 enables a deliberate regular expression. A malformed explicit regex returns a
 bounded protocol error rather than proving a symbol absent.

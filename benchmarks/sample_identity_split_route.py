@@ -133,20 +133,27 @@ def feature_plan(base_packet: dict) -> dict:
     }
 
 
-def split_provenance() -> dict:
+def split_provenance(mode: dict | None = None) -> dict:
     source_config = read_json(STABILITY.KIT / ".local-agents" / "config.json")
     source_config["explorer_mode"] = "locate"
     return {
         **ROUTE.runtime_manifest(source_config),
         "case_input_sha256": ROUTE._sha256_json(
-            {"case": asdict(CASE), "units": UNITS, "variant": "dependent-split"}
+            {
+                "case": asdict(CASE),
+                "units": UNITS,
+                "variant": "dependent-split",
+                "mode": mode,
+            }
         ),
     }
 
 
 def require_frozen_provenance(root: Path) -> None:
     recorded = read_json(root / ".agent" / "split-provenance.json")
-    current = split_provenance()
+    current = split_provenance(
+        read_json(root / ".agent" / "split-coordinator-mode.json")
+    )
     if (
         recorded.get("runtime_sha256") != current["runtime_sha256"]
         or recorded.get("case_input_sha256") != current["case_input_sha256"]
@@ -154,12 +161,19 @@ def require_frozen_provenance(root: Path) -> None:
         raise ValueError("split fixture runtime, role config, or case input changed")
 
 
-def prepare() -> Path:
+def prepare(*, model_coordinator: bool = False, supervised_entry: bool = False) -> Path:
     source_config = read_json(STABILITY.KIT / ".local-agents" / "config.json")
     source_config["explorer_mode"] = "locate"
     root = STABILITY.WORK / f"route-split-{uuid.uuid4().hex[:12]}" / CASE.name
     config_path, packet_path = STABILITY.prepare(CASE, root, source_config)
-    STABILITY.write_json(root / ".agent" / "split-provenance.json", split_provenance())
+    mode = {
+        "enabled": model_coordinator or supervised_entry,
+        "supervised_entry": supervised_entry,
+    }
+    STABILITY.write_json(
+        root / ".agent" / "split-provenance.json", split_provenance(mode)
+    )
+    STABILITY.write_json(root / ".agent" / "split-coordinator-mode.json", mode)
     base_packet = read_json(packet_path)
     plan = feature_plan(base_packet)
     contracts = plan["contracts"]
@@ -267,27 +281,137 @@ def run_unit(root: Path, unit_id: str) -> dict:
             run_refs_path,
             {"fingerprint": {"task_id": TASK_ID, "run_id": "fingerprint-a1"}},
         )
+    mode_path = root / ".agent" / "split-coordinator-mode.json"
+    model_coordinator = (
+        mode_path.is_file() and read_json(mode_path).get("enabled") is True
+    )
+    supervised_entry = (
+        mode_path.is_file() and read_json(mode_path).get("supervised_entry") is True
+    )
+    coordinator_reports = {}
+    if model_coordinator:
+        if unit_id == "fingerprint":
+            STABILITY.write_json(run_refs_path, {})
+        reference = read_json(packet_path)
+        STABILITY.write_json(
+            root / ".agent" / f"split-{unit_id}-primary-reference.json", reference
+        )
+        context_path = root / ".agent" / f"split-{unit_id}-coordinator-context.json"
+        STABILITY.write_json(
+            context_path,
+            {
+                "identity": {
+                    key: reference[key]
+                    for key in ("unit_id", "run_id", "attempt", "packet_revision")
+                },
+                "goal": reference["goal"],
+                "source_refs": full.get("source_refs", []),
+                "navigation_targets": reference["edit_targets"],
+                "question": "Use runtime execution evidence for the next decision. For a proposal, use "
+                "the granted identity and navigation targets, exact Primary required focused tests, "
+                "no supplemental tests, scope inside ceilings, and advisory implementation_guidance strings.",
+            },
+        )
+        for mode in () if supervised_entry else ("decision", "proposal"):
+            output_path = root / ".agent" / f"split-{unit_id}-coordinator-{mode}.json"
+            generated = STABILITY.run_command(
+                root,
+                [
+                    sys.executable,
+                    str(STABILITY.KIT / ".local-agents/coordinator-runtime.py"),
+                    "--plan",
+                    str(plan_path),
+                    "--context",
+                    str(context_path),
+                    "--mode",
+                    mode,
+                    "--config",
+                    str(config_path),
+                    "--report",
+                    str(output_path),
+                    *(
+                        ["--check-transition", "--run-refs", str(run_refs_path)]
+                        if mode == "decision"
+                        else []
+                    ),
+                ],
+                900,
+            )
+            report = read_json(output_path) if output_path.is_file() else {}
+            coordinator_reports[mode] = report
+            expected = "transition_valid" if mode == "decision" else "protocol_valid"
+            if (
+                generated.returncode != 0
+                or report.get("status") != expected
+                or (
+                    mode == "decision"
+                    and report.get("output")
+                    != {"decision": "CONTINUE", "unit_id": unit_id}
+                )
+            ):
+                return {
+                    "stage": "coordinator",
+                    "unit_id": unit_id,
+                    "mode": mode,
+                    "report": report,
+                    "output_tail": (generated.stdout + generated.stderr)[-700:],
+                }
+        if not supervised_entry:
+            packet = contract_module().materialize_bounded_packet(
+                read_json(plan_path), coordinator_reports["proposal"]["output"]
+            )
+            STABILITY.write_json(packet_path, packet)
+    if supervised_entry:
+        contract = contract_module()
+        plan = read_json(plan_path)
+        state_path = root / ".agent/coordinator" / plan["feature_id"] / "state.json"
+        sequence = contract.load_coordinator_state(plan, root, state_path)["sequence"]
+        route_args = [
+            str(STABILITY.KIT / ".local-agents/coordinator-supervised.py"),
+            "--context",
+            str(context_path),
+            "--run-refs",
+            str(run_refs_path),
+            "--authorize-step",
+            "--expected-sequence",
+            str(sequence),
+            "--manage-exploration",
+        ]
+    else:
+        route_args = [
+            str(STABILITY.KIT / ".local-agents/coordinator-localization.py"),
+            "--packet",
+            str(packet_path),
+            *(["--run-refs", str(run_refs_path)] if unit_id == "reuse-key" else []),
+        ]
     route = STABILITY.run_command(
         root,
         [
             sys.executable,
-            str(STABILITY.KIT / ".local-agents" / "coordinator-localization.py"),
+            *route_args,
             "--plan",
             str(plan_path),
-            "--packet",
-            str(packet_path),
             "--request",
             str(request_path),
             "--explorer-report",
             str(report_path),
             "--config",
             str(config_path),
-            *(["--run-refs", str(run_refs_path)] if unit_id == "reuse-key" else []),
         ],
         1200,
     )
     try:
         routed = json.loads(route.stdout)
+        if supervised_entry and "unit_result" in routed:
+            archive = Path(routed["archive"])
+            coordinator_reports = {
+                mode: read_json(archive / f"{mode}.json")
+                for mode in ("decision", "proposal")
+            }
+            coordinator_reports["exploration"] = read_json(
+                archive / "exploration-choice.json"
+            )
+            routed = routed["unit_result"]
     except ValueError:
         routed = {"output_tail": (route.stdout + route.stderr)[-1000:]}
     focused = STABILITY.run_command(
@@ -295,6 +419,9 @@ def run_unit(root: Path, unit_id: str) -> dict:
     )
     result = {
         "unit_id": unit_id,
+        "model_coordinator": model_coordinator,
+        "supervised_entry": supervised_entry,
+        "coordinator": coordinator_reports,
         "explorer_status": full.get("status"),
         "explorer_report": str(report_path),
         "route_exit": route.returncode,
@@ -408,13 +535,22 @@ def main() -> int:
     parser.add_argument("phase", choices=("first", "second", "verify", "inspect"))
     parser.add_argument("--workspace", type=Path)
     parser.add_argument("--record-integration", action="store_true")
+    parser.add_argument("--model-coordinator", action="store_true")
+    parser.add_argument("--supervised-entry", action="store_true")
     args = parser.parse_args()
+    if (args.model_coordinator or args.supervised_entry) and args.phase != "first":
+        parser.error(
+            "Coordinator mode is frozen by first; do not change it in later phases"
+        )
     if args.record_integration and args.phase != "verify":
         parser.error("--record-integration is only valid with verify")
     if args.phase == "first":
         if args.workspace is not None:
             parser.error("first creates a fresh frozen workspace; omit --workspace")
-        root = prepare()
+        root = prepare(
+            model_coordinator=args.model_coordinator,
+            supervised_entry=args.supervised_entry,
+        )
         result = run_unit(root, "fingerprint")
     else:
         if args.workspace is None:

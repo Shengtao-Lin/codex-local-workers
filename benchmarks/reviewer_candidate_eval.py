@@ -34,13 +34,18 @@ def run(
     approved_python_current: bool = False,
     bypass_startup_probe: bool = False,
     reviewer_native_tools: bool = False,
+    request_timeout: int | None = None,
+    reasoning_strength: str | None = None,
 ) -> Path:
     workspace = workspace.resolve()
     config = REVIEWER.load_object(workspace / ".local-agents" / "config.json")
     packet = REVIEWER.load_object(workspace / ".agent" / "packet.json")
     config["reviewer_model"] = model
-    if reviewer_native_tools:
-        config["reviewer_native_tools"] = True
+    config["reviewer_native_tools"] = reviewer_native_tools
+    if request_timeout is not None:
+        config["model_request_timeout_seconds"] = request_timeout
+    if reasoning_strength is not None:
+        config["reviewer_reasoning_strength"] = reasoning_strength
     if approved_python_current:
         config["python"] = sys.executable
         for profile in config.get("validation_profiles", {}).values():
@@ -117,6 +122,10 @@ def run(
             "approved_python_override": approved_python_current,
             "startup_probe_bypassed": bypass_startup_probe,
             "reviewer_native_tools": reviewer_native_tools,
+            "request_timeout_seconds": int(
+                config.get("model_request_timeout_seconds", 180)
+            ),
+            "reasoning_strength": config.get("reviewer_reasoning_strength"),
             "seconds": round(time.monotonic() - started, 3),
             "review_archive": str(archive),
             "protocol_errors": facts.get("protocol_error_count"),
@@ -169,6 +178,14 @@ def main() -> int:
     )
     parser.add_argument("--reviewer-native-tools", action="store_true")
     parser.add_argument(
+        "--request-timeout",
+        type=int,
+        help="Diagnostic model-request timeout in seconds",
+    )
+    parser.add_argument(
+        "--reasoning-strength", choices=("low", "medium", "high", "xhigh")
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=KIT / "benchmarks" / "results" / "reviewer-candidates",
@@ -176,6 +193,8 @@ def main() -> int:
     args = parser.parse_args()
     if args.repeats < 1:
         parser.error("repeats must be positive")
+    if args.request_timeout is not None and not 1 <= args.request_timeout <= 900:
+        parser.error("--request-timeout must be between 1 and 900 seconds")
     print(
         run(
             args.workspace,
@@ -185,6 +204,8 @@ def main() -> int:
             args.approved_python_current,
             args.bypass_startup_probe,
             args.reviewer_native_tools,
+            args.request_timeout,
+            args.reasoning_strength,
         )
     )
     return 0

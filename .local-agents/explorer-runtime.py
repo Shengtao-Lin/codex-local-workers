@@ -24,6 +24,20 @@ if hasattr(sys.stderr, "reconfigure"):
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+
+
+def _load_model_residency() -> Any:
+    spec = importlib.util.spec_from_file_location(
+        "local_explorer_model_residency", SCRIPT_DIR / "model_residency.py"
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("could not load model_residency.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+MODEL_RESIDENCY = _load_model_residency()
 EXCLUDED_PARTS = {
     ".agent",
     ".git",
@@ -199,6 +213,10 @@ EXPLORER_TOOLS = [
 
 class ExplorerError(RuntimeError):
     pass
+
+
+class ExplorerMissingAction(ExplorerError):
+    """A terminal attempt is premature, not a report-formatting failure."""
 
 
 class ExplorerPreflightBlocked(ExplorerError):
@@ -1109,6 +1127,7 @@ finding or concluding the current question is answered."""
                 if (
                     envelope is not None
                     and envelope["action"] == "FINISH_SUCCESS"
+                    and not isinstance(exc, ExplorerMissingAction)
                     and not self.finish_repair_used
                     and (
                         self.mode == "locate"
@@ -1380,14 +1399,14 @@ finding or concluding the current question is answered."""
                 item.get("action") == "SEARCH" and item.get("mode") == "regex"
                 for item in self.action_trace
             ):
-                raise ExplorerError(
+                raise ExplorerMissingAction(
                     "compatibility qualification requires regex SEARCH; next action exactly: "
                     '{"action":"SEARCH","query":"normalize_.*","mode":"regex",'
                     '"glob":"**/*.py"}'
                 )
             required_trace = self.config.get("explorer_require_trace_symbol")
             if required_trace and required_trace not in self.trace_evidence_symbols:
-                raise ExplorerError(
+                raise ExplorerMissingAction(
                     "compatibility qualification requires TRACE with file/line evidence; "
                     "next action exactly: "
                     + json.dumps({"action": "TRACE", "symbol": required_trace})
@@ -1841,7 +1860,17 @@ finding or concluding the current question is answered."""
             }:
                 raise ExplorerError("source_refs have an invalid kind")
             if not set(range(start, end + 1)) <= self.displayed_line_numbers.get(relative, set()):
-                raise ExplorerError(f"source_refs contain unread lines: {relative}:{start}-{end}")
+                line_count = len(path.read_bytes().decode("utf-8-sig").splitlines())
+                correction = (
+                    f"; file ends at line {line_count}; end_line must be <= {line_count}. "
+                    "Resubmit FINISH_SUCCESS with an actually displayed range; "
+                    "another READ_FILE cannot create a line beyond EOF"
+                    if end > line_count
+                    else "; READ_FILE the missing range before citing it"
+                )
+                raise ExplorerError(
+                    f"source_refs contain unread lines: {relative}:{start}-{end}" + correction
+                )
             content = path.read_bytes()
             digest = hashlib.sha256(content).hexdigest()
             if digest != self.read_hashes.get(relative):
@@ -2024,7 +2053,8 @@ def main() -> int:
             temperature=config.get("explorer_temperature", 0.1),
         )
         runtime = ExplorerRuntime(Path.cwd(), args.task, config, client, args.task_id)
-        report = runtime.run()
+        with MODEL_RESIDENCY.role_model_lease(client, config):
+            report = runtime.run()
     except KeyboardInterrupt:
         report = {
             "schema_version": 1,
@@ -2037,6 +2067,14 @@ def main() -> int:
             },
         }
     except ExplorerPreflightBlocked as exc:
+        report = {
+            "schema_version": 1,
+            "status": "blocked",
+            "task": args.task,
+            "failure_reason": str(exc),
+            "blocked": {"reason_code": exc.reason_code, "reason": str(exc)},
+        }
+    except MODEL_RESIDENCY.ModelResidencyError as exc:
         report = {
             "schema_version": 1,
             "status": "blocked",

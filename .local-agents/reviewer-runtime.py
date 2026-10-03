@@ -573,6 +573,11 @@ constraint_id values from ordering_constraints. Required order needs read source
 evidence; forbidden order may use read source or cumulative diff. Pass only when
 all constraints are verified. If evidence is missing, choose rework or escalate.
 """
+        strength = self.config.get("reviewer_reasoning_strength")
+        if strength is not None:
+            if not isinstance(strength, str) or strength not in {"low", "medium", "high", "xhigh"}:
+                raise ReviewError("reviewer_reasoning_strength must be low, medium, high, or xhigh")
+            prompt += f"Reasoning strength: {strength}.\n"
         if self.config.get("reviewer_native_tools") is True:
             prompt += (
                 "Use exactly one provided native tool call per turn; its function name is the "
@@ -1297,6 +1302,12 @@ all constraints are verified. If evidence is missing, choose rework or escalate.
         return report
 
     def run(self) -> dict[str, Any]:
+        if self.config.get("reviewer_preload_model") is True:
+            ensure_loaded = getattr(self.client, "ensure_loaded", None)
+            if callable(ensure_loaded):
+                ensure_loaded(
+                    timeout_seconds=int(self.config.get("reviewer_model_load_timeout_seconds", 360))
+                )
         preflight = getattr(self.client, "preflight", None)
         if callable(preflight):
             preflight()
@@ -1677,8 +1688,16 @@ def main() -> int:
             client.protocol_fallback_model = WORKER.require_string(
                 fallback_model, "reviewer_protocol_fallback_model"
             )
-        report = ReviewerRuntime(repo_root, request, config, client).run()
-    except (ReviewError, WORKER.WorkerError, SAFE_EDIT.SafeEditError, OSError, ValueError) as exc:
+        with WORKER.MODEL_RESIDENCY.role_model_lease(client, config):
+            report = ReviewerRuntime(repo_root, request, config, client).run()
+    except (
+        ReviewError,
+        WORKER.WorkerError,
+        WORKER.MODEL_RESIDENCY.ModelResidencyError,
+        SAFE_EDIT.SafeEditError,
+        OSError,
+        ValueError,
+    ) as exc:
         report = {
             "schema_version": 1,
             "decision": "failed",
@@ -1698,6 +1717,11 @@ def main() -> int:
                 "diagnostics": exc.diagnostics,
             }
         elif isinstance(exc, WORKER.PreflightBlocked):
+            report["infra_failure"] = {
+                "reason_code": exc.reason_code,
+                "reason": str(exc),
+            }
+        elif isinstance(exc, WORKER.MODEL_RESIDENCY.ModelResidencyError):
             report["infra_failure"] = {
                 "reason_code": exc.reason_code,
                 "reason": str(exc),

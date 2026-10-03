@@ -1088,8 +1088,38 @@ Only the third cell used that manifest, so these results remain observational
 and do not substitute for the two-round/multi-case gate. See
 `benchmarks/LOCALIZATION-ROUTE-EXPANSION-V2.md`.
 
-Do not deploy the restricted route for unattended live units yet. Its current
-command is an opt-in Primary-supervised implementation slice.
+On 2026-10-01, frozen localization-route candidate 4 completed 22 cells with
+21 Primary accepts (95.45%), independent Explorer evidence in every cell,
+23/23 reached unit Reviewers converged, both split integrations accepted,
+and zero cohort infrastructure failures. Sixteen standard units exercised
+repair_focus; fifteen eventually validated (93.75%). These meet the registered
+cohort thresholds, but do **not** establish final qualification: a separate
+current-policy compatibility smoke failed Explorer's required TRACE completion
+and left Coder SEARCH unexercised. Final qualification remains HOLD pending
+bounded recovery/compatibility work. See
+`benchmarks/V2.1-LOCALIZATION-CANDIDATE-4.md`; do not replace its original
+mapping-message-sequence failure with later rework.
+
+Follow-up on 2026-10-01 corrected the Explorer missing-action/report-only
+interaction. Full regression passed 366 tests and 25 subtests; live Explorer
+TRACE/regex and Reviewer capabilities passed. A separate deliberate late-symbol
+Coder fixture exercised SEARCH and passed independent checks; the original
+short core smoke remains explicitly incomplete. This is capability evidence,
+not a replacement for candidate 4 or a new frozen cohort. New runtime provenance
+and limitations are recorded in `benchmarks/V2.1-COMPAT-RECOVERY-FIX.md`.
+
+On 2026-10-03, frozen candidate6 qualified the existing opt-in
+Primary-supervised localization route:22/22 cells explicitly accepted,
+24/24 Explorer/Coder/Reviewer unit calls passed,15/15 repair-focus standard
+units validated, both split feature integrations passed, and zero candidate
+infrastructure failures. Current role capabilities, full369-test/28-subtest
+regression, two hidden-defect challenges and a clean Reviewer control passed.
+Primary replayed canonical source quotes, frozen input manifests and immutable
+acceptance archives. See `benchmarks/V2.1-LOCALIZATION-CANDIDATE-6.md`.
+This GO does not qualify general semantic investigation, unattended deployment,
+or broader autonomous Phase2 routing. The duplicate-message stress control
+remains a recorded takeover limitation; it is not relabeled a Coder success.
+Default capability selection and Primary acceptance authority remain unchanged.
 
 Coordinator schema/protocol fixtures may also consume the model-role
 qualification format from Stability, but Coordinator live behavior is not

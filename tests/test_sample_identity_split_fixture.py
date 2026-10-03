@@ -88,10 +88,33 @@ def test_split_inspection_replays_both_run_refs_without_writing(
 
 def test_split_phases_reject_changed_frozen_provenance(tmp_path: Path) -> None:
     path = tmp_path / ".agent" / "split-provenance.json"
-    SPLIT.STABILITY.write_json(path, SPLIT.split_provenance())
+    mode = {"enabled": False, "supervised_entry": False}
+    SPLIT.STABILITY.write_json(tmp_path / ".agent/split-coordinator-mode.json", mode)
+    SPLIT.STABILITY.write_json(path, SPLIT.split_provenance(mode))
     SPLIT.require_frozen_provenance(tmp_path)
     changed = SPLIT.read_json(path)
     changed["case_input_sha256"] = "0" * 64
     SPLIT.STABILITY.write_json(path, changed)
     with pytest.raises(ValueError, match="runtime, role config, or case input changed"):
+        SPLIT.require_frozen_provenance(tmp_path)
+
+
+def test_split_phases_reject_changed_coordinator_mode(tmp_path: Path) -> None:
+    mode = {"enabled": True, "supervised_entry": True}
+    mode_path = tmp_path / ".agent/split-coordinator-mode.json"
+    SPLIT.STABILITY.write_json(mode_path, mode)
+    SPLIT.STABILITY.write_json(
+        tmp_path / ".agent/split-provenance.json", SPLIT.split_provenance(mode)
+    )
+    SPLIT.require_frozen_provenance(tmp_path)
+    SPLIT.STABILITY.write_json(mode_path, {"enabled": True, "supervised_entry": False})
+    with pytest.raises(ValueError, match="case input changed"):
+        SPLIT.require_frozen_provenance(tmp_path)
+
+
+def test_split_phases_do_not_infer_missing_mode(tmp_path: Path) -> None:
+    SPLIT.STABILITY.write_json(
+        tmp_path / ".agent/split-provenance.json", SPLIT.split_provenance()
+    )
+    with pytest.raises(FileNotFoundError):
         SPLIT.require_frozen_provenance(tmp_path)

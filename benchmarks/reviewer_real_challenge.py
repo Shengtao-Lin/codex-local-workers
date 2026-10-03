@@ -159,6 +159,7 @@ def run(
     config_path: Path,
     variant: str = "selection",
     reviewer_model: str | None = None,
+    reasoning_strength: str | None = None,
 ) -> dict:
     if variant not in {"selection", "metadata", "metadata-control"}:
         raise ValueError(f"unknown challenge variant: {variant}")
@@ -246,6 +247,8 @@ def run(
     config = json.loads(config_path.read_text(encoding="utf-8-sig"))
     if reviewer_model is not None:
         config["reviewer_model"] = reviewer_model
+    if reasoning_strength is not None:
+        config["reviewer_reasoning_strength"] = reasoning_strength
     config.update(
         {
             "python": sys.executable,
@@ -434,6 +437,7 @@ def run(
         "workspace": str(root),
         "status": "reviewed" if reviewer.returncode == 0 else "reviewer_failed",
         "reviewer_model": config["reviewer_model"],
+        "reasoning_strength": config.get("reviewer_reasoning_strength"),
         "focused_tests_passed": True,
         "ruff_passed": True,
         "hidden_oracle_failed_as_expected": not clean_control,
@@ -465,8 +469,13 @@ def main() -> int:
         default="selection",
     )
     parser.add_argument("--reviewer-model", help="Disposable Reviewer candidate model")
+    parser.add_argument(
+        "--reasoning-strength", choices=("low", "medium", "high", "xhigh")
+    )
     args = parser.parse_args()
-    result = run(args.config, args.variant, args.reviewer_model)
+    result = run(
+        args.config, args.variant, args.reviewer_model, args.reasoning_strength
+    )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return (
         0

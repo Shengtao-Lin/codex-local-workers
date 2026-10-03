@@ -33,6 +33,22 @@ class ReviewerRuntimeTests(unittest.TestCase):
         self.assertIn('"verified", "violated", or "uncertain"', prompt)
         self.assertIn('use "violated"', prompt)
 
+    def test_reasoning_strength_is_optional_and_bounded(self) -> None:
+        default = REVIEWER.ReviewerRuntime.system_prompt(type("Runtime", (), {"config": {}})())
+        self.assertNotIn("Reasoning strength:", default)
+        low = REVIEWER.ReviewerRuntime.system_prompt(
+            type("Runtime", (), {"config": {"reviewer_reasoning_strength": "low"}})()
+        )
+        self.assertIn("Reasoning strength: low.", low)
+        with self.assertRaisesRegex(REVIEWER.ReviewError, "reviewer_reasoning_strength"):
+            REVIEWER.ReviewerRuntime.system_prompt(
+                type("Runtime", (), {"config": {"reviewer_reasoning_strength": "invalid"}})()
+            )
+        with self.assertRaisesRegex(REVIEWER.ReviewError, "reviewer_reasoning_strength"):
+            REVIEWER.ReviewerRuntime.system_prompt(
+                type("Runtime", (), {"config": {"reviewer_reasoning_strength": []}})()
+            )
+
     def test_native_tool_prompt_and_allowlist_are_read_only(self) -> None:
         prompt = REVIEWER.ReviewerRuntime.system_prompt(
             type("Runtime", (), {"config": {"reviewer_native_tools": True}})()
@@ -217,6 +233,44 @@ class ReviewerRuntimeTests(unittest.TestCase):
             ).read_text(encoding="utf-8")
             self.assertIn("diagnostic_action", events)
             self.assertIn("response_sha256", events)
+
+    def test_reviewer_preloads_model_before_inference(self) -> None:
+        class ReadyClient(FakeClient):
+            def __init__(self, actions):
+                super().__init__(actions)
+                self.load_timeout = None
+
+            def ensure_loaded(self, *, timeout_seconds):
+                self.load_timeout = timeout_seconds
+
+            def complete(self, messages):
+                assert self.load_timeout == 420
+                return super().complete(messages)
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            request = self.make_run(root)
+            client = ReadyClient(
+                [
+                    {
+                        "action": "REPORT",
+                        "arguments": {
+                            "decision": "pass_to_primary",
+                            "findings": [],
+                            "verified_contract_ids": ["behavior-1"],
+                            "unverified_claims": [],
+                        },
+                    }
+                ]
+            )
+            report = REVIEWER.ReviewerRuntime(
+                root,
+                request,
+                {"reviewer_preload_model": True, "reviewer_model_load_timeout_seconds": 420},
+                client,
+            ).run()
+            self.assertEqual(report["decision"], "pass_to_primary")
+            self.assertEqual(client.load_timeout, 420)
 
     def test_runtime_falls_back_when_substantive_structured_output_is_rejected(self) -> None:
         class StructuredThenPlainClient(FakeClient):

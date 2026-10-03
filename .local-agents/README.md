@@ -1,6 +1,6 @@
 # Local agents
 
-Both workers call LM Studio's OpenAI-compatible chat endpoint directly.
+The local workers call LM Studio's OpenAI-compatible chat endpoint directly.
 `explorer-runtime.py` exposes read-only repository actions;
 `worker-runtime.py` exposes bounded implementation and validation actions; and
 `reviewer-runtime.py` performs an independent read-only review of completed
@@ -57,6 +57,18 @@ Copy-Item .local-agents\config.example.json .local-agents\config.json
 - pytest installed in that environment
 
 The runtime itself uses only the Python standard library.
+
+With `single_model_residency: true`, normal Explorer, Coder, and Reviewer CLI
+invocations use one LM Studio role model at a time. At a role handoff the kit
+unloads only the other model IDs configured for those three roles, then loads
+the active model at its configured context length. A cross-process lease holds
+the role model for the whole invocation, so concurrent kit calls fail with a
+visible lock reason instead of unloading one another's model. A different
+loaded LM Studio model blocks the handoff; the kit never unloads it implicitly.
+The active model stays loaded after the invocation until the next role switch.
+The lease file is in the system temp directory; after an abnormal termination,
+inspect its PID and actual process state before removing a stale lease. This
+policy coordinates this kit's CLIs, not unrelated LM Studio clients.
 
 ## Local verification before copying to another repository
 
@@ -269,3 +281,96 @@ The locator accepts at most six references and 80 total displayed lines, with
 one bounded final-report correction. Missing evidence fails closed. The two
 modes have separate exact-task cache keys. Qualification results must name the
 mode; success in `locate` does not qualify `investigate` for autonomous routing.
+
+## Read-only supervised Coordinator inspections
+
+From the target repository root, the restricted Coordinator supports
+`--compact-handoff` and `--next-step`, with `--plan <feature-plan.json>` and
+`--run-refs <accepted-run-refs.json>` (or repeated `--run-ref UNIT TASK RUN`).
+An empty JSON object supplies no accepted-unit evidence. `--next-step` also
+reads `--state`, defaulting to `.agent/coordinator/<feature_id>/state.json`.
+Absent state initializes read-only pending memory; it does not create a file.
+
+Only matching immutable Primary/Coder/Reviewer archives establish accepted
+units. Unknown units remain unverified. An unresolved running, rework or
+escalated unit requires Primary inspection before further dispatch; no restart
+or retry is triggered. `CONTINUE` is a proposal for a Primary-authorized
+localization dispatch, not automatic execution. `FEATURE_READY` additionally
+requires current passing integration evidence and means only eligibility for
+Primary final review. Both interfaces are read-only and never accept a feature.
+
+Coordinator model probes use `coordinator-runtime.py --mode decision|proposal`
+with a Primary plan and bounded context. `--report` creates immutable evidence
+inside workspace `.agent`; it never overwrites old outcomes. Decision probes
+can additionally use `--check-transition --run-refs <Primary-selected refs>`
+and optional `--state`. They reread state after inference and reject a changed
+sequence. Syntax validity is distinct from `transition_valid`; neither launches
+a worker. Unaccepted dependencies and unresolved execution block CONTINUE;
+REWORK_LOCAL requires the separate explicit Primary recovery route;
+FEATURE_READY needs matching accepted archives and current passing integration.
+
+## Explicitly authorized model-Coordinator step
+
+`coordinator-supervised.py` is the opt-in product entry point for one
+Primary-supervised localization unit. From the target repository root, supply
+`--plan`, `--context` (including the Primary-granted unit/run/attempt/revision),
+`--request`, `--explorer-report`, `--run-refs`, `--config`,
+`--authorize-step`, and `--expected-sequence <current sequence>`.
+Missing authorization or stale state fails before model inference.
+
+The entry independently gates a model decision, materializes a fresh-context
+proposal against the Primary contract, verifies current Explorer evidence,
+releases the Coordinator model lease, and dispatches the trusted Coder→Reviewer
+route. Dispatch repeats the authorized sequence check. Every run reserves a
+create-only proposal archive; an existing run id is never overwritten or retried.
+ESCALATE_PRIMARY and FEATURE_READY do not dispatch or accept anything. Primary
+still reviews and records acceptance separately. This entry does not
+automatically recover failed units or accept features.
+
+Opt-in `--manage-exploration` lets Coordinator select RUN_EXPLORER,
+REUSE_EVIDENCE or ESCALATE_PRIMARY in a separate fresh context, with at most one
+protocol correction. RUN_EXPLORER launches the trusted read-only CLI using the
+unchanged Primary-approved single question and locate-mode configuration;
+the Coordinator lease is released first. `--explorer-report` may be omitted for
+this mode. REUSE_EVIDENCE only avoids another call: all current-file and quote
+checks remain mandatory before Coder dispatch. Missing evidence cannot be
+skipped, and failed Explorer calls are preserved without automatic retry.
+
+Exploration now precedes proposal generation. The proposal's fresh context
+receives the selected report's bounded source references; the original Primary
+context is unchanged. Existing evidence is first checked against the Primary
+unit's scope ceilings, and that runtime fact is supplied to the exploration
+selector. Dispatch still rechecks evidence against the actual narrower packet.
+
+An already-applied terminal-failure recovery grant can be supplied with
+`--recovery-authorization <fixed Primary review path>`. The entry checks the
+failed canonical archive hashes, post-recovery state sequence, approved new run id
+and increased attempt/revision before model inference. Only the granted unit may
+receive a REWORK_LOCAL proposal; all normal packet/evidence checks and the
+trusted route's no-scope-expansion rules still apply. The entry neither creates
+the Primary grant nor infers permission from the model's reason_code. Unknown,
+interrupted or incomplete execution requires inspection, not a replay.
+
+`--proposal-id <unique identifier>` reserves a separate immutable Coordinator
+attempt without changing the Primary-granted Coder run identity. Use it only
+after Primary inspection/authorization and a changed approach or evidence target,
+not as an automatic retry. Any existing canonical Coder run directory, including
+an incomplete one, blocks inference: another proposal id never permits execution
+replay. The old proposal archive is retained and cannot be overwritten.
+
+Successful Coordinator transport calls retain a deep-copied `model_requests`
+metadata list in decision/proposal and exploration-choice archives, including
+protocol-correction turns. These are client-observed request facts, not model
+claims, prompts, or authority. A transport exception may leave only a partial
+archive; missing usage is unknown, not zero.
+
+Compact handoffs include canonical validation counts/configured-check results
+and the matching fresh Reviewer's current findings/check acknowledgements.
+Missing fields remain `null` or `not_recorded`; historical finding resolution
+is explicitly `not_inferred` and requires archive inspection when relevant.
+Neither the compact facts nor FEATURE_READY replace risk-routed Primary review.
+
+Native LM Studio model keys and loaded-instance ids can differ. Readiness reuses
+the resident instance of the matching model key while retaining the configured
+context floor; it does not reload merely because an instance has an alias id.
+The role lease still enforces exactly one resident managed model instance.

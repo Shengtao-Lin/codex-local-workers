@@ -1,0 +1,9 @@
+{
+  "identity": {
+    "unit_id": "worker-success-finalization",
+    "run_id": "coordinator-compat-a1",
+    "attempt": 1,
+    "packet_revision": 1
+  },
+  "question": "Prepare a bounded worker-success-finalization proposal only, without dispatch. Use the Primary identity exactly. Keep tests read-only; no supplemental tests. Relevant stable implementation anchor is def execute_job. Scope read is src/agent_runtime and tests/test_lease_fencing.py; modify only src/agent_runtime/worker.py; create nothing. focused_tests is tests/test_lease_fencing.py. edit_targets is a list of objects with path and anchor. implementation_guidance is an array of advisory strings. Describe the post-handler lease check, rollback on lost lease and success only on valid lease; hard ordering and acceptance obligations come from the plan."
+}

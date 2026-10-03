@@ -300,7 +300,10 @@ def validate_unit_packet(plan: dict, candidate: dict) -> dict:
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
-    normalized = module.validate_packet(packet)
+    try:
+        normalized = module.validate_packet(packet)
+    except module.WorkerError as exc:
+        raise ValueError(f"Coder packet schema rejected: {exc}") from exc
     authority = scope_authority(unit["scope_authority"], "unit.scope_authority")
     scope = normalized["scope"]
     for path in scope["read"]:
@@ -413,6 +416,34 @@ def validate_localization_dispatch(
 ) -> dict:
     """Fail closed before dispatch; locate evidence is never a semantic verdict."""
     normalized = validate_unit_packet(plan, packet)
+    return _validate_localization_evidence(normalized, request, report, repo_root=repo_root)
+
+
+def validate_localization_evidence(
+    plan: dict, unit_id: str, request: dict, report: dict, *, repo_root: Path
+) -> dict:
+    """Verify reusable evidence against Primary ceilings, not authorize a packet."""
+    validate_feature_plan(plan)
+    unit = next((item for item in plan["units"] if item["unit_id"] == unit_id), None)
+    if unit is None or unit["owner"] != "local-coder":
+        raise ValueError("localization evidence needs an authorized local unit")
+    authority = unit["scope_authority"]
+    bounded = {
+        "task_id": plan["task_id"],
+        "unit_id": unit_id,
+        "scope": {
+            "read": authority["read_roots"],
+            "readonly": authority["readonly"],
+            "modify": authority["modify"],
+            "forbidden": authority["forbidden"],
+        },
+    }
+    return _validate_localization_evidence(bounded, request, report, repo_root=repo_root)
+
+
+def _validate_localization_evidence(
+    normalized: dict, request: dict, report: dict, *, repo_root: Path
+) -> dict:
     if not isinstance(request, dict) or set(request) != {
         "capability",
         "task_id",
@@ -656,6 +687,110 @@ def accepted_units_from_archives(
     return accepted
 
 
+def compact_primary_handoff(
+    plan: dict, repo_root: Path, run_refs: dict[str, dict[str, str]]
+) -> dict:
+    """Summarize verified acceptances; never infer acceptance from worker claims.
+
+    References are explicitly Primary-selected accepted runs. Unreferenced units
+    are unknown, not failed or pending. Invalid references fail closed rather
+    than disappearing from a superficially successful summary.
+    """
+    validated = validate_feature_plan(plan)
+    if not isinstance(run_refs, dict):
+        raise ValueError("handoff run references must be an object")
+    accepted = accepted_units_from_archives(plan, repo_root, run_refs)
+    unknown = sorted({unit["unit_id"] for unit in plan["units"]} - accepted)
+    changed_paths: set[str] = set()
+    validation_summary = []
+    reviewer_summary = []
+    for unit in plan["units"]:
+        unit_id = unit["unit_id"]
+        if unit_id not in accepted:
+            continue
+        if unit["owner"] == "primary":
+            path = repo_root / ".agent" / "primary-reviews" / plan["feature_id"] / f"{unit_id}.json"
+        else:
+            ref = run_refs[unit_id]
+            path = (
+                repo_root
+                / ".agent"
+                / "tasks"
+                / ref["task_id"]
+                / "runs"
+                / ref["run_id"]
+                / "handoff.json"
+            )
+        record = json.loads(path.read_text(encoding="utf-8"))
+        for item in record.get("changed_files", []):
+            changed_paths.add(item["path"] if isinstance(item, dict) else item)
+        if unit["owner"] == "primary":
+            validation_summary.append({"unit_id": unit_id, "origin": "primary_review"})
+            continue
+        validation = record.get("validation", {})
+        junit = validation.get("focused_tests", {}).get("junit", {})
+        validation_summary.append(
+            {
+                "unit_id": unit_id,
+                "status": validation.get("status", "not_recorded"),
+                "executed_focused_tests": junit.get("executed"),
+                "configured_checks": [
+                    {key: check.get(key) for key in ("id", "status", "exit_code")}
+                    for check in validation.get("configured_checks", [])
+                ],
+            }
+        )
+        primary = json.loads(path.with_name("review.json").read_text(encoding="utf-8"))
+        reviewer = json.loads(
+            (
+                repo_root
+                / ".agent/tasks"
+                / ref["task_id"]
+                / "reviews"
+                / identifier(primary["local_review_id"], "review.local_review_id")
+                / "handoff.json"
+            ).read_text(encoding="utf-8")
+        )
+        reviewer_summary.append(
+            {
+                "unit_id": unit_id,
+                "decision": reviewer["decision"],
+                "findings": reviewer.get("findings"),
+                "historical_finding_resolution": "not_inferred",
+                "verified_check_ids": reviewer.get("verified_check_ids"),
+            }
+        )
+    if not unknown:
+        verify_integration_archive(plan, repo_root, run_refs)
+    level = max(
+        [RISK[plan["integration_risk"]], RISK[plan["feature_risk"]]]
+        + [RISK[value] for value in validated["effective_unit_risk"].values()]
+    )
+    return {
+        "schema_version": 1,
+        "feature_id": plan["feature_id"],
+        "primary_plan_sha256": authority_fingerprint(plan),
+        "capability": "localization_only_primary_supervised",
+        "status": "incomplete_evidence" if unknown else "eligible_for_primary_final_review",
+        "accepted_units": sorted(accepted),
+        "unverified_units": unknown,
+        "changed_paths": sorted(changed_paths),
+        "validation_summary": validation_summary,
+        "reviewer_summary": reviewer_summary,
+        "escalation_reason": "missing-accepted-unit-evidence" if unknown else None,
+        "integration_status": "not_evaluated" if unknown else "verified_passed",
+        "integration_risk": plan["integration_risk"],
+        "primary_review_level": {0: "compact", 1: "selected_critical_hunks", 2: "full_diff"}[level],
+        "feature_accepted": False,
+        "automatic_retry_allowed": False,
+        "next_action_required": (
+            "primary_supply_missing_acceptance_evidence"
+            if unknown
+            else "primary_final_review_and_explicit_decision"
+        ),
+    }
+
+
 def verify_integration_archive(
     plan: dict, repo_root: Path, run_refs: dict[str, dict[str, str]]
 ) -> None:
@@ -742,6 +877,175 @@ def validate_decision_transition(
         primary_accepted_units=accepted,
         integration_verified=integration_verified,
     )
+
+
+def verified_execution_evidence(
+    plan: dict, repo_root: Path, state: dict, run_refs: dict[str, dict[str, str]]
+) -> dict:
+    """Materialize current execution facts for model input, not model authority."""
+    validate_coordinator_state(plan, state)
+    if not isinstance(run_refs, dict):
+        raise ValueError("execution archive references must be an object")
+    accepted = accepted_units_from_archives(plan, repo_root, run_refs)
+    remaining = [unit for unit in plan["units"] if unit["unit_id"] not in accepted]
+    unresolved = [
+        unit["unit_id"]
+        for unit in remaining
+        if state["units"][unit["unit_id"]]["phase"] != "pending"
+    ]
+    eligible = [
+        unit["unit_id"]
+        for unit in remaining
+        if unit["owner"] == "local-coder"
+        and not unresolved
+        and state["feature_phase"] == "open"
+        and set(unit["dependencies"]) <= accepted
+    ]
+    evidence = {
+        "primary_plan_sha256": authority_fingerprint(plan),
+        "state_sequence": state["sequence"],
+        "accepted_units": sorted(accepted),
+        "legal_unit_ids": [unit["unit_id"] for unit in plan["units"]],
+        "eligible_local_units": eligible,
+        "unresolved_execution_units": unresolved,
+        "primary_units_awaiting_acceptance": [
+            unit["unit_id"] for unit in remaining if unit["owner"] == "primary"
+        ],
+        "execution_phases": {key: value["phase"] for key, value in state["units"].items()},
+        "integration_status": "not_evaluated",
+        "eligible_for_primary_final_review": False,
+        "automatic_rework_authorized": False,
+        "feature_accepted": False,
+    }
+    if not remaining:
+        try:
+            verify_integration_archive(plan, repo_root, run_refs)
+            evidence["integration_status"] = "verified_passed"
+            evidence["eligible_for_primary_final_review"] = True
+        except (OSError, ValueError) as exc:
+            evidence["integration_status"] = "missing_failed_or_stale"
+            evidence["integration_error"] = str(exc)[:500]
+    return evidence
+
+
+def gate_model_decision(
+    plan: dict,
+    repo_root: Path,
+    state: dict,
+    candidate: dict,
+    run_refs: dict[str, dict[str, str]],
+    *,
+    expected_sequence: int,
+) -> dict:
+    """Read-only live decision gate; model enums never grant recovery authority."""
+    validate_coordinator_state(plan, state)
+    if type(expected_sequence) is not int or state["sequence"] != expected_sequence:
+        raise ValueError("model decision state sequence is stale")
+    if not isinstance(run_refs, dict):
+        raise ValueError("model decision archive references must be an object")
+    decision = validate_decision(plan, candidate)
+    accepted = accepted_units_from_archives(plan, repo_root, run_refs)
+    choice, unit_id = decision["decision"], decision["unit_id"]
+    if choice == "REWORK_LOCAL":
+        raise ValueError("model rework needs explicit Primary terminal recovery authorization")
+    if choice == "CONTINUE":
+        if state["feature_phase"] != "open":
+            raise ValueError("ready feature cannot dispatch another unit")
+        unit = next(item for item in plan["units"] if item["unit_id"] == unit_id)
+        if unit["owner"] != "local-coder":
+            raise ValueError("model cannot dispatch a Primary-owned unit")
+        unresolved = [
+            key
+            for key, memory in state["units"].items()
+            if key not in accepted and memory["phase"] != "pending"
+        ]
+        if unresolved:
+            raise ValueError(
+                "unresolved execution requires Primary inspection: " + ", ".join(unresolved)
+            )
+    # Includes dependency, prior acceptance, and fresh integration checks.
+    validated = validate_decision_transition(plan, decision, repo_root=repo_root, run_refs=run_refs)
+    return {
+        "decision": validated,
+        "state_sequence": state["sequence"],
+        "primary_plan_sha256": authority_fingerprint(plan),
+        "next_action_required": {
+            "CONTINUE": "authorized_proposal_and_localization_gate_required",
+            "ESCALATE_PRIMARY": "primary_inspect_reason_and_archives",
+            "FEATURE_READY": "primary_final_review_and_explicit_decision",
+        }[choice],
+        "dispatch_allowed": False,
+        "feature_accepted": False,
+    }
+
+
+def next_supervised_step(
+    plan: dict, repo_root: Path, state: dict, run_refs: dict[str, dict[str, str]]
+) -> dict:
+    """Select a bounded next step without dispatching, recovering or accepting.
+
+    Accepted archives override stale execution memory, never the reverse.
+    Any unresolved running/rework/escalated unit blocks later dispatches.
+    """
+    validate_coordinator_state(plan, state)
+    if not isinstance(run_refs, dict):
+        raise ValueError("next-step run references must be an object")
+    accepted = accepted_units_from_archives(plan, repo_root, run_refs)
+    remaining = [unit for unit in plan["units"] if unit["unit_id"] not in accepted]
+    base = {
+        "feature_id": plan["feature_id"],
+        "primary_plan_sha256": authority_fingerprint(plan),
+        "state_sequence": state["sequence"],
+        "capability": "localization_only_primary_supervised",
+        "automatic_dispatch_allowed": False,
+        "automatic_retry_allowed": False,
+        "feature_accepted": False,
+    }
+    if not remaining:
+        verify_integration_archive(plan, repo_root, run_refs)
+        return {
+            **base,
+            "decision": {"decision": "FEATURE_READY", "unit_id": plan["units"][-1]["unit_id"]},
+            "next_action_required": "primary_final_review_and_explicit_decision",
+        }
+    if state["feature_phase"] == "ready":
+        raise ValueError("ready memory lacks complete accepted archive evidence")
+    for unit in remaining:
+        phase = state["units"][unit["unit_id"]]["phase"]
+        if phase != "pending":
+            return {
+                **base,
+                "decision": {
+                    "decision": "ESCALATE_PRIMARY",
+                    "unit_id": unit["unit_id"],
+                    "reason_code": f"unresolved-{phase}",
+                },
+                "next_action_required": "primary_inspect_archives_before_recovery",
+            }
+    for unit in remaining:
+        if set(unit["dependencies"]) <= accepted:
+            if unit["owner"] == "primary":
+                return {
+                    **base,
+                    "decision": {
+                        "decision": "ESCALATE_PRIMARY",
+                        "unit_id": unit["unit_id"],
+                        "reason_code": "primary-owned-unit",
+                    },
+                    "next_action_required": "primary_complete_and_record_owned_unit",
+                }
+            decision = validate_decision_transition(
+                plan,
+                {"decision": "CONTINUE", "unit_id": unit["unit_id"]},
+                repo_root=repo_root,
+                run_refs=run_refs,
+            )
+            return {
+                **base,
+                "decision": decision,
+                "next_action_required": "primary_authorize_proposal_and_localization_dispatch",
+            }
+    raise ValueError("no eligible unit; dependency acceptance evidence is incomplete")
 
 
 def new_coordinator_state(plan: dict) -> dict:
@@ -888,6 +1192,16 @@ def apply_coordinator_decision(
     if memory["phase"] == "escalated" and choice in {"CONTINUE", "REWORK_LOCAL"}:
         raise ValueError("escalated unit needs a new Primary plan or review")
     if choice == "CONTINUE":
+        if memory["phase"] not in {"pending", "rework"}:
+            raise ValueError("unit is already running; Primary inspection required")
+        accepted = accepted_units_from_archives(plan, repo_root, run_refs)
+        unresolved = [
+            key
+            for key, other in updated["units"].items()
+            if key != unit_id and key not in accepted and other["phase"] != "pending"
+        ]
+        if unresolved:
+            raise ValueError("another unresolved unit blocks dispatch: " + ", ".join(unresolved))
         memory["phase"] = "running"
     elif choice == "REWORK_LOCAL":
         memory["phase"] = "rework"

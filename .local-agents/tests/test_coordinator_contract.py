@@ -39,6 +39,57 @@ def test_example_plan_keeps_high_risk_atomic_unit(plan: dict) -> None:
     }
 
 
+@pytest.mark.parametrize("phase", ["running", "rework", "escalated"])
+def test_actual_transition_blocks_other_unresolved_unit(
+    plan: dict, tmp_path: Path, phase: str
+) -> None:
+    state = CONTRACT.new_coordinator_state(plan)
+    state["units"]["worker-success-finalization"]["phase"] = phase
+    before = copy.deepcopy(state)
+    with pytest.raises(ValueError, match="another unresolved unit"):
+        CONTRACT.apply_coordinator_decision(
+            plan,
+            state,
+            {"decision": "CONTINUE", "unit_id": "lease-test-support"},
+            expected_sequence=0,
+            repo_root=tmp_path,
+            run_refs={},
+        )
+    assert state == before
+
+
+def test_actual_transition_rejects_repeat_of_running_unit(plan: dict, tmp_path: Path) -> None:
+    state = CONTRACT.new_coordinator_state(plan)
+    state["units"]["lease-test-support"]["phase"] = "running"
+    with pytest.raises(ValueError, match="already running"):
+        CONTRACT.apply_coordinator_decision(
+            plan,
+            state,
+            {"decision": "CONTINUE", "unit_id": "lease-test-support"},
+            expected_sequence=0,
+            repo_root=tmp_path,
+            run_refs={},
+        )
+
+
+def test_compact_handoff_missing_evidence_is_not_pending_or_accepted(
+    plan: dict, tmp_path: Path
+) -> None:
+    result = CONTRACT.compact_primary_handoff(plan, tmp_path, {})
+    assert result["status"] == "incomplete_evidence"
+    assert result["accepted_units"] == []
+    assert len(result["unverified_units"]) == 3
+    assert result["primary_review_level"] == "full_diff"
+    assert result["integration_status"] == "not_evaluated"
+    assert result["feature_accepted"] is False
+    assert result["automatic_retry_allowed"] is False
+    assert not (tmp_path / ".agent").exists()
+    with pytest.raises(ValueError, match="unknown unit archive reference"):
+        CONTRACT.compact_primary_handoff(plan, tmp_path, {"invented": {}})
+    with pytest.raises(ValueError, match="references must be an object"):
+        CONTRACT.compact_primary_handoff(plan, tmp_path, [])
+
+
 def test_durable_state_rejects_stale_or_foreign_plan(plan: dict) -> None:
     with TemporaryDirectory() as directory:
         root = Path(directory)
@@ -69,6 +120,127 @@ def test_durable_state_rejects_stale_or_foreign_plan(plan: dict) -> None:
         revised["plan_revision"] += 1
         with pytest.raises(ValueError, match="differs from Primary plan"):
             CONTRACT.load_coordinator_state(revised, root, path)
+
+
+def test_next_step_requires_primary_unit_and_never_writes(plan: dict, tmp_path: Path) -> None:
+    state = CONTRACT.new_coordinator_state(plan)
+    original = copy.deepcopy(state)
+    result = CONTRACT.next_supervised_step(plan, tmp_path, state, {})
+    assert result["decision"] == {
+        "decision": "ESCALATE_PRIMARY",
+        "unit_id": "lease-test-support",
+        "reason_code": "primary-owned-unit",
+    }
+    assert result["automatic_dispatch_allowed"] is False
+    assert result["automatic_retry_allowed"] is False
+    assert state == original
+    assert not (tmp_path / ".agent").exists()
+    state["feature_phase"] = "ready"
+    with pytest.raises(ValueError, match="ready memory lacks"):
+        CONTRACT.next_supervised_step(plan, tmp_path, state, {})
+
+
+def test_model_decision_gate_requires_dependencies_and_primary_ownership(
+    plan: dict, tmp_path: Path
+) -> None:
+    state = CONTRACT.new_coordinator_state(plan)
+    facts = CONTRACT.verified_execution_evidence(plan, tmp_path, state, {})
+    assert facts["eligible_local_units"] == []
+    assert facts["primary_units_awaiting_acceptance"] == ["lease-test-support"]
+    assert facts["accepted_units"] == []
+    with pytest.raises(ValueError, match="dependencies are not accepted"):
+        CONTRACT.gate_model_decision(
+            plan,
+            tmp_path,
+            state,
+            {"decision": "CONTINUE", "unit_id": "worker-success-finalization"},
+            {},
+            expected_sequence=0,
+        )
+    with pytest.raises(ValueError, match="Primary-owned"):
+        CONTRACT.gate_model_decision(
+            plan,
+            tmp_path,
+            state,
+            {"decision": "CONTINUE", "unit_id": "lease-test-support"},
+            {},
+            expected_sequence=0,
+        )
+    assert not (tmp_path / ".agent").exists()
+
+
+def test_model_decision_gate_blocks_rework_ready_and_stale_memory(
+    plan: dict, tmp_path: Path
+) -> None:
+    state = CONTRACT.new_coordinator_state(plan)
+    for decision, reason in (
+        ("REWORK_LOCAL", "model-failure"),
+        ("ESCALATE_PRIMARY", "scope-expansion"),
+    ):
+        candidate = {
+            "decision": decision,
+            "unit_id": "worker-success-finalization",
+            "reason_code": reason,
+        }
+        if decision == "REWORK_LOCAL":
+            with pytest.raises(ValueError, match="Primary terminal recovery"):
+                CONTRACT.gate_model_decision(
+                    plan, tmp_path, state, candidate, {}, expected_sequence=0
+                )
+        else:
+            result = CONTRACT.gate_model_decision(
+                plan, tmp_path, state, candidate, {}, expected_sequence=0
+            )
+            assert result["dispatch_allowed"] is False
+            assert result["decision"] == candidate
+            with pytest.raises(ValueError, match="sequence is stale"):
+                CONTRACT.gate_model_decision(
+                    plan, tmp_path, state, candidate, {}, expected_sequence=1
+                )
+    with pytest.raises((ValueError, OSError)):
+        CONTRACT.gate_model_decision(
+            plan,
+            tmp_path,
+            state,
+            {"decision": "FEATURE_READY", "unit_id": "worker-success-finalization"},
+            {},
+            expected_sequence=0,
+        )
+    assert state == CONTRACT.new_coordinator_state(plan)
+
+
+def test_model_continue_gate_allows_eligible_unit_but_never_executes(
+    plan: dict, tmp_path: Path
+) -> None:
+    plan["units"] = [plan["units"][1]]
+    plan["units"][0]["dependencies"] = []
+    plan["contracts"] = plan["contracts"][1:4]
+    state = CONTRACT.new_coordinator_state(plan)
+    candidate = {"decision": "CONTINUE", "unit_id": "worker-success-finalization"}
+    facts = CONTRACT.verified_execution_evidence(plan, tmp_path, state, {})
+    assert facts["eligible_local_units"] == ["worker-success-finalization"]
+    result = CONTRACT.gate_model_decision(plan, tmp_path, state, candidate, {}, expected_sequence=0)
+    assert result["decision"] == candidate
+    assert result["feature_accepted"] is False
+    assert result["dispatch_allowed"] is False
+    state["units"]["worker-success-finalization"]["phase"] = "running"
+    assert (
+        CONTRACT.verified_execution_evidence(plan, tmp_path, state, {})["eligible_local_units"]
+        == []
+    )
+    with pytest.raises(ValueError, match="unresolved execution"):
+        CONTRACT.gate_model_decision(plan, tmp_path, state, candidate, {}, expected_sequence=0)
+
+
+@pytest.mark.parametrize("phase", ["running", "rework", "escalated"])
+def test_next_step_blocks_unresolved_units_even_when_other_unit_is_pending(
+    plan: dict, tmp_path: Path, phase: str
+) -> None:
+    state = CONTRACT.new_coordinator_state(plan)
+    state["units"]["worker-success-finalization"]["phase"] = phase
+    result = CONTRACT.next_supervised_step(plan, tmp_path, state, {})
+    assert result["decision"]["reason_code"] == f"unresolved-{phase}"
+    assert result["decision"]["unit_id"] == "worker-success-finalization"
 
 
 def test_durable_state_rejects_lock_corruption_and_outside_path(plan: dict) -> None:
@@ -1018,6 +1190,46 @@ def test_accepted_units_require_primary_and_reviewer_archives(plan: dict, tmp_pa
         path.write_text(json.dumps(value), encoding="utf-8")
     refs = {unit_id: {"task_id": task_id, "run_id": run_id}}
     assert CONTRACT.accepted_units_from_archives(plan, tmp_path, refs) == {unit_id}
+    summary = CONTRACT.compact_primary_handoff(plan, tmp_path, refs)
+    assert summary["accepted_units"] == [unit_id]
+    assert summary["status"] == "incomplete_evidence"
+    assert summary["validation_summary"][0]["status"] == "not_recorded"
+    assert summary["validation_summary"][0]["executed_focused_tests"] is None
+    assert summary["reviewer_summary"][0]["decision"] == "pass_to_primary"
+    assert summary["reviewer_summary"][0]["findings"] is None
+    assert summary["reviewer_summary"][0]["historical_finding_resolution"] == "not_inferred"
+    assert summary["escalation_reason"] == "missing-accepted-unit-evidence"
+    with_facts = copy.deepcopy(records[archive / "handoff.json"])
+    with_facts["validation"] = {
+        "status": "passed",
+        "focused_tests": {"junit": {"executed": 3}},
+        "configured_checks": [{"id": "ruff-check", "status": "passed", "exit_code": 0}],
+    }
+    archive.joinpath("handoff.json").write_text(json.dumps(with_facts), encoding="utf-8")
+    review_facts = {
+        **records[reviewer / "handoff.json"],
+        "findings": [],
+        "verified_check_ids": ["ruff-check"],
+    }
+    reviewer.joinpath("handoff.json").write_text(json.dumps(review_facts), encoding="utf-8")
+    observed = CONTRACT.compact_primary_handoff(plan, tmp_path, refs)
+    assert observed["validation_summary"] == [
+        {
+            "unit_id": unit_id,
+            "status": "passed",
+            "executed_focused_tests": 3,
+            "configured_checks": [{"id": "ruff-check", "status": "passed", "exit_code": 0}],
+        }
+    ]
+    assert observed["reviewer_summary"][0]["findings"] == []
+    assert observed["reviewer_summary"][0]["verified_check_ids"] == ["ruff-check"]
+    assert observed["feature_accepted"] is False
+    archive.joinpath("handoff.json").write_text(
+        json.dumps(records[archive / "handoff.json"]), encoding="utf-8"
+    )
+    reviewer.joinpath("handoff.json").write_text(
+        json.dumps(records[reviewer / "handoff.json"]), encoding="utf-8"
+    )
     assert (
         CONTRACT.validate_decision_transition(
             plan,
@@ -1046,6 +1258,8 @@ def test_accepted_units_require_primary_and_reviewer_archives(plan: dict, tmp_pa
     (reviewer / "completed.json").write_text(json.dumps({"decision": "rework"}), encoding="utf-8")
     with pytest.raises(ValueError, match="Reviewer pass"):
         CONTRACT.accepted_units_from_archives(plan, tmp_path, refs)
+    with pytest.raises(ValueError, match="Reviewer pass"):
+        CONTRACT.compact_primary_handoff(plan, tmp_path, refs)
     (reviewer / "completed.json").write_text(
         json.dumps({"decision": "pass_to_primary"}), encoding="utf-8"
     )
@@ -1077,6 +1291,24 @@ def test_primary_owned_unit_uses_fixed_plan_bound_review(plan: dict, tmp_path: P
     }
     path.write_text(json.dumps(review), encoding="utf-8")
     assert CONTRACT.accepted_units_from_archives(plan, tmp_path, {unit_id: {}}) == {unit_id}
+    state = CONTRACT.new_coordinator_state(plan)
+    state["units"][unit_id]["phase"] = "running"
+    result = CONTRACT.next_supervised_step(plan, tmp_path, state, {unit_id: {}})
+    assert result["decision"] == {
+        "decision": "CONTINUE",
+        "unit_id": "worker-success-finalization",
+    }
+    assert result["state_sequence"] == 0
+    advanced = CONTRACT.apply_coordinator_decision(
+        plan,
+        state,
+        result["decision"],
+        expected_sequence=0,
+        repo_root=tmp_path,
+        run_refs={unit_id: {}},
+    )
+    assert advanced["units"]["worker-success-finalization"]["phase"] == "running"
+    assert advanced["sequence"] == 1
     plan["contracts"][0]["text"] = "Weakened test contract."
     with pytest.raises(ValueError, match="missing or stale"):
         CONTRACT.accepted_units_from_archives(plan, tmp_path, {unit_id: {}})
@@ -1130,6 +1362,21 @@ def test_feature_ready_requires_fresh_integration_archive(
         ],
     }
     validation_path.write_text(json.dumps(evidence), encoding="utf-8")
+    summary = CONTRACT.compact_primary_handoff(plan, tmp_path, refs)
+    assert summary["status"] == "eligible_for_primary_final_review"
+    assert summary["changed_paths"] == ["tests/test_lease_fencing.py"]
+    assert summary["integration_status"] == "verified_passed"
+    assert summary["feature_accepted"] is False
+    result = CONTRACT.next_supervised_step(
+        plan, tmp_path, CONTRACT.new_coordinator_state(plan), refs
+    )
+    assert result["decision"] == decision
+    assert result["feature_accepted"] is False
+    gated = CONTRACT.gate_model_decision(
+        plan, tmp_path, CONTRACT.new_coordinator_state(plan), decision, refs, expected_sequence=0
+    )
+    assert gated["decision"] == decision
+    assert gated["feature_accepted"] is False
     assert (
         CONTRACT.validate_decision_transition(plan, decision, repo_root=tmp_path, run_refs=refs)
         == decision
@@ -1188,6 +1435,10 @@ def test_feature_ready_requires_fresh_integration_archive(
         CONTRACT.validate_decision_transition(plan, decision, repo_root=tmp_path, run_refs=refs)
     validation_path.write_text(json.dumps(evidence), encoding="utf-8")
     source.write_text("assert False\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="changed after validation"):
+        CONTRACT.compact_primary_handoff(plan, tmp_path, refs)
+    with pytest.raises(ValueError, match="changed after validation"):
+        CONTRACT.next_supervised_step(plan, tmp_path, CONTRACT.new_coordinator_state(plan), refs)
     with pytest.raises(ValueError, match="changed after validation"):
         CONTRACT.validate_decision_transition(plan, decision, repo_root=tmp_path, run_refs=refs)
     assert ROUTE.main() == 3

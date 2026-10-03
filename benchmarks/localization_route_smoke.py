@@ -9,6 +9,7 @@ import json
 import sys
 import uuid
 from dataclasses import asdict
+from pathlib import Path
 
 import stability_e2e as STABILITY
 
@@ -92,7 +93,20 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--case", default="mapping-message-sequence")
     parser.add_argument("--unknown-location", action="store_true")
+    parser.add_argument("--model-coordinator", action="store_true")
+    parser.add_argument("--supervised-entry", action="store_true")
+    parser.add_argument("--managed-exploration", action="store_true")
+    parser.add_argument("--reuse-explorer-report", type=Path)
+    parser.add_argument("--diagnostic-one-turn-coder", action="store_true")
     args = parser.parse_args()
+    if args.reuse_explorer_report and not args.managed_exploration:
+        parser.error("--reuse-explorer-report requires --managed-exploration")
+    if args.managed_exploration:
+        args.supervised_entry = True
+    if args.supervised_entry:
+        args.model_coordinator = True
+    if args.diagnostic_one_turn_coder and not args.supervised_entry:
+        parser.error("diagnostic budget requires the supervised entry")
     cases = {case.name: case for case in STABILITY.CASES}
     if args.case not in cases:
         parser.error(f"unknown frozen case: {args.case}")
@@ -103,6 +117,13 @@ def main() -> int:
         )
     )
     source_config["explorer_mode"] = "locate"
+    if args.diagnostic_one_turn_coder:
+        source_config.update(
+            max_model_turns=1,
+            hard_max_model_turns=1,
+            repair_turn_reserve=0,
+            prevalidation_edit_turn_reserve=0,
+        )
     provenance = runtime_manifest(source_config)
     variant = "unknown" if args.unknown_location else "known"
     root = STABILITY.WORK / f"route-{variant}-{uuid.uuid4().hex[:12]}" / case.name
@@ -165,6 +186,15 @@ def main() -> int:
             "case": asdict(case),
             "question": question,
             "unknown_location": args.unknown_location,
+            "model_coordinator": args.model_coordinator,
+            "supervised_entry": args.supervised_entry,
+            "managed_exploration": args.managed_exploration,
+            "diagnostic_one_turn_coder": args.diagnostic_one_turn_coder,
+            "reused_report_sha256": hashlib.sha256(
+                args.reuse_explorer_report.read_bytes()
+            ).hexdigest()
+            if args.reuse_explorer_report
+            else None,
         }
     )
     request_path = root / ".agent" / "localization-request.json"
@@ -191,30 +221,40 @@ def main() -> int:
         baseline_lint is not None and baseline_lint.returncode != 0
     )
     explorer_path = root / ".agent" / "explorer-full-report.json"
-    explorer = STABILITY.run_command(
-        root,
-        [
-            sys.executable,
-            str(STABILITY.KIT / ".local-agents" / "local-explore.py"),
-            "--task",
-            question,
-            "--task-id",
-            packet["task_id"],
-            "--config",
-            str(config_path),
-            "--report",
-            str(explorer_path),
-            "--full-report",
-        ],
-        600,
+    if args.reuse_explorer_report:
+        STABILITY.write_json(
+            explorer_path,
+            json.loads(args.reuse_explorer_report.read_text(encoding="utf-8-sig")),
+        )
+    explorer = (
+        None
+        if args.managed_exploration
+        else STABILITY.run_command(
+            root,
+            [
+                sys.executable,
+                str(STABILITY.KIT / ".local-agents" / "local-explore.py"),
+                "--task",
+                question,
+                "--task-id",
+                packet["task_id"],
+                "--config",
+                str(config_path),
+                "--report",
+                str(explorer_path),
+                "--full-report",
+            ],
+            600,
+        )
     )
     full = (
         json.loads(explorer_path.read_text(encoding="utf-8"))
         if explorer_path.is_file()
         else {}
     )
-    if explorer.returncode != 0 or not STABILITY.explorer_has_line_evidence(
-        full, case, test_path
+    if not args.managed_exploration and (
+        explorer.returncode != 0
+        or not STABILITY.explorer_has_line_evidence(full, case, test_path)
     ):
         result = {
             "workspace": str(root),
@@ -243,19 +283,113 @@ def main() -> int:
         STABILITY.write_json(root / "route-result.json", result)
         print(json.dumps(result, ensure_ascii=False))
         return 2
+    coordinator = None
+    if args.model_coordinator:
+        # Primary grants identity and ceilings, not a finished model packet.
+        context_path = root / ".agent" / "coordinator-context.json"
+        coordinator_path = root / ".agent" / "coordinator-proposal-report.json"
+        STABILITY.write_json(root / ".agent" / "primary-packet-reference.json", packet)
+        STABILITY.write_json(
+            context_path,
+            {
+                "identity": {
+                    key: packet[key]
+                    for key in ("unit_id", "run_id", "attempt", "packet_revision")
+                },
+                "goal": packet["goal"],
+                "source_refs": full.get("source_refs", []),
+                "navigation_targets": packet["edit_targets"],
+                "question": (
+                    "Generate one bounded proposal for the approved unit. Use granted identity exactly. "
+                    "Choose readable/writable paths inside Primary scope_authority, use provided real "
+                    "navigation targets as edit_targets (path/anchor objects), include required focused "
+                    "tests unchanged, supplemental_tests empty. implementation_guidance is an advisory "
+                    "array of strings, not a rewrite of the hard contract. No dispatch or acceptance."
+                ),
+            },
+        )
+        if args.supervised_entry:
+            STABILITY.write_json(root / ".agent" / "run-refs.json", {})
+        else:
+            generated = STABILITY.run_command(
+                root,
+                [
+                    sys.executable,
+                    str(STABILITY.KIT / ".local-agents" / "coordinator-runtime.py"),
+                    "--plan",
+                    str(plan_path),
+                    "--context",
+                    str(context_path),
+                    "--config",
+                    str(config_path),
+                    "--mode",
+                    "proposal",
+                    "--report",
+                    str(coordinator_path),
+                ],
+                900,
+            )
+        if not args.supervised_entry:
+            coordinator = (
+                json.loads(coordinator_path.read_text(encoding="utf-8"))
+                if coordinator_path.is_file()
+                else {
+                    "status": "infrastructure_or_missing_report",
+                    "output_tail": (generated.stdout + generated.stderr)[-1000:],
+                }
+            )
+        if not args.supervised_entry and (
+            generated.returncode != 0 or coordinator.get("status") != "protocol_valid"
+        ):
+            result = {
+                "workspace": str(root),
+                "case": case.name,
+                "stage": "coordinator",
+                "coordinator": coordinator,
+                "explorer_evidence_valid": True,
+                "qualified_pass": False,
+                "provenance": provenance,
+            }
+            STABILITY.write_json(root / "route-result.json", result)
+            print(json.dumps(result, ensure_ascii=False))
+            return 2
+        # Independently regenerate from raw model output, not its claimed verified packet.
+        if not args.supervised_entry:
+            packet = contract.materialize_bounded_packet(plan, coordinator["output"])
+            STABILITY.write_json(packet_path, packet)
+    if args.supervised_entry:
+        route_args = [
+            str(STABILITY.KIT / ".local-agents" / "coordinator-supervised.py"),
+            "--context",
+            str(context_path),
+            "--run-refs",
+            str(root / ".agent" / "run-refs.json"),
+            "--authorize-step",
+            "--expected-sequence",
+            "0",
+        ]
+        if args.managed_exploration:
+            route_args.append("--manage-exploration")
+    else:
+        route_args = [
+            str(STABILITY.KIT / ".local-agents" / "coordinator-localization.py"),
+            "--packet",
+            str(packet_path),
+        ]
     route = STABILITY.run_command(
         root,
         [
             sys.executable,
-            str(STABILITY.KIT / ".local-agents" / "coordinator-localization.py"),
+            *route_args,
             "--plan",
             str(plan_path),
-            "--packet",
-            str(packet_path),
             "--request",
             str(request_path),
-            "--explorer-report",
-            str(explorer_path),
+            *(
+                []
+                if args.managed_exploration and not args.reuse_explorer_report
+                else ["--explorer-report", str(explorer_path)]
+            ),
             "--config",
             str(config_path),
         ],
@@ -263,6 +397,20 @@ def main() -> int:
     )
     try:
         routed = json.loads(route.stdout)
+        if args.supervised_entry and "unit_result" in routed:
+            coordinator = {"archive": routed["archive"]}
+            if args.managed_exploration:
+                archived_report = Path(routed["archive"]) / "explorer-report.json"
+                if archived_report.is_file():
+                    explorer_path = archived_report
+                coordinator["exploration"] = json.loads(
+                    (Path(routed["archive"]) / "exploration-choice.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                coordinator["explorer_invocations"] = int(archived_report.is_file())
+                full = json.loads(explorer_path.read_text(encoding="utf-8"))
+            routed = routed["unit_result"]
     except ValueError:
         routed = {"output_tail": (route.stdout + route.stderr)[-1000:]}
     independent = STABILITY.run_command(
@@ -281,9 +429,16 @@ def main() -> int:
         "question_version": 2,
         "question": question,
         "stage": "route",
+        "model_coordinator": args.model_coordinator,
+        "supervised_entry": args.supervised_entry,
+        "managed_exploration": args.managed_exploration,
+        "diagnostic_fault_injection": args.diagnostic_one_turn_coder,
+        "coordinator": coordinator,
         "baseline_failed": baseline_failed,
         "explorer_status": full.get("status"),
-        "explorer_evidence_valid": True,
+        "explorer_evidence_valid": STABILITY.explorer_has_line_evidence(
+            full, case, test_path
+        ),
         "explorer_report": str(explorer_path),
         "explorer_infra_failure": full.get("infra_failure"),
         "route_exit": route.returncode,
@@ -299,6 +454,8 @@ def main() -> int:
     }
     result["qualified_pass"] = (
         result["baseline_failed"]
+        and not result["diagnostic_fault_injection"]
+        and result["explorer_evidence_valid"]
         and route.returncode == 0
         and routed.get("status") == "primary_review_required"
         and routed.get("unit_result", {}).get("reviewer_decision") == "pass_to_primary"
@@ -306,6 +463,11 @@ def main() -> int:
         and result["independent_format_passed"]
         and result["independent_lint_passed"]
         and not result["runtime_changed_during_run"]
+        and (
+            not args.reuse_explorer_report
+            or coordinator.get("exploration", {}).get("output", {}).get("action")
+            == "REUSE_EVIDENCE"
+        )
     )
     STABILITY.write_json(root / "route-result.json", result)
     print(json.dumps(result, ensure_ascii=False))

@@ -138,6 +138,63 @@ def _recovery_authorization(repo_root: Path, plan: dict, path: Path, failed_run_
     return value
 
 
+def authorized_rework_context(
+    *,
+    repo_root: Path,
+    plan: dict,
+    state: dict,
+    identity: dict,
+    authorization_path: Path,
+    run_refs: dict,
+) -> dict:
+    """Read-only check of an already-applied Primary terminal recovery grant."""
+    authorization = _recovery_authorization(
+        repo_root, plan, authorization_path, authorization_path.stem
+    )
+    unit_id = identity["unit_id"]
+    if (
+        authorization["unit_id"] != unit_id
+        or authorization["new_run_id"] != identity["run_id"]
+        or authorization["expected_sequence"] + 1 != state["sequence"]
+        or state["units"].get(unit_id, {}).get("phase") != "rework"
+    ):
+        raise ValueError("rework identity or sequence differs from Primary authorization")
+    parent = repo_root / ".agent/tasks" / plan["task_id"] / "runs" / authorization["failed_run_id"]
+    CONTRACT._state_path(repo_root, parent / "packet.json")
+    old_path, completed_path = parent / "packet.json", parent / "completed.json"
+    if (
+        hashlib.sha256(old_path.read_bytes()).hexdigest() != authorization["archived_packet_sha256"]
+        or hashlib.sha256(completed_path.read_bytes()).hexdigest()
+        != authorization["completed_sha256"]
+        or _object(completed_path).get("status") != "failed"
+    ):
+        raise ValueError("rework parent archive is stale or not terminal failed")
+    old_packet = CONTRACT.validate_unit_packet(plan, _object(old_path))
+    if old_packet["unit_id"] != unit_id:
+        raise ValueError("rework parent names another unit")
+    for key in ("attempt", "packet_revision"):
+        if type(identity[key]) is not int or identity[key] <= old_packet[key]:
+            raise ValueError("rework requires increased attempt and packet_revision")
+    # Reuse the actual-transition checks without writing any state or dispatching.
+    CONTRACT.apply_coordinator_decision(
+        plan,
+        state,
+        {"decision": "CONTINUE", "unit_id": unit_id},
+        expected_sequence=state["sequence"],
+        repo_root=repo_root,
+        run_refs=run_refs,
+    )
+    return {
+        "unit_id": unit_id,
+        "new_run_id": identity["run_id"],
+        "failed_run_id": authorization["failed_run_id"],
+        "authorization_sha256": hashlib.sha256(authorization_path.read_bytes()).hexdigest(),
+        "state_sequence": state["sequence"],
+        "eligible_for_rework_proposal": True,
+        "worker_launch_requires_final_scope_and_evidence_gate": True,
+    }
+
+
 def run_localization_unit(
     *,
     repo_root: Path,
@@ -151,6 +208,7 @@ def run_localization_unit(
     coder_report_path: Path,
     review_report_path: Path,
     recovery_authorization_path: Path | None = None,
+    authorized_sequence: int | None = None,
     unit_runner: Callable[..., tuple[int, dict]] = UNIT.run_unit,
 ) -> tuple[int, dict]:
     """Route exactly one validated packet; leave acceptance to Primary."""
@@ -159,6 +217,8 @@ def run_localization_unit(
         plan, packet, request, explorer_report, repo_root=repo_root
     )
     state = CONTRACT.load_coordinator_state(plan, repo_root, state_path)
+    if authorized_sequence is not None and state["sequence"] != authorized_sequence:
+        raise ValueError("Primary-authorized dispatch sequence is stale")
     phase = state["units"][packet["unit_id"]]["phase"]
     if phase not in {"pending", "rework"}:
         raise ValueError("unit is already running or escalated; Primary recovery required")
@@ -460,6 +520,8 @@ def main() -> int:
     parser.add_argument("--explorer-report", type=Path)
     parser.add_argument("--inspect-only", action="store_true")
     parser.add_argument("--inspect-feature", action="store_true")
+    parser.add_argument("--compact-handoff", action="store_true")
+    parser.add_argument("--next-step", action="store_true")
     parser.add_argument("--unit-id")
     parser.add_argument("--recover-terminal", action="store_true")
     parser.add_argument("--authorization", type=Path)
@@ -480,13 +542,28 @@ def main() -> int:
     plan = _object(args.plan)
     state_path = args.state or root / ".agent" / "coordinator" / plan["feature_id"] / "state.json"
     try:
-        if sum((args.inspect_only, args.inspect_feature, args.recover_terminal)) > 1:
+        if (
+            sum(
+                (
+                    args.inspect_only,
+                    args.inspect_feature,
+                    args.compact_handoff,
+                    args.next_step,
+                    args.recover_terminal,
+                )
+            )
+            > 1
+        ):
             parser.error("choose only one inspection or recovery mode")
-        if args.run_ref and not args.inspect_feature:
-            parser.error("--run-ref is only valid with --inspect-feature")
-        if args.inspect_feature:
-            if args.unit_id is None or (args.run_refs is None and not args.run_ref):
-                parser.error("--inspect-feature requires --unit-id and archive run references")
+        if args.run_ref and not (args.inspect_feature or args.compact_handoff or args.next_step):
+            parser.error("--run-ref requires --inspect-feature, --compact-handoff or --next-step")
+        if args.inspect_feature or args.compact_handoff or args.next_step:
+            if (args.inspect_feature and args.unit_id is None) or (
+                args.run_refs is None and not args.run_ref
+            ):
+                parser.error(
+                    "inspection needs archive references; --inspect-feature also needs --unit-id"
+                )
             if args.run_refs is not None and args.run_ref:
                 parser.error("choose either --run-refs or repeated --run-ref")
             if args.run_refs is not None:
@@ -500,6 +577,19 @@ def main() -> int:
                     if unit_id in run_refs:
                         raise ValueError(f"duplicate run-ref unit_id: {unit_id}")
                     run_refs[unit_id] = {"task_id": task_id, "run_id": run_id}
+            if args.compact_handoff or args.next_step:
+                result = (
+                    CONTRACT.next_supervised_step(
+                        plan,
+                        root,
+                        CONTRACT.load_coordinator_state(plan, root, state_path),
+                        run_refs,
+                    )
+                    if args.next_step
+                    else CONTRACT.compact_primary_handoff(plan, root, run_refs)
+                )
+                print(json.dumps(result, ensure_ascii=False))
+                return 0
             CONTRACT.validate_decision_transition(
                 plan,
                 {"decision": "FEATURE_READY", "unit_id": args.unit_id},
