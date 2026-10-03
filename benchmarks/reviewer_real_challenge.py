@@ -76,6 +76,8 @@ RUNTIME_TARGET = "src/agent_runtime/models.py"
 RUNTIME_TEST = "tests/test_metadata_review.py"
 RUNTIME_ANCHOR = "    for key in value:\n"
 RUNTIME_BUG = '        if key.startswith("x-"):\n            continue\n'
+RUNTIME_CONTROL_BEFORE = "        if not key or len(key) > 128:\n"
+RUNTIME_CONTROL_AFTER = "        if not key or 128 < len(key):\n"
 RUNTIME_FOCUSED_TEST = """import pytest
 
 from agent_runtime.models import validate_metadata
@@ -148,14 +150,21 @@ def caught_bug(report: dict, source: Path, variant: str = "selection") -> bool:
     )
 
 
+def clean_control_passed(report: dict) -> bool:
+    """A semantically equivalent edit must not trigger contract rework."""
+    return report.get("decision") == "pass_to_primary" and not report.get("findings")
+
+
 def run(
     config_path: Path,
     variant: str = "selection",
     reviewer_model: str | None = None,
+    reasoning_strength: str | None = None,
 ) -> dict:
-    if variant not in {"selection", "metadata"}:
+    if variant not in {"selection", "metadata", "metadata-control"}:
         raise ValueError(f"unknown challenge variant: {variant}")
-    metadata = variant == "metadata"
+    metadata = variant.startswith("metadata")
+    clean_control = variant == "metadata-control"
     source_root = RUNTIME_SOURCE if metadata else SOURCE
     pinned = RUNTIME_PINNED if metadata else PINNED
     target = RUNTIME_TARGET if metadata else TARGET
@@ -185,11 +194,16 @@ def run(
     original = source.read_text(encoding="utf-8")
     if original.count(anchor) != 1:
         raise ValueError("mutation anchor is not unique")
-    buggy = (
-        original.replace(anchor, anchor + bug, 1)
-        if metadata
-        else original.replace(anchor, bug + anchor, 1)
-    )
+    if clean_control:
+        if original.count(RUNTIME_CONTROL_BEFORE) != 1:
+            raise ValueError("control mutation anchor is not unique")
+        buggy = original.replace(RUNTIME_CONTROL_BEFORE, RUNTIME_CONTROL_AFTER, 1)
+    else:
+        buggy = (
+            original.replace(anchor, anchor + bug, 1)
+            if metadata
+            else original.replace(anchor, bug + anchor, 1)
+        )
     source.write_text(buggy, encoding="utf-8")
     test = root / test_relative
     test.parent.mkdir(parents=True)
@@ -206,7 +220,11 @@ def run(
     (root / "pytest.ini").write_text("[pytest]\npythonpath = src\n", encoding="utf-8")
     write_json(
         root / "fixture-source.json",
-        {"repository": str(source_root), "files": pinned, "mutation": bug},
+        {
+            "repository": str(source_root),
+            "files": pinned,
+            "mutation": RUNTIME_CONTROL_AFTER if clean_control else bug,
+        },
     )
     junit = root / "junit.xml"
     pytest = run_command(root, "pytest", test_relative, "-q", f"--junitxml={junit}")
@@ -215,8 +233,8 @@ def run(
     hidden = run_command(root, "pytest", oracle.relative_to(root).as_posix(), "-q")
     if (
         any(result.returncode for result in (pytest, formatting, lint))
-        or hidden.returncode != 1
-        or "AssertionError" not in hidden.stdout
+        or hidden.returncode != (0 if clean_control else 1)
+        or (not clean_control and "AssertionError" not in hidden.stdout)
     ):
         return {
             "workspace": str(root),
@@ -229,6 +247,8 @@ def run(
     config = json.loads(config_path.read_text(encoding="utf-8-sig"))
     if reviewer_model is not None:
         config["reviewer_model"] = reviewer_model
+    if reasoning_strength is not None:
+        config["reviewer_reasoning_strength"] = reasoning_strength
     config.update(
         {
             "python": sys.executable,
@@ -417,12 +437,17 @@ def run(
         "workspace": str(root),
         "status": "reviewed" if reviewer.returncode == 0 else "reviewer_failed",
         "reviewer_model": config["reviewer_model"],
+        "reasoning_strength": config.get("reviewer_reasoning_strength"),
         "focused_tests_passed": True,
         "ruff_passed": True,
-        "hidden_oracle_failed_as_expected": True,
+        "hidden_oracle_failed_as_expected": not clean_control,
+        "hidden_oracle_passed_as_expected": clean_control,
         "reviewer_decision": report.get("decision"),
         "findings": report.get("findings"),
-        "caught_hidden_bug": caught_bug(report, source, variant),
+        "caught_hidden_bug": (
+            caught_bug(report, source, variant) if not clean_control else False
+        ),
+        "clean_control_passed": clean_control_passed(report) if clean_control else None,
         "read_paths": report.get("runtime_facts", {}).get("read_paths"),
         "protocol_errors": report.get("runtime_facts", {}).get("protocol_error_count"),
         "reviewer_output_tail": (reviewer.stdout + reviewer.stderr)[-1000:],
@@ -439,13 +464,24 @@ def main() -> int:
         "--config", type=Path, default=KIT / ".local-agents/config.json"
     )
     parser.add_argument(
-        "--variant", choices=["selection", "metadata"], default="selection"
+        "--variant",
+        choices=["selection", "metadata", "metadata-control"],
+        default="selection",
     )
     parser.add_argument("--reviewer-model", help="Disposable Reviewer candidate model")
+    parser.add_argument(
+        "--reasoning-strength", choices=("low", "medium", "high", "xhigh")
+    )
     args = parser.parse_args()
-    result = run(args.config, args.variant, args.reviewer_model)
+    result = run(
+        args.config, args.variant, args.reviewer_model, args.reasoning_strength
+    )
     print(json.dumps(result, ensure_ascii=False, indent=2))
-    return 0 if result.get("caught_hidden_bug") else 1
+    return (
+        0
+        if result.get("caught_hidden_bug") or result.get("clean_control_passed")
+        else 1
+    )
 
 
 if __name__ == "__main__":

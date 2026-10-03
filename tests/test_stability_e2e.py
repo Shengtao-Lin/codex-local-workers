@@ -40,6 +40,29 @@ def test_localization_requires_actual_faulty_branch_not_just_correct_file():
     )
 
 
+def test_localization_accepts_exact_faulty_constant_definition() -> None:
+    case = next(case for case in STABILITY.CASES if case.name == "metadata-limit")
+    report = {
+        "explorer_mode": "locate",
+        "semantic_verdict": "not_evaluated",
+        "source_refs": [
+            {"path": case.target, "kind": "definition", "quote": case.after},
+            {
+                "path": "tests/test_metadata_limit.py",
+                "kind": "test",
+                "quote": "assert MAX_METADATA_BYTES == 16_384",
+            },
+        ],
+    }
+    assert STABILITY.explorer_has_line_evidence(
+        report, case, "tests/test_metadata_limit.py"
+    )
+    report["source_refs"][0]["quote"] = "MAX_METADATA_BYTES = 16_384"
+    assert not STABILITY.explorer_has_line_evidence(
+        report, case, "tests/test_metadata_limit.py"
+    )
+
+
 def test_localization_task_does_not_ask_for_execution_prediction():
     question = STABILITY.explorer_task(
         STABILITY.CASES[0], "tests/test_selection_order.py", "locate"
@@ -55,7 +78,9 @@ def test_localization_distinguishes_required_targets_from_context():
     case = next(case for case in STABILITY.CASES if case.name == "sample-identity")
     question = STABILITY.explorer_task(case, "tests/test_sample_identity.py", "locate")
     assert "Other source reads are context, not mandatory references" in question
-    required = question.split("including these implementation files: ")[1].split(". Other")[0]
+    required = question.split("including these implementation files: ")[1].split(
+        ". Other"
+    )[0]
     assert case.target in required
     assert all(mutation.target in required for mutation in case.extra_mutations)
     assert "canonical/models.py" not in required

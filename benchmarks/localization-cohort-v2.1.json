@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "candidate_id": "v2.1-localization-route-split-2",
+  "capability": "localization_only_primary_supervised",
+  "question_version": 2,
+  "rounds": 2,
+  "role_models": {
+    "explorer": "openai/gpt-oss-20b",
+    "coder": "qwen/qwen3-coder-30b",
+    "reviewer": "meta/muse-glimmer"
+  },
+  "standard_cases": [
+    "selection-order",
+    "mapping-metadata",
+    "metadata-limit",
+    "internal-trace",
+    "scorer-unused-binding",
+    "selection-percentage",
+    "metadata-key-length",
+    "selection-random-seed",
+    "mapping-message-sequence",
+    "guardrail-casefold"
+  ],
+  "split_case": "sample-identity",
+  "split_units": ["fingerprint", "reuse-key"],
+  "excluded_alias": "reviewer-citation duplicates the metadata-limit behavior",
+  "per_round_distinct_behavior_types": 11,
+  "archive_policy": "fresh snapshot per case and round; keep every initial failure and rework; Primary reviews each accepted unit and the split feature integration",
+  "stop_conditions": [
+    "runtime or role configuration changes",
+    "case input changes between rounds",
+    "source pin or injected baseline preflight fails",
+    "infrastructure failure invalidates the zero-infra candidate"
+  ],
+  "qualification_notes": "This measures the restricted supervised localization route, not general semantic investigation or unattended deployment. Apply stability-plan-v1.2 section 12.9 role thresholds, plus Reviewer hidden-defect and clean-control challenges."
+}

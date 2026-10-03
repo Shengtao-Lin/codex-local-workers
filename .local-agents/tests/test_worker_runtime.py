@@ -479,6 +479,83 @@ class WorkerRuntimeTests(unittest.TestCase):
             self.assertEqual(payload["source_excerpts"][0]["path"], "src/example.py")
             self.assertIn("VALUE = 1", payload["source_excerpts"][0]["content"])
 
+    def test_exception_message_mismatch_has_bounded_source_backed_focus(self) -> None:
+        for source, expected_line in (
+            ('raise TypeError("wrong message")\n', 1),
+            ('raise TypeError("wrong message")\nraise TypeError("wrong message")\n', None),
+            ("raise TypeError(message)\n", None),
+        ):
+            with self.subTest(source=source), TemporaryDirectory() as directory:
+                root = Path(directory)
+                self.make_tree(root)
+                (root / "src/example.py").write_text(source, encoding="utf-8")
+                runtime = RUNTIME.WorkerRuntime(root, packet_v2(), {}, FakeClient([]))
+                runtime.changed["src/example.py"] = {"sha256": "a" * 64}
+                focused = {
+                    "diagnostic": {
+                        "failures": [
+                            {
+                                "test": "test_error",
+                                "location": "tests/test_example.py:4: AssertionError",
+                                "message": "AssertionError: Regex pattern did not match.\n"
+                                "  Expected regex: 'message.*sequence'\n  Actual message: 'wrong message'",
+                            }
+                        ]
+                    }
+                }
+                focus = runtime._failed_test_repair_focus(focused)[0]
+                self.assertEqual(focus["diagnosis"], "exception_message_regex_mismatch")
+                self.assertEqual(focus["expected_regex"], "message.*sequence")
+                self.assertEqual(focus["actual_message"], "wrong message")
+                self.assertEqual(focus.get("line"), expected_line)
+                self.assertIn("exception type", focus["instruction"])
+                payload = runtime._compact_repair_payload(focus)
+                self.assertEqual(payload["repair_focus"]["expected_regex"], "message.*sequence")
+                if expected_line:
+                    self.assertEqual(
+                        focus["expected_sha256"], runtime.editor.read_bytes("src/example.py")[1]
+                    )
+                elif source.count('"wrong message"') == 2:
+                    self.assertEqual(focus["message_source_candidate_count"], 2)
+                    self.assertNotIn("required_path", focus)
+                    self.assertEqual(
+                        [
+                            c["candidate_raise_line"]
+                            for c in payload["repair_focus"]["message_source_candidates"]
+                        ],
+                        [1, 2],
+                    )
+                    self.assertTrue(
+                        all(
+                            c["sha256"] == runtime.editor.read_bytes("src/example.py")[1]
+                            for c in focus["message_source_candidates"]
+                        )
+                    )
+
+    def test_message_mismatch_does_not_interpret_truncated_or_executable_values(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            runtime = RUNTIME.WorkerRuntime(root, packet_v2(), {}, FakeClient([]))
+            for message in (
+                "AssertionError: Regex pattern did not match.\n  Expected regex: 'x'",
+                "AssertionError: Regex pattern did not match.\n  Expected regex: eval('x')\n  Actual message: 'y'",
+                "AssertionError: DID NOT RAISE <class 'TypeError'>",
+            ):
+                focused = {
+                    "diagnostic": {
+                        "failures": [
+                            {
+                                "message": message,
+                                "location": "tests/test_example.py:4: AssertionError",
+                            }
+                        ]
+                    }
+                }
+                focus = runtime._failed_test_repair_focus(focused)[0]
+                self.assertNotIn("expected_regex", focus)
+                self.assertNotIn("diagnosis", focus)
+
     def test_post_edit_failure_keeps_unchanged_multi_file_candidates(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -580,6 +657,99 @@ class WorkerRuntimeTests(unittest.TestCase):
                     }
                 )
             self.assertEqual(runtime.repairs, 0)
+
+    def test_failed_validation_edit_shape_and_noop_reach_current_validation(self) -> None:
+        class RepairReplayClient:
+            def __init__(self) -> None:
+                self.step = 0
+                self.source_hash = ""
+
+            def complete(self, messages: list[dict[str, str]]) -> str:
+                self.step += 1
+                observations = [
+                    json.loads(item["content"].split("\n", 1)[1])
+                    for item in messages
+                    if item["role"] == "user" and item["content"].startswith("OBSERVATION\n")
+                ]
+                if self.step == 1:
+                    action = {"action": "READ_FILE", "arguments": {"path": "src/example.py"}}
+                elif self.step == 2:
+                    self.source_hash = observations[-1]["sha256"]
+                    action = {"action": "VALIDATE", "arguments": {}}
+                elif self.step == 3:
+                    action = {
+                        "action": "SAFE_REPLACE",
+                        "arguments": {
+                            "path": "src/example.py",
+                            "expected_sha256": self.source_hash,
+                            "find": "VALUE = 1\n",
+                            "replace": "VALUE = 2  \n",
+                        },
+                    }
+                elif self.step == 4:
+                    action = {"action": "READ_FILE", "arguments": {"path": "src/example.py"}}
+                elif self.step == 5:
+                    self.source_hash = observations[-1]["sha256"]
+                    action = {
+                        "action": "SAFE_REPLACE_LINE",
+                        "arguments": {
+                            "path": "src/example.py",
+                            "expected_sha256": self.source_hash,
+                            "line": 1,
+                            "replacement": "VALUE = 2\nOTHER = 3",
+                        },
+                    }
+                elif self.step == 6:
+                    action = {
+                        "action": "SAFE_REPLACE",
+                        "arguments": {
+                            "path": "src/example.py",
+                            "expected_sha256": self.source_hash,
+                            "find": "VALUE = 2  ",
+                            "replace": "VALUE = 2",
+                        },
+                    }
+                elif self.step == 7:
+                    action = {
+                        "action": "SAFE_REPLACE",
+                        "arguments": {
+                            "path": "src/example.py",
+                            "expected_sha256": self.source_hash,
+                            "find": "VALUE = 2",
+                            "replace": "VALUE = 2",
+                        },
+                    }
+                elif self.step == 8:
+                    self.assertion = observations[-1]["required_next_action"]
+                    action = {"action": "VALIDATE", "arguments": {}}
+                else:
+                    action = {
+                        "action": "FINISH_SUCCESS",
+                        "arguments": {
+                            "summary": ["Validated current draft."],
+                            "remaining_uncertainty": [],
+                        },
+                    }
+                return json.dumps(action)
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            (root / "tests" / "test_example.py").write_text(
+                "import runpy\n\ndef test_value():\n    assert runpy.run_path('src/example.py')['VALUE'] == 2\n",
+                encoding="utf-8",
+            )
+            value = packet_v2()
+            value["limits"] = {"max_model_turns": 14}
+            client = RepairReplayClient()
+            runtime = RUNTIME.WorkerRuntime(root, value, {"python": sys.executable}, client)
+            report = runtime.run()
+            self.assertEqual(report["status"], "ready_for_review")
+            self.assertEqual(client.assertion, "VALIDATE")
+            self.assertEqual(runtime.protocol_errors, 0)
+            self.assertEqual(runtime.validation_count, 2)
+            self.assertFalse(runtime.noop_validation_pending)
+            self.assertEqual((root / "src/example.py").read_text(), "VALUE = 2\n")
 
     def test_placeholder_warning_only_for_new_executable_raise(self) -> None:
         with TemporaryDirectory() as directory:
@@ -1022,6 +1192,8 @@ class WorkerRuntimeTests(unittest.TestCase):
         self.assertEqual(hint["path"], "src/evaluations/dedup.py")
         self.assertEqual(hint["line"], 28)
         self.assertIn("preserving", hint["instruction"])
+        self.assertIn('replace ""', hint["instruction"])
+        self.assertIn("keep neighboring statements unchanged", hint["instruction"])
 
     def test_ruff_f821_becomes_early_repair_focus_when_tests_pass(self) -> None:
         with TemporaryDirectory() as directory:
@@ -1866,6 +2038,198 @@ class WorkerRuntimeTests(unittest.TestCase):
     def test_non_json_trailing_output_is_rejected(self) -> None:
         with self.assertRaisesRegex(RUNTIME.WorkerError, "non-JSON trailing"):
             RUNTIME.parse_action('{"action":"VALIDATE"}\nthen run tests')
+
+    def test_lmstudio_client_explicitly_loads_missing_model_with_role_context(self) -> None:
+        requests = []
+
+        class FakeResponse(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.close()
+
+        def fake_urlopen(request, timeout):
+            requests.append((request.full_url, request.get_method(), timeout))
+            if request.get_method() == "POST":
+                self.assertEqual(
+                    json.loads(request.data),
+                    {"model": "meta/muse-glimmer", "context_length": 24576},
+                )
+                return FakeResponse(b'{"status":"loaded"}')
+            loaded = len(requests) > 2
+            instances = (
+                [{"id": "meta/muse-glimmer", "config": {"context_length": 24576}}] if loaded else []
+            )
+            return FakeResponse(
+                json.dumps(
+                    {"models": [{"key": "meta/muse-glimmer", "loaded_instances": instances}]}
+                ).encode()
+            )
+
+        client = RUNTIME.LMStudioClient(
+            "http://localhost:12345/v1", "meta/muse-glimmer", context_length=24576
+        )
+        with patch.object(RUNTIME.urllib.request, "urlopen", side_effect=fake_urlopen):
+            self.assertEqual(client.ensure_loaded()["status"], "loaded")
+            self.assertEqual(client.ensure_loaded()["status"], "already_loaded")
+        self.assertEqual([method for _, method, _ in requests], ["GET", "POST", "GET", "GET"])
+        self.assertEqual(requests[1][2], 360)
+
+    def test_lmstudio_client_model_readiness_failure_is_infrastructure(self) -> None:
+        client = RUNTIME.LMStudioClient("http://localhost:12345/v1", "meta/muse-glimmer")
+        with patch.object(
+            RUNTIME.urllib.request,
+            "urlopen",
+            side_effect=RUNTIME.urllib.error.URLError("unavailable"),
+        ):
+            with self.assertRaises(RUNTIME.PreflightBlocked) as raised:
+                client.ensure_loaded()
+        self.assertEqual(raised.exception.reason_code, "model_load_failed")
+
+    def test_lmstudio_readiness_reuses_loaded_instance_with_distinct_id(self) -> None:
+        """The native model key and loaded instance id are distinct fields."""
+
+        class FakeResponse(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.close()
+
+        client = RUNTIME.LMStudioClient(
+            "http://localhost:12345/v1", "meta/muse-glimmer", context_length=24576
+        )
+        calls = []
+        inventory = {
+            "models": [
+                {
+                    "key": client.model,
+                    "loaded_instances": [
+                        {"id": "muse-loaded-instance", "config": {"context_length": 24576}}
+                    ],
+                }
+            ]
+        }
+
+        def urlopen(request, timeout):
+            calls.append(request.get_method())
+            if request.get_method() != "GET":
+                raise AssertionError("already resident role must not be loaded again")
+            return FakeResponse(json.dumps(inventory).encode())
+
+        with patch.object(RUNTIME.urllib.request, "urlopen", side_effect=urlopen):
+            self.assertEqual(client.ensure_loaded()["status"], "already_loaded")
+        self.assertEqual(calls, ["GET"])
+
+    def test_lmstudio_distinct_instance_id_keeps_context_floor(self) -> None:
+        class FakeResponse(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.close()
+
+        client = RUNTIME.LMStudioClient(
+            "http://localhost:12345/v1", "meta/muse-glimmer", context_length=24576
+        )
+        inventory = {
+            "models": [
+                {
+                    "key": client.model,
+                    "loaded_instances": [
+                        {"id": "muse-loaded-instance", "config": {"context_length": 8192}}
+                    ],
+                }
+            ]
+        }
+
+        def urlopen(request, timeout):
+            self.assertEqual(request.get_method(), "GET")
+            return FakeResponse(json.dumps(inventory).encode())
+
+        with patch.object(RUNTIME.urllib.request, "urlopen", side_effect=urlopen):
+            with self.assertRaises(RUNTIME.PreflightBlocked) as raised:
+                client.ensure_loaded()
+        self.assertEqual(raised.exception.reason_code, "model_context_too_small")
+
+    def test_role_lease_then_readiness_does_not_reload_alias_instance(self) -> None:
+        class FakeResponse(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.close()
+
+        client = RUNTIME.LMStudioClient(
+            "http://localhost:12345/v1", "meta/muse-glimmer", context_length=24576
+        )
+        config = {
+            "single_model_residency": True,
+            "explorer_model": "openai/gpt-oss-20b",
+            "coder_model": "qwen/qwen3-coder-30b",
+            "reviewer_model": client.model,
+        }
+        inventory = {
+            "models": [
+                {
+                    "key": model,
+                    "loaded_instances": [
+                        {"id": "muse-loaded-instance", "config": {"context_length": 24576}}
+                    ]
+                    if model == client.model
+                    else [],
+                }
+                for model in (config["explorer_model"], config["coder_model"], client.model)
+            ]
+        }
+        calls = []
+
+        def urlopen(request, timeout):
+            method = request.get_method() if hasattr(request, "get_method") else "GET"
+            calls.append(method)
+            self.assertEqual(method, "GET")
+            return FakeResponse(json.dumps(inventory).encode())
+
+        with TemporaryDirectory() as directory:
+            with patch.object(
+                RUNTIME.MODEL_RESIDENCY.tempfile, "gettempdir", return_value=directory
+            ):
+                with patch.object(RUNTIME.urllib.request, "urlopen", side_effect=urlopen):
+                    with RUNTIME.MODEL_RESIDENCY.role_model_lease(client, config):
+                        self.assertEqual(client.ensure_loaded()["status"], "already_loaded")
+                self.assertEqual(list(Path(directory).iterdir()), [])
+        self.assertEqual(calls, ["GET", "GET", "GET", "GET"])
+
+    def test_lmstudio_client_rejects_loaded_context_below_role_contract(self) -> None:
+        class FakeResponse(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.close()
+
+        client = RUNTIME.LMStudioClient(
+            "http://localhost:12345/v1", "meta/muse-glimmer", context_length=24576
+        )
+        inventory = {
+            "models": [
+                {
+                    "key": "meta/muse-glimmer",
+                    "loaded_instances": [
+                        {"id": "meta/muse-glimmer", "config": {"context_length": 8192}}
+                    ],
+                }
+            ]
+        }
+        with patch.object(
+            RUNTIME.urllib.request,
+            "urlopen",
+            return_value=FakeResponse(json.dumps(inventory).encode()),
+        ):
+            with self.assertRaises(RUNTIME.PreflightBlocked) as raised:
+                client.ensure_loaded()
+        self.assertEqual(raised.exception.reason_code, "model_context_too_small")
 
     def test_lmstudio_client_requests_schema_constrained_actions(self) -> None:
         captured = {}

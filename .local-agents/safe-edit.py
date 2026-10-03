@@ -215,7 +215,41 @@ class SafeEditor:
                 },
             )
         if occurrences != 1:
-            raise SafeEditError(f"target block occurs {occurrences} times; refusing ambiguous edit")
+            # Navigation only: never select a duplicate or apply a rejected edit.
+            lines = text.splitlines()
+            candidates = []
+            offset = 0
+            for _ in range(min(occurrences, 4)):
+                position = text.find(find, offset)
+                line_index = text.count("\n", 0, position)
+                start = max(0, line_index - 3)
+                end = min(len(lines), line_index + 4)
+                candidates.append(
+                    {
+                        "match_start_line": line_index + 1,
+                        "context": "\n".join(
+                            f"{index + 1}: {lines[index]}" for index in range(start, end)
+                        )[:1200],
+                    }
+                )
+                offset = position + len(find)
+            raise SafeEditError(
+                f"target block occurs {occurrences} times; refusing ambiguous edit",
+                details={
+                    "path": relative,
+                    "current_sha256": current_sha256,
+                    "match_count": occurrences,
+                    "candidate_contexts": candidates,
+                    "candidates_truncated": occurrences > len(candidates),
+                    "instruction": (
+                        "No edit ran. These are possible matches, not the responsible branch. "
+                        "Compare each surrounding condition with the failing test and contract. "
+                        "READ_FILE the chosen current range, then SAFE_REPLACE a small unique "
+                        "block including its condition. Do not add an unrelated guard, repeat "
+                        "the ambiguous find, or choose the first match automatically."
+                    ),
+                },
+            )
 
         updated = text.replace(find, replacement, 1).encode("utf-8")
         output = (b"\xef\xbb\xbf" + updated) if bom else updated

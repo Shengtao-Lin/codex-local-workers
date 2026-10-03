@@ -15,6 +15,40 @@ SPEC.loader.exec_module(SAFE_EDIT)
 
 
 class SafeEditTests(unittest.TestCase):
+    def test_ambiguous_replace_returns_bounded_context_without_edit(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "example.py"
+            original = 'if value is None:\n    raise TypeError("bad")\nif isinstance(value, str):\n    raise TypeError("bad")\n'
+            target.write_text(original, encoding="utf-8")
+            editor = SAFE_EDIT.SafeEditor(root, allowed_modify=["example.py"], allowed_create=[])
+            _, digest = editor.read_bytes("example.py")
+            with self.assertRaisesRegex(SAFE_EDIT.SafeEditError, "ambiguous") as caught:
+                editor.replace(
+                    "example.py", 'raise TypeError("bad")', 'raise TypeError("good")', digest
+                )
+            details = caught.exception.details
+            self.assertEqual(details["current_sha256"], digest)
+            self.assertEqual([c["match_start_line"] for c in details["candidate_contexts"]], [2, 4])
+            self.assertFalse(details["candidates_truncated"])
+            self.assertEqual(target.read_text(), original)
+            editor.replace(
+                "example.py",
+                'if isinstance(value, str):\n    raise TypeError("bad")',
+                'if isinstance(value, str):\n    raise TypeError("good")',
+                digest,
+            )
+            self.assertIn('if value is None:\n    raise TypeError("bad")', target.read_text())
+            target.write_text(("x" * 2000 + "\nBAD\n") * 6, encoding="utf-8")
+            _, digest = editor.read_bytes("example.py")
+            with self.assertRaises(SAFE_EDIT.SafeEditError) as caught:
+                editor.replace("example.py", "BAD", "GOOD", digest)
+            details = caught.exception.details
+            self.assertEqual(details["match_count"], 6)
+            self.assertEqual(len(details["candidate_contexts"]), 4)
+            self.assertTrue(details["candidates_truncated"])
+            self.assertTrue(all(len(c["context"]) <= 1200 for c in details["candidate_contexts"]))
+
     def test_replace_line_preserves_newlines_and_requires_current_hash(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)

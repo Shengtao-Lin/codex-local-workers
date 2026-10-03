@@ -1,0 +1,8 @@
+{
+  "question": "A local worker cannot proceed because its requested path is outside Primary scope. Choose ESCALATE_PRIMARY for worker-success-finalization with reason_code scope-expansion. Do not claim feature readiness.",
+  "expected_decision": {
+    "decision": "ESCALATE_PRIMARY",
+    "unit_id": "worker-success-finalization",
+    "reason_code": "scope-expansion"
+  }
+}

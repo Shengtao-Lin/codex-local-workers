@@ -1,4 +1,31 @@
-# Benchmarks
+# Testing and model qualification
+
+## Current release
+
+Start with [release notes](../docs/release-notes.md),
+[model configuration](../docs/models.md), and
+[cost and latency](../docs/cost-and-latency.md). Run deterministic checks with
+`python -m pytest .local-agents/tests tests -q` before starting local models.
+Use an interpreter with pytest, Ruff and fixture dependencies installed.
+
+Qualify the configured roles with `python benchmarks/role_compat.py --config
+.local-agents/config.json`. Add `--explorer-mode locate` to qualify supervised
+localization separately. Run local jobs serially and allow time for model loads.
+
+For a paired coordination comparison, run `supervised_efficiency.py --pair
+benchmarks/work/my-pair --case selection-random-seed --mode control`, then the
+same command with `--mode coordinator`. Other cases are
+`mapping-message-sequence` and `metadata-limit`. Each arm still requires
+independent Primary review; the runner never accepts a feature. Preserve input
+and runtime hashes and record failed attempts, not just successful arms.
+
+## Historical evaluation reference
+
+The material below documents older experiments, not current release status.
+GO/NO-GO labels apply only to their own frozen cohort and scope; do not pool
+successive candidate denominators. Engineering plans referenced by historical
+reports are retained on
+[`codex/v2.1-dev`](https://github.com/Shengtao-Lin/codex-local-workers/tree/codex/v2.1-dev/docs).
 
 The [S5 baseline](S5-RESULTS.md) is a historical diagnostic experiment from
 before the current S6 Reviewer and recovery flow. For current-version evidence,
@@ -98,6 +125,15 @@ line; a bare `escalate` or empty findings is not counted. This is a one-case
 diagnostic, not a measured miss rate or proof of general review reliability.
 
 ## S5 baseline benchmark
+
+For a future restricted-localization route cohort, run each frozen case with
+`python benchmarks/localization_route_smoke.py --case <name> --unknown-location`.
+Summarize explicitly selected `route-result.json` files with
+`python benchmarks/localization_route_summary.py <results...> --require-frozen-manifest`.
+The strict option rejects missing or mixed runtime/config provenance, changed
+runtime files during a cell, and changed inputs for repeated attempts of one
+case. It does not itself establish the 11+ type/two-round release gate or
+authenticate model weights behind a local model ID.
 
 Copy `config.example.json` to the ignored `config.local.json` and set its
 trusted Python interpreter before running local workers. Generated task

@@ -145,6 +145,101 @@ class RepeatedMalformedAfterEvidenceClient:
         )
 
 
+class LocateEvidenceRepairClient:
+    def __init__(self) -> None:
+        self.native_tools = RUNTIME.EXPLORER_TOOLS
+        self.native_tool_choice = "auto"
+        self.allowed_tools: list[list[str]] = []
+
+    def complete(self, _messages: list[dict[str, str]]) -> str:
+        self.allowed_tools.append([tool["function"]["name"] for tool in self.native_tools])
+        step = len(self.allowed_tools)
+        if step == 1:
+            return json.dumps(
+                {
+                    "action": "FINISH_SUCCESS",
+                    "source_refs": [
+                        {
+                            "path": "greeting.py",
+                            "start_line": 1,
+                            "end_line": 1,
+                            "kind": "implementation",
+                        }
+                    ],
+                    "uncertainties": [],
+                }
+            )
+        if step <= 3:
+            return json.dumps(
+                {
+                    "action": "READ_FILE",
+                    "path": "greeting.py" if step == 2 else "tests/test_greeting.py",
+                }
+            )
+        return json.dumps(
+            {
+                "action": "FINISH_SUCCESS",
+                "source_refs": [
+                    {
+                        "path": "greeting.py",
+                        "start_line": 1,
+                        "end_line": 1,
+                        "kind": "implementation",
+                    },
+                    {
+                        "path": "tests/test_greeting.py",
+                        "start_line": 2,
+                        "end_line": 2,
+                        "kind": "test",
+                    },
+                ],
+                "uncertainties": [],
+            }
+        )
+
+
+class RequiredTestReadClient:
+    def __init__(self, repeat_search: bool = False) -> None:
+        self.repeat_search = repeat_search
+        self.step = 0
+        self.messages_seen: list[list[dict[str, str]]] = []
+
+    def complete(self, messages: list[dict[str, str]]) -> str:
+        self.messages_seen.append(list(messages))
+        self.step += 1
+        if self.step == 1:
+            action = {"action": "READ_FILE", "path": "greeting.py"}
+        elif self.step == 2 or (self.repeat_search and self.step == 3):
+            action = {
+                "action": "SEARCH",
+                "path": "tests",
+                "query": "test_greeting",
+                "glob": "**/*.py",
+            }
+        elif self.step == 3 or (self.repeat_search and self.step == 4):
+            action = {"action": "READ_FILE", "path": "tests/test_greeting.py"}
+        else:
+            action = {
+                "action": "FINISH_SUCCESS",
+                "source_refs": [
+                    {
+                        "path": "greeting.py",
+                        "start_line": 1,
+                        "end_line": 1,
+                        "kind": "implementation",
+                    },
+                    {
+                        "path": "tests/test_greeting.py",
+                        "start_line": 2,
+                        "end_line": 2,
+                        "kind": "test",
+                    },
+                ],
+                "uncertainties": [],
+            }
+        return json.dumps(action)
+
+
 class ExplorerRuntimeTests(unittest.TestCase):
     def test_globstar_does_not_hide_root_level_test_directory(self) -> None:
         with TemporaryDirectory() as directory:
@@ -251,6 +346,154 @@ class ExplorerRuntimeTests(unittest.TestCase):
                 RUNTIME.ExplorerRuntime(
                     root, "Locate.", {"explorer_mode": "typo"}, AdaptiveExplorerClient()
                 )
+
+    def test_localization_eof_citation_rejects_without_silent_clamping(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            runtime = RUNTIME.ExplorerRuntime(
+                root, "Locate.", {"explorer_mode": "locate"}, AdaptiveExplorerClient()
+            )
+            runtime.read_file({"path": "greeting.py"})
+            ref = {
+                "path": "greeting.py",
+                "start_line": 1,
+                "end_line": 2,
+                "kind": "implementation",
+            }
+            with self.assertRaisesRegex(RUNTIME.ExplorerError, "file ends at line 1"):
+                runtime.finish_success({"source_refs": [ref], "uncertainties": []})
+            self.assertEqual(ref["end_line"], 2)
+            ref["end_line"] = 1
+            self.assertEqual(
+                runtime.finish_success({"source_refs": [ref], "uncertainties": []})["status"],
+                "success",
+            )
+
+    def test_localization_eof_hint_reaches_next_model_turn(self) -> None:
+        class EofRepairClient:
+            step = 0
+
+            def complete(self, messages):
+                self.step += 1
+                if self.step == 1:
+                    return json.dumps({"action": "READ_FILE", "path": "greeting.py"})
+                if self.step == 3:
+                    assert "file ends at line 1" in json.dumps(messages)
+                    assert "end_line must be <= 1" in json.dumps(messages)
+                return json.dumps(
+                    {
+                        "action": "FINISH_SUCCESS",
+                        "source_refs": [
+                            {
+                                "path": "greeting.py",
+                                "start_line": 1,
+                                "end_line": 2 if self.step == 2 else 1,
+                                "kind": "implementation",
+                            }
+                        ],
+                        "uncertainties": [],
+                    }
+                )
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            client = EofRepairClient()
+            runtime = RUNTIME.ExplorerRuntime(root, "Locate.", {"explorer_mode": "locate"}, client)
+            report = runtime.run()
+            self.assertEqual(report["status"], "success")
+            self.assertEqual(report["budget_usage"]["protocol_errors"], 1)
+            self.assertEqual(client.step, 3)
+            self.assertEqual(report["source_refs"][0]["end_line"], 1)
+
+    def test_localization_unread_finish_can_read_before_terminal_retry(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            (root / "tests" / "test_greeting.py").write_text(
+                "from greeting import build_greeting\nassert build_greeting() is None\n",
+                encoding="utf-8",
+            )
+            client = LocateEvidenceRepairClient()
+            runtime = RUNTIME.ExplorerRuntime(
+                root,
+                "Locate implementation and assertion.",
+                {
+                    "explorer_mode": "locate",
+                    "explorer_required_citation_paths": ["tests/test_greeting.py"],
+                    "explorer_require_test_assertion_citation": True,
+                },
+                client,
+            )
+            report = runtime.run()
+            self.assertEqual(report["status"], "success")
+            self.assertEqual(report["budget_usage"]["protocol_errors"], 1)
+            self.assertIn("READ_FILE", client.allowed_tools[1])
+            self.assertFalse(runtime.finish_repair_used)
+
+    def test_empty_content_search_requires_read_of_known_test_file(self) -> None:
+        for repeat_search in (False, True):
+            with self.subTest(repeat_search=repeat_search), TemporaryDirectory() as directory:
+                root = Path(directory)
+                self.make_tree(root)
+                (root / "tests" / "test_greeting.py").write_text(
+                    "from greeting import build_greeting\nassert build_greeting() is None\n",
+                    encoding="utf-8",
+                )
+                client = RequiredTestReadClient(repeat_search)
+                runtime = RUNTIME.ExplorerRuntime(
+                    root,
+                    "Locate the implementation and the test assertion.",
+                    {
+                        "explorer_mode": "locate",
+                        "explorer_required_citation_paths": ["tests/test_greeting.py"],
+                        "explorer_require_test_assertion_citation": True,
+                    },
+                    client,
+                )
+                report = runtime.run()
+                self.assertEqual(report["status"], "success")
+                self.assertEqual(runtime.search_count, 1)
+                self.assertEqual(runtime.read_files, {"greeting.py", "tests/test_greeting.py"})
+                self.assertIn(
+                    "READ_FILE with path tests/test_greeting.py",
+                    client.messages_seen[2][-1]["content"],
+                )
+                if repeat_search:
+                    self.assertEqual(runtime.required_citation_read_rejections, 0)
+                    self.assertIn(
+                        "required_citation_read_not_taken",
+                        client.messages_seen[3][-1]["content"],
+                    )
+
+    def test_localization_requires_actual_test_assertion_citation_when_configured(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            (root / "tests" / "test_greeting.py").write_text(
+                "from greeting import build_greeting\nassert build_greeting() is None\n",
+                encoding="utf-8",
+            )
+            runtime = RUNTIME.ExplorerRuntime(
+                root,
+                "Locate implementation and assertion.",
+                {"explorer_mode": "locate", "explorer_require_test_assertion_citation": True},
+                FailIfCalledClient(),
+            )
+            runtime.read_file({"path": "greeting.py"})
+            runtime.read_file({"path": "tests/test_greeting.py"})
+            refs = [
+                {"path": "greeting.py", "start_line": 1, "end_line": 1, "kind": "implementation"},
+                {"path": "tests/test_greeting.py", "start_line": 1, "end_line": 1, "kind": "test"},
+            ]
+            with self.assertRaisesRegex(RUNTIME.ExplorerError, "test assertion line"):
+                runtime.finish_success({"source_refs": refs, "uncertainties": []})
+            refs[1]["start_line"] = refs[1]["end_line"] = 2
+            self.assertEqual(
+                runtime.finish_success({"source_refs": refs, "uncertainties": []})["status"],
+                "success",
+            )
 
     def test_citation_shape_recovery_is_one_shot_and_enforced_before_dispatch(self) -> None:
         for repair_action in ("FINISH_SUCCESS", "READ_FILE"):
@@ -553,6 +796,64 @@ class ExplorerRuntimeTests(unittest.TestCase):
                 },
             )
             self.assertEqual(report["status"], "success")
+
+    def test_missing_compat_action_does_not_enter_report_only_recovery(self) -> None:
+        for required in ("TRACE", "SEARCH"):
+            with self.subTest(required=required), TemporaryDirectory() as directory:
+                root = Path(directory)
+                self.make_tree(root)
+                finish = {
+                    "action": "FINISH_SUCCESS",
+                    "source_refs": [
+                        {
+                            "path": "greeting.py",
+                            "start_line": 1,
+                            "end_line": 1,
+                            "kind": "implementation",
+                        },
+                        {
+                            "path": "tests/test_greeting.py",
+                            "start_line": 1,
+                            "end_line": 1,
+                            "kind": "test",
+                        },
+                    ],
+                    "uncertainties": [],
+                }
+                action = (
+                    {"action": "TRACE", "symbol": "build_greeting"}
+                    if required == "TRACE"
+                    else {"action": "SEARCH", "query": "build_.*", "mode": "regex", "glob": "*.py"}
+                )
+                actions = [
+                    {"action": "READ_FILE", "path": "greeting.py"},
+                    {"action": "READ_FILE", "path": "tests/test_greeting.py"},
+                    finish,
+                    action,
+                    finish,
+                ]
+
+                class Client:
+                    native_tools = RUNTIME.EXPLORER_TOOLS
+                    native_tool_choice = "auto"
+
+                    def complete(self, _messages):
+                        if len(actions) == 2:
+                            assert required in {
+                                item["function"]["name"] for item in self.native_tools
+                            }
+                        return json.dumps(actions.pop(0))
+
+                config = {"explorer_mode": "locate"}
+                if required == "TRACE":
+                    config["explorer_require_trace_symbol"] = "build_greeting"
+                else:
+                    config["explorer_require_regex_search"] = True
+                runtime = RUNTIME.ExplorerRuntime(root, "Locate.", config, Client())
+                result = runtime.run()
+                self.assertEqual(result["status"], "success")
+                self.assertEqual(result["budget_usage"]["protocol_errors"], 1)
+                self.assertFalse(runtime.finish_repair_used)
 
     def test_explorer_capability_schema_is_read_only(self) -> None:
         actions = {item["function"]["name"] for item in RUNTIME.EXPLORER_TOOLS}

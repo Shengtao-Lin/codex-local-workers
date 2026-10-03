@@ -24,6 +24,20 @@ if hasattr(sys.stderr, "reconfigure"):
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+
+
+def _load_model_residency() -> Any:
+    spec = importlib.util.spec_from_file_location(
+        "local_explorer_model_residency", SCRIPT_DIR / "model_residency.py"
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("could not load model_residency.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+MODEL_RESIDENCY = _load_model_residency()
 EXCLUDED_PARTS = {
     ".agent",
     ".git",
@@ -199,6 +213,10 @@ EXPLORER_TOOLS = [
 
 class ExplorerError(RuntimeError):
     pass
+
+
+class ExplorerMissingAction(ExplorerError):
+    """A terminal attempt is premature, not a report-formatting failure."""
 
 
 class ExplorerPreflightBlocked(ExplorerError):
@@ -736,6 +754,8 @@ class ExplorerRuntime:
         self.no_progress_streak = 0
         self.finish_repair_pending = False
         self.finish_repair_used = False
+        self.required_citation_read: str | None = None
+        self.required_citation_read_rejections = 0
         self.max_no_progress_streak = int(config.get("max_explorer_no_progress_streak", 3))
         self.read_hashes: dict[str, str] = {}
         self.read_observations: dict[str, str] = {}
@@ -1019,11 +1039,38 @@ finding or concluding the current question is answered."""
             envelope: dict[str, Any] | None = None
             try:
                 envelope = parse_action(raw)
+                warnings = []
                 if finish_only and envelope["action"] != "FINISH_SUCCESS":
                     raise ExplorerError("report-only recovery permits only FINISH_SUCCESS")
-                warnings = envelope["warnings"]
-                self.protocol_normalizations += len(warnings)
-                observation, final = self.execute(envelope["action"], envelope["arguments"])
+                if self.required_citation_read is not None:
+                    expected_path = self.required_citation_read
+                    if (
+                        envelope["action"] != "READ_FILE"
+                        or envelope["arguments"].get("path") != expected_path
+                    ):
+                        self.required_citation_read_rejections += 1
+                        if self.required_citation_read_rejections >= 2:
+                            raise ExplorerError(
+                                "required citation READ_FILE was ignored twice: " + expected_path
+                            )
+                        observation = {
+                            "status": "rejected",
+                            "error": "required_citation_read_not_taken",
+                            "next_step": (
+                                "Next action exactly READ_FILE with path " + expected_path
+                            ),
+                        }
+                        final = None
+                    else:
+                        self.required_citation_read = None
+                        self.required_citation_read_rejections = 0
+                        warnings = envelope["warnings"]
+                        self.protocol_normalizations += len(warnings)
+                        observation, final = self.execute(envelope["action"], envelope["arguments"])
+                else:
+                    warnings = envelope["warnings"]
+                    self.protocol_normalizations += len(warnings)
+                    observation, final = self.execute(envelope["action"], envelope["arguments"])
                 if warnings and final is None:
                     observation["protocol_warnings"] = warnings
             except (ExplorerError, OSError, UnicodeDecodeError, re.error) as exc:
@@ -1080,6 +1127,7 @@ finding or concluding the current question is answered."""
                 if (
                     envelope is not None
                     and envelope["action"] == "FINISH_SUCCESS"
+                    and not isinstance(exc, ExplorerMissingAction)
                     and not self.finish_repair_used
                     and (
                         self.mode == "locate"
@@ -1088,25 +1136,42 @@ finding or concluding the current question is answered."""
                         or str(exc).startswith("citations.")
                     )
                 ):
-                    self.finish_repair_pending = True
-                    self.finish_repair_used = True
-                    observation["next_step"] = (
-                        "Correct FINISH_SUCCESS now. Supply citations as objects with "
-                        "path, integer line, and claim, one for every path named in the "
-                        "error. claim must be a nonempty string explaining that observed "
-                        "line, not a field named text or quote. Use only lines from "
-                        "READ_FILE. Do not read or search again."
-                    )
-                    if self.mode == "locate":
-                        observation["next_step"] = (
-                            "Correct FINISH_SUCCESS once using only source_refs and uncertainties. "
-                            "Each reference needs path, integer start_line/end_line, and kind "
-                            "implementation/test/caller/definition. Use already read lines. "
-                            "Both limits apply together: at most 6 references AND at most 80 "
-                            "total lines, summing end_line - start_line + 1 for every reference. "
-                            "Keep controlling values and relevant assertions; omit optional "
-                            "context ranges rather than citing whole files."
+                    needs_read = self.mode == "locate" and (
+                        str(exc).startswith("source_refs contain unread lines:")
+                        or (
+                            str(exc).startswith("source_refs missing required paths:")
+                            and any(
+                                path.strip() not in self.read_files
+                                for path in str(exc).split(":", 1)[1].split(",")
+                            )
                         )
+                    )
+                    if needs_read:
+                        observation["next_step"] = (
+                            "READ_FILE the missing source/test lines named in the error, "
+                            "then retry FINISH_SUCCESS with observed line ranges. "
+                            "A SEARCH hit alone is not a cited read."
+                        )
+                    else:
+                        self.finish_repair_pending = True
+                        self.finish_repair_used = True
+                        observation["next_step"] = (
+                            "Correct FINISH_SUCCESS now. Supply citations as objects with "
+                            "path, integer line, and claim, one for every path named in the "
+                            "error. claim must be a nonempty string explaining that observed "
+                            "line, not a field named text or quote. Use only lines from "
+                            "READ_FILE. Do not read or search again."
+                        )
+                        if self.mode == "locate":
+                            observation["next_step"] = (
+                                "Correct FINISH_SUCCESS once using only source_refs and uncertainties. "
+                                "Each reference needs path, integer start_line/end_line, and kind "
+                                "implementation/test/caller/definition. Use already read lines. "
+                                "Both limits apply together: at most 6 references AND at most 80 "
+                                "total lines, summing end_line - start_line + 1 for every reference. "
+                                "Keep controlling values and relevant assertions; omit optional "
+                                "context ranges rather than citing whole files."
+                            )
                 if self.protocol_errors >= self.max_protocol_errors:
                     self.diagnostic_event(
                         "turn",
@@ -1159,6 +1224,30 @@ finding or concluding the current question is answered."""
                 self.no_progress_streak = 0 if evidence else self.no_progress_streak + 1
             else:
                 self.no_progress_streak += 1
+            if (
+                self.mode == "locate"
+                and envelope is not None
+                and envelope["action"] == "SEARCH"
+                and observation.get("status") == "ok"
+                and not observation.get("results")
+                and self.required_citation_read is None
+            ):
+                for candidate in self.config.get("explorer_required_citation_paths", []):
+                    if not isinstance(candidate, str):
+                        continue
+                    try:
+                        relative, required_file = self.resolve(candidate)
+                    except ExplorerError:
+                        continue
+                    if relative not in self.read_files and required_file.is_file():
+                        self.required_citation_read = relative
+                        self.required_citation_read_rejections = 0
+                        observation["next_step"] = (
+                            "Content search found no matches. The required citation file exists; "
+                            "next action exactly READ_FILE with path " + relative + "."
+                        )
+                        self.no_progress_streak = 0
+                        break
             if self.finish_repair_pending:
                 # One invalid terminal report is a formatting error, not another
                 # repository investigation. Allow its single report-only retry
@@ -1184,7 +1273,11 @@ finding or concluding the current question is answered."""
                     )
                 )
             observation["remaining_model_turns"] = self.max_turns - _turn - 1
-            if observation["remaining_model_turns"] <= 2 and not self.finish_repair_pending:
+            if (
+                observation["remaining_model_turns"] <= 2
+                and not self.finish_repair_pending
+                and "next_step" not in observation
+            ):
                 observation["next_step"] = (
                     "Finish now with evidence or explicit uncertainty. "
                     "Do not start another broad search."
@@ -1306,14 +1399,14 @@ finding or concluding the current question is answered."""
                 item.get("action") == "SEARCH" and item.get("mode") == "regex"
                 for item in self.action_trace
             ):
-                raise ExplorerError(
+                raise ExplorerMissingAction(
                     "compatibility qualification requires regex SEARCH; next action exactly: "
                     '{"action":"SEARCH","query":"normalize_.*","mode":"regex",'
                     '"glob":"**/*.py"}'
                 )
             required_trace = self.config.get("explorer_require_trace_symbol")
             if required_trace and required_trace not in self.trace_evidence_symbols:
-                raise ExplorerError(
+                raise ExplorerMissingAction(
                     "compatibility qualification requires TRACE with file/line evidence; "
                     "next action exactly: "
                     + json.dumps({"action": "TRACE", "symbol": required_trace})
@@ -1767,7 +1860,17 @@ finding or concluding the current question is answered."""
             }:
                 raise ExplorerError("source_refs have an invalid kind")
             if not set(range(start, end + 1)) <= self.displayed_line_numbers.get(relative, set()):
-                raise ExplorerError(f"source_refs contain unread lines: {relative}:{start}-{end}")
+                line_count = len(path.read_bytes().decode("utf-8-sig").splitlines())
+                correction = (
+                    f"; file ends at line {line_count}; end_line must be <= {line_count}. "
+                    "Resubmit FINISH_SUCCESS with an actually displayed range; "
+                    "another READ_FILE cannot create a line beyond EOF"
+                    if end > line_count
+                    else "; READ_FILE the missing range before citing it"
+                )
+                raise ExplorerError(
+                    f"source_refs contain unread lines: {relative}:{start}-{end}" + correction
+                )
             content = path.read_bytes()
             digest = hashlib.sha256(content).hexdigest()
             if digest != self.read_hashes.get(relative):
@@ -1784,6 +1887,15 @@ finding or concluding the current question is answered."""
         missing = {normalize_relative_path(path) for path in required} - present
         if missing:
             raise ExplorerError("source_refs missing required paths: " + ", ".join(sorted(missing)))
+        if self.config.get("explorer_require_test_assertion_citation", False):
+            if not any(
+                ref["kind"] == "test"
+                and ("assert " in ref["quote"] or "pytest.raises(" in ref["quote"])
+                for ref in materialized
+            ):
+                raise ExplorerError(
+                    "source_refs need a read test assertion line (assert or pytest.raises)"
+                )
         report = self.report(
             "success",
             relevant_files=[
@@ -1941,7 +2053,8 @@ def main() -> int:
             temperature=config.get("explorer_temperature", 0.1),
         )
         runtime = ExplorerRuntime(Path.cwd(), args.task, config, client, args.task_id)
-        report = runtime.run()
+        with MODEL_RESIDENCY.role_model_lease(client, config):
+            report = runtime.run()
     except KeyboardInterrupt:
         report = {
             "schema_version": 1,
@@ -1954,6 +2067,14 @@ def main() -> int:
             },
         }
     except ExplorerPreflightBlocked as exc:
+        report = {
+            "schema_version": 1,
+            "status": "blocked",
+            "task": args.task,
+            "failure_reason": str(exc),
+            "blocked": {"reason_code": exc.reason_code, "reason": str(exc)},
+        }
+    except MODEL_RESIDENCY.ModelResidencyError as exc:
         report = {
             "schema_version": 1,
             "status": "blocked",

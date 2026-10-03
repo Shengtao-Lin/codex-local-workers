@@ -1,7 +1,7 @@
 # codex-local-workers
 
-Experimental, project-local orchestration for delegating bounded Python work
-from Codex to models served by LM Studio.
+Run scoped Python coding tasks with local LM Studio models while Codex handles
+planning, review and final acceptance.
 
 Codex remains the Primary Agent: it owns user intent, architecture, scope, Git
 operations, review, broader validation, and final acceptance. The local
@@ -20,22 +20,28 @@ observed tests remain authoritative.
 ```text
 Codex Primary
   -> feature decomposition + feature/unit/integration risk
-  -> optional focused Explorer (gpt-oss)
+  -> optional focused Explorer
   -> bounded implementation-unit packet
-  -> local Coder (Qwen3-Coder)
+  -> local Coder
   -> deterministic gates + Local Reviewer
   -> risk-routed Codex review and feature integration validation
   -> accept / rework / replan / takeover
 ```
 
-## Repository layout
+## What you can use
 
-- `.local-agents/`: Python runtimes, PowerShell wrappers, protocol, and tests.
-- `example/`: small integration example.
-- `benchmarks/`: historical S5 A/B benchmark and read-only paired real-task scorecard.
-- `docs/design-brief.md`: original architecture brief.
-- `docs/improvement-plan-v1.md`: staged implementation and evaluation plan.
-- `AGENTS.md`: operating rules for Codex Primary.
+- Explorer locates source and tests with file/line evidence.
+- Coder reads, searches, edits authorized files and runs configured validation.
+- Reviewer independently checks the actual diff and can run registered tests
+  and static checks in a fresh context.
+- Optional Coordinator prepares bounded execution proposals for an approved
+  feature. Each step requires Primary authorization; completion returns to
+  Primary for acceptance.
+
+The default configuration uses OSS Explorer, Qwen Coder and Muse Reviewer;
+the optional Coordinator also uses Muse in an independent context. Model IDs
+are configuration values. A replacement model must pass the relevant role's
+protocol and quality checks. See [model configuration](docs/models.md).
 
 ## Quick start
 
@@ -77,7 +83,8 @@ Run a focused read-only exploration:
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass `
   -File ".local-agents\local-explore.ps1" `
-  -Task "Trace how configuration reaches request handling."
+  -Task "Locate the configuration loader and its tests." `
+  -TaskId "configuration-loader"
 ```
 
 Run a bounded Coder packet with automatic handoff to read-only Reviewer:
@@ -141,18 +148,19 @@ is orchestration and write-scope control, not an operating-system sandbox. Use
 it only with trusted local repositories. Review depth follows explicit unit
 risk, and high-risk feature integration always receives final Primary review.
 
-## Status
+## Choosing a workflow
 
-S0-S5 and the first S6 orchestration layer are implemented. S6 adds
-feature/unit risk separation, deterministic diff-quality gates, explicit
-read-only scope, inherited rework packets, and a read-only Local Reviewer.
-Qwen is the default Reviewer; alternate models should remain shadow evaluation
-until benchmark evidence supports routing acceptance through them.
-The current S6 candidate also includes anchored Coder packets, bounded
-context replay, progress-aware turn reserves, and an HTTP-to-pytest E2E test.
-An opt-in disposable live LM Studio smoke is available at
-`benchmarks/live_smoke.py`; its result is distinct from the deterministic E2E
-and from the real-task paired evaluation.
-The S5 benchmark is historical; no measured Primary-token saving or real-service
-PostgreSQL/MLflow result has been established for this candidate. See
-[the real-task evaluation guide](benchmarks/REAL-TASK-EVAL.md) for the next gate.
+Use the direct Coder-to-Reviewer workflow for a known, scoped change. Use
+Explorer when source or tests need locating. The opt-in supervised Coordinator
+supports localization tasks and dependency-aware proposals; general autonomous
+investigation and unattended execution have not been qualified.
+
+Local execution can take several minutes. The kit runs one local model at a
+time and preserves failed attempts for review. Compare cloud usage and local
+waiting time together: local model tokens are different from Codex usage.
+Measured Codex savings have not yet been established.
+
+See [cost and latency](docs/cost-and-latency.md),
+[release notes](docs/release-notes.md), [the runtime guide](.local-agents/README.md),
+and the [worked example](example/README.md).
+The development branch contains engineering plans and historical evaluations.

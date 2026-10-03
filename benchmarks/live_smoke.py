@@ -75,6 +75,19 @@ def _run(
     return completed.returncode, data
 
 
+def inherit_lifecycle_config(source: dict, target: dict) -> None:
+    """Keep diagnostic role launches on the active model lifecycle policy."""
+    for key in (
+        "single_model_residency",
+        "model_switch_timeout_seconds",
+        "reviewer_preload_model",
+        "reviewer_model_load_timeout_seconds",
+        "reviewer_reasoning_strength",
+    ):
+        if key in source:
+            target[key] = source[key]
+
+
 def run(config_path: Path, *, explorer_mode: str | None = None) -> dict:
     source_config = json.loads(config_path.read_text(encoding="utf-8-sig"))
     root = (
@@ -167,6 +180,7 @@ def run(config_path: Path, *, explorer_mode: str | None = None) -> dict:
         "explorer_invocation_timeout_seconds": 600,
         "diagnostic_logging": True,
     }
+    inherit_lifecycle_config(source_config, config)
     local_config = root / ".local-agents" / "config.json"
     local_config.write_text(json.dumps(config, indent=2), encoding="utf-8")
     explorer_compat_config = root / ".local-agents" / "config-explorer-compat.json"

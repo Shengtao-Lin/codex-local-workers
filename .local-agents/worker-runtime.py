@@ -28,6 +28,20 @@ if hasattr(sys.stderr, "reconfigure"):
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+
+
+def _load_model_residency() -> Any:
+    spec = importlib.util.spec_from_file_location(
+        "local_worker_model_residency", SCRIPT_DIR / "model_residency.py"
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("could not load model_residency.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+MODEL_RESIDENCY = _load_model_residency()
 EXCLUDED_PARTS = {
     ".agent",
     ".local-agents",
@@ -88,6 +102,17 @@ def post_edit_progress_schema(base: dict[str, Any]) -> dict[str, Any]:
         "SAFE_REPLACE",
         "SAFE_REPLACE_LINE",
         "SAFE_CREATE",
+        "VALIDATE",
+        "FINISH_BLOCKED",
+        "REQUEST_CONTRACT_REVISION",
+    ]
+    return schema
+
+
+def validation_only_action_schema(base: dict[str, Any]) -> dict[str, Any]:
+    """After a no-op edit, require validation of the current draft or explicit exit."""
+    schema = json.loads(json.dumps(base))
+    schema["properties"]["action"]["enum"] = [
         "VALIDATE",
         "FINISH_BLOCKED",
         "REQUEST_CONTRACT_REVISION",
@@ -327,6 +352,82 @@ class LMStudioClient:
                 "model_unavailable",
                 f"configured model is not available from LM Studio: {self.model}",
             )
+
+    def ensure_loaded(self, *, timeout_seconds: int = 360) -> dict[str, Any]:
+        """Explicitly warm a role model before its first inference request."""
+        if not self.base_url.endswith("/v1") or not 1 <= timeout_seconds <= 900:
+            raise PreflightBlocked(
+                "model_load_config", "invalid LM Studio model load configuration"
+            )
+        models_url = self.base_url[:-3] + "/api/v1/models"
+
+        def loaded_instance() -> dict[str, Any] | None:
+            request = urllib.request.Request(models_url, method="GET")
+            with urllib.request.urlopen(request, timeout=min(timeout_seconds, 30)) as response:
+                payload = json.load(response)
+            if not isinstance(payload, dict) or not isinstance(payload.get("models"), list):
+                raise ValueError("LM Studio native model inventory has an invalid shape")
+            for item in payload["models"]:
+                if not isinstance(item, dict) or item.get("key") != self.model:
+                    continue
+                instances = item.get("loaded_instances")
+                if not isinstance(instances, list):
+                    raise ValueError("LM Studio loaded_instances has an invalid shape")
+                return next(
+                    (
+                        instance
+                        for instance in instances
+                        if isinstance(instance, dict) and isinstance(instance.get("id"), str)
+                    ),
+                    None,
+                )
+            raise PreflightBlocked(
+                "model_unavailable",
+                f"configured model is not available from LM Studio: {self.model}",
+            )
+
+        try:
+            instance = loaded_instance()
+            if instance is None:
+                body: dict[str, Any] = {"model": self.model}
+                if self.context_length is not None:
+                    body["context_length"] = self.context_length
+                request = urllib.request.Request(
+                    models_url + "/load",
+                    data=json.dumps(body).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+                    result = json.load(response)
+                if not isinstance(result, dict) or result.get("status") != "loaded":
+                    raise ValueError("LM Studio did not confirm model load")
+                instance = loaded_instance()
+                if instance is None:
+                    raise ValueError("LM Studio did not show the model as loaded")
+                status = "loaded"
+            else:
+                status = "already_loaded"
+            instance_config = instance.get("config") or {}
+            if not isinstance(instance_config, dict):
+                raise ValueError("LM Studio loaded model config has an invalid shape")
+            configured_length = instance_config.get("context_length")
+            if (
+                self.context_length is not None
+                and type(configured_length) is int
+                and configured_length < self.context_length
+            ):
+                raise PreflightBlocked(
+                    "model_context_too_small",
+                    f"loaded {self.model} context {configured_length} is below configured {self.context_length}",
+                )
+            return {"status": status, "model": self.model}
+        except PreflightBlocked:
+            raise
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+            raise PreflightBlocked(
+                "model_load_failed", f"LM Studio model readiness failed for {self.model}: {exc}"
+            ) from exc
 
     def complete(self, messages: list[dict[str, str]]) -> str:
         payload: dict[str, Any] = {
@@ -1121,6 +1222,9 @@ class WorkerRuntime:
         self.duplicate_read_streak = 0
         self.duplicate_read_count = 0
         self.noop_repair_attempts = 0
+        self.multiline_shape_repair_revisions: set[tuple[str, int]] = set()
+        self.noop_validation_nudge_revisions: set[int] = set()
+        self.noop_validation_pending = False
         self.repair_supervision_states: set[tuple[int, int]] = set()
         self.repair_evidence_action_counts: dict[tuple[int, int], int] = {}
         self.post_edit_evidence_counts: dict[int, int] = {}
@@ -1504,6 +1608,9 @@ Available actions:
 - SAFE_REPLACE_LINE: path, expected_sha256, line, replacement. The line must
   have been observed by READ_FILE or SEARCH at the current file hash. Use a
   single replacement line without a newline when exact block matching fails.
+  replacement "" blanks only that line; it does not shift or copy adjacent lines.
+  To delete a statement, SAFE_REPLACE its exact text with replace "". Never
+  substitute the next source line for the statement being removed.
   Example: {"action":"SAFE_REPLACE_LINE","path":"src/a.py","expected_sha256":"<current hash>","line":12,"replacement":"value = 2"}.
 - VALIDATE: optional contract_check object. When the packet requires it, include
   required_behavior_ids, required_order_confirmed, forbidden_orderings_absent,
@@ -1625,7 +1732,18 @@ while removing only the unused binding. Previous attempts are context, not autho
                     and getattr(self.client, "structured_output", False)
                     and isinstance(original_action_schema, dict)
                 )
-                if repair_only_turn:
+                validation_only_turn = (
+                    self.noop_validation_pending
+                    and getattr(self.client, "structured_output", False)
+                    and isinstance(original_action_schema, dict)
+                )
+                if validation_only_turn:
+                    self.client.action_schema = validation_only_action_schema(
+                        original_action_schema
+                    )
+                    self.client.schema_name = "local_coder_validate_current_draft"
+                    self.archive.event("noop_validation_gate", {"turn": _turn})
+                elif repair_only_turn:
                     self.client.action_schema = repair_only_action_schema(
                         original_action_schema, supervised_repair["required_next_action"]
                     )
@@ -1683,7 +1801,7 @@ while removing only the unused binding. Previous attempts are context, not autho
                 finally:
                     if isinstance(original_timeout, (int, float)):
                         self.client.timeout = original_timeout
-                    if repair_only_turn or post_edit_progress_turn:
+                    if validation_only_turn or repair_only_turn or post_edit_progress_turn:
                         self.client.action_schema = original_action_schema
                         self.client.schema_name = original_schema_name
                 messages.append({"role": "assistant", "content": raw})
@@ -1696,6 +1814,16 @@ while removing only the unused binding. Previous attempts are context, not autho
                     required_path = (
                         required_repair.get("required_path") if required_repair else None
                     )
+                    if self.noop_validation_pending and action["action"] not in {
+                        "VALIDATE",
+                        "FINISH_BLOCKED",
+                        "REQUEST_CONTRACT_REVISION",
+                    }:
+                        raise WorkerError(
+                            "current edited draft requires VALIDATE after a no-op replacement"
+                        )
+                    if action["action"] == "VALIDATE":
+                        self.noop_validation_pending = False
                     if self._validated_terminal_state() and action["action"] != "FINISH_SUCCESS":
                         self._assert_validation_current()
                         if self.terminal_nudge_revision != self.edit_revision:
@@ -2110,13 +2238,46 @@ while removing only the unused binding. Previous attempts are context, not autho
                         )
                         and not self.observable_scenario_shape_repair_used
                     )
+                    edit_shape_key = (
+                        (action["arguments"].get("path"), self.edit_revision)
+                        if action is not None
+                        else (None, self.edit_revision)
+                    )
+                    multiline_shape_repair = (
+                        action is not None
+                        and action["action"] == "SAFE_REPLACE_LINE"
+                        and str(exc) == "line replacement must be one line of text"
+                        and bool(getattr(exc, "details", {}).get("edit_format_repair"))
+                        and edit_shape_key not in self.multiline_shape_repair_revisions
+                    )
+                    if multiline_shape_repair:
+                        self.multiline_shape_repair_revisions.add(edit_shape_key)
+                        self.archive.event(
+                            "multiline_edit_shape_repair",
+                            {"turn": _turn, "path": edit_shape_key[0]},
+                        )
+                    noop_validation_nudge = (
+                        action is not None
+                        and action["action"] == "SAFE_REPLACE"
+                        and str(exc).startswith("SAFE_REPLACE find and replace are identical")
+                        and bool(self.changed)
+                        and self.validation is None
+                        and self.edit_revision not in self.noop_validation_nudge_revisions
+                    )
+                    if noop_validation_nudge:
+                        self.noop_validation_nudge_revisions.add(self.edit_revision)
+                        self.noop_validation_pending = True
+                        self.archive.event(
+                            "noop_validation_nudge",
+                            {"turn": _turn, "edit_revision": self.edit_revision},
+                        )
                     if scenario_shape_repair:
                         self.observable_scenario_shape_repair_used = True
                         self.archive.event(
                             "observable_scenario_shape_repair",
                             {"turn": _turn},
                         )
-                    else:
+                    elif not multiline_shape_repair and not noop_validation_nudge:
                         self.protocol_errors += 1
                     error_code = self._error_code(exc)
                     details = getattr(exc, "details", {})
@@ -2137,6 +2298,20 @@ while removing only the unused binding. Previous attempts are context, not autho
                     }
                     if details:
                         observation["details"] = details
+                    if noop_validation_nudge:
+                        observation["required_next_action"] = "VALIDATE"
+                        observation["next_step"] = (
+                            "No edit ran. Validate the current changed draft now with the "
+                            "packet's contract_check, or explicitly block if the contract cannot "
+                            "be confirmed. Validation will report any remaining quality issues."
+                        )
+                        observation["validate_repair"] = {
+                            "example": {
+                                "action": "VALIDATE",
+                                "arguments": {"contract_check": self.contract_check_template()},
+                            },
+                            "instruction": "Confirm only obligations supported by the current diff.",
+                        }
                     if action is not None and action["action"] == "VALIDATE":
                         observation["validate_repair"] = {
                             "example": {
@@ -3260,7 +3435,7 @@ while removing only the unused binding. Previous attempts are context, not autho
         for failure in diagnostic.get("failures") or []:
             if not isinstance(failure, dict):
                 continue
-            message = str(failure.get("message") or "")[:240]
+            message = str(failure.get("message") or "")[:700]
             location = str(failure.get("location") or "")[:300]
             key = (message, location)
             item = groups.setdefault(
@@ -3373,6 +3548,87 @@ while removing only the unused binding. Previous attempts are context, not autho
                     ) or self.observed_hashes.get(candidate)
                     if digest:
                         item["expected_sha256"] = digest
+            mismatch = re.fullmatch(
+                r"AssertionError: Regex pattern did not match\.\n\s*Expected regex: (.+)"
+                r"\n\s*Actual message: (.+)",
+                item["message"],
+            )
+            if mismatch:
+                try:
+                    expected_regex, actual_message = (
+                        ast.literal_eval(value) for value in mismatch.groups()
+                    )
+                except (ValueError, SyntaxError):
+                    expected_regex = actual_message = None
+                if isinstance(expected_regex, str) and isinstance(actual_message, str):
+                    item["diagnosis"] = "exception_message_regex_mismatch"
+                    item["expected_regex"] = expected_regex
+                    item["actual_message"] = actual_message
+                    item["instruction"] = (
+                        "The expected exception was raised; its message did not match the "
+                        "test regex. Make a minimal message correction satisfying expected_regex "
+                        "while preserving the exception type, rejection condition and passing "
+                        "branches. The pattern is a regex, not necessarily a literal string. "
+                        "Do not change protected tests or rewrite unrelated loops. Then VALIDATE."
+                    )
+                    matches = []
+                    match_contexts = []
+                    for candidate in item.get("candidate_edit_paths", []):
+                        try:
+                            raw, digest = self.editor.read_bytes(candidate)
+                            tree = ast.parse(raw.decode("utf-8-sig"))
+                        except (SafeEditError, UnicodeError, SyntaxError):
+                            continue
+                        for node in ast.walk(tree):
+                            if not isinstance(node, ast.Raise) or node.exc is None:
+                                continue
+                            if (
+                                isinstance(node.exc, ast.Call)
+                                and node.exc.args
+                                and isinstance(node.exc.args[0], ast.Constant)
+                                and node.exc.args[0].value == actual_message
+                            ):
+                                matches.append((candidate, node.lineno, digest))
+                                if len(match_contexts) < 4:
+                                    lines = raw.decode("utf-8-sig").splitlines()
+                                    start = max(0, node.lineno - 5)
+                                    end = min(len(lines), (node.end_lineno or node.lineno) + 2)
+                                    match_contexts.append(
+                                        {
+                                            "path": candidate,
+                                            "sha256": digest,
+                                            "candidate_raise_line": node.lineno,
+                                            "content": "\n".join(
+                                                f"{index + 1}: {lines[index]}"
+                                                for index in range(start, end)
+                                            )[:1600],
+                                        }
+                                    )
+                    if len(matches) > 1:
+                        item["message_source_candidates"] = match_contexts
+                        item["message_source_candidate_count"] = len(matches)
+                        item["message_source_candidates_truncated"] = len(matches) > 4
+                        item["instruction"] += (
+                            " Multiple raises contain this message; candidate_raise_line is "
+                            "navigation, NOT a proven responsible line. Compare the failing "
+                            "test's actual input with each surrounding branch condition, read "
+                            "the chosen range, and replace a unique block including that "
+                            "condition. Correct the existing responsible message rather than "
+                            "adding a new guard or changing an unrelated branch."
+                        )
+                    if len(matches) == 1:
+                        candidate, line_number, digest = matches[0]
+                        item.update(
+                            {
+                                "path": candidate,
+                                "line": line_number,
+                                "required_path": candidate,
+                                "candidate_edit_paths": [candidate],
+                                "required_next_action": "SAFE_REPLACE",
+                                "expected_sha256": digest,
+                                "expected_sha256_by_path": {candidate: digest},
+                            }
+                        )
             missing = re.fullmatch(
                 r"NameError: name '([A-Za-z_]\w*)' is not defined", item["message"]
             )
@@ -3799,7 +4055,10 @@ while removing only the unused binding. Previous attempts are context, not autho
                     "line": int(match.group(2)),
                     "instruction": (
                         "Inspect this line and make a narrow edit: remove the unused binding "
-                        "while preserving any required expression side effect. Then VALIDATE."
+                        "while preserving any required expression side effect. If the expression "
+                        "has no required side effect, SAFE_REPLACE the exact assignment with "
+                        'replace ""; keep neighboring statements unchanged. Do not replace the '
+                        "assignment with a copy of the next line. Then VALIDATE."
                     ),
                 }
             match = re.search(
@@ -4563,8 +4822,9 @@ def main() -> int:
             context_safety_margin=int(config.get("model_context_safety_margin", 1024)),
         )
         runtime = WorkerRuntime(repo_root, packet, config, client)
-        runtime.preflight()
-        report = runtime.run()
+        with MODEL_RESIDENCY.role_model_lease(client, config):
+            runtime.preflight()
+            report = runtime.run()
     except KeyboardInterrupt:
         if "runtime" in locals():
             runtime.close()
@@ -4603,6 +4863,18 @@ def main() -> int:
                 "reason": str(exc),
                 "requested_scope": {"read": [], "modify": [], "create": []},
             },
+            "changed_files": [],
+            "next_action_required": "primary_environment_decision",
+        }
+    except MODEL_RESIDENCY.ModelResidencyError as exc:
+        report = {
+            "schema_version": 2,
+            "status": "blocked",
+            "task_id": packet.get("task_id") if "packet" in locals() else None,
+            "unit_id": packet.get("unit_id") if "packet" in locals() else None,
+            "run_id": packet.get("run_id") if "packet" in locals() else None,
+            "failure_reason": str(exc),
+            "blocked": {"reason_code": exc.reason_code, "reason": str(exc)},
             "changed_files": [],
             "next_action_required": "primary_environment_decision",
         }
