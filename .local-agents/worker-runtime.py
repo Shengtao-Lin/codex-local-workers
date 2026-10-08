@@ -443,6 +443,7 @@ class LMStudioClient:
         if self.native_tools is not None:
             payload["tools"] = self.native_tools
             payload["tool_choice"] = self.native_tool_choice
+            payload["parallel_tool_calls"] = False
         elif self.structured_output:
             payload["response_format"] = {
                 "type": "json_schema",
@@ -454,10 +455,16 @@ class LMStudioClient:
             }
         body = json.dumps(payload).encode("utf-8")
         message_chars = len(json.dumps(messages, ensure_ascii=False))
-        estimated_input_tokens = max(1, (message_chars + 3) // 4)
+        native_schema_chars = (
+            len(json.dumps(self.native_tools, ensure_ascii=False))
+            if self.native_tools is not None
+            else 0
+        )
+        estimated_input_tokens = max(1, (message_chars + native_schema_chars + 3) // 4)
         self.last_request_stats = {
             "model": self.model,
             "message_chars": message_chars,
+            "native_schema_chars": native_schema_chars,
             "request_bytes": len(body),
             "estimated_input_tokens": estimated_input_tokens,
             "max_output_tokens": self.max_tokens,
@@ -735,6 +742,21 @@ def resolve_inherited_packet(repo_root: Path, child: dict[str, Any]) -> dict[str
     child_revision = child.get("packet_revision")
     if not isinstance(child_revision, int) or child_revision <= parent_revision:
         raise WorkerError("inherited packet_revision must be greater than the parent revision")
+    parent_state = {"status": "unknown", "validation_reusable": False, "drifted_paths": []}
+    post_state_path = parent_path.with_name("post-state.json")
+    if post_state_path.is_file():
+        expected_inputs = load_json(post_state_path).get("validation_inputs")
+        if isinstance(expected_inputs, dict) and expected_inputs:
+            resolver = SafeEditor(repo_root, allowed_modify=[], allowed_create=[])
+            drifted = []
+            for raw_path, expected in expected_inputs.items():
+                relative, current_path = resolver.resolve(raw_path)
+                current = RUN_STATE.file_fact(current_path, relative)
+                if not isinstance(expected, dict) or any(
+                    current.get(key) != expected.get(key) for key in ("exists", "kind", "sha256")
+                ):
+                    drifted.append(relative)
+            parent_state.update(status="drifted" if drifted else "unchanged", drifted_paths=drifted)
     resolved = {
         key: value
         for key, value in json.loads(json.dumps(parent)).items()
@@ -755,6 +777,7 @@ def resolve_inherited_packet(repo_root: Path, child: dict[str, Any]) -> dict[str
             "_inheritance": {
                 "parent_run_id": parent_run_id,
                 "rework_traceback": compact_rework_traceback(parent_path.parent),
+                "parent_input_state": parent_state,
                 "parent_packet_sha256": RUN_STATE.sha256_bytes(
                     json.dumps(
                         parent, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -1111,7 +1134,22 @@ class WorkerRuntime:
         self.source_packet = json.loads(json.dumps(packet))
         self.packet = validate_packet(json.loads(json.dumps(packet)))
         self.config = config
+        self.context_retention = config.get("coder_context_retention", "recent")
+        if not isinstance(self.context_retention, str) or self.context_retention not in {
+            "recent",
+            "budgeted",
+        }:
+            raise WorkerError("coder_context_retention must be recent or budgeted")
         self.client = client
+        self.repair_focus_retention = config.get("coder_repair_focus_retention", "all")
+        if not isinstance(self.repair_focus_retention, str) or self.repair_focus_retention not in {
+            "all",
+            "latest",
+        }:
+            raise WorkerError("coder_repair_focus_retention must be all or latest")
+        self.post_edit_validation_hint = config.get("coder_post_edit_validation_hint", False)
+        if not isinstance(self.post_edit_validation_hint, bool):
+            raise WorkerError("coder_post_edit_validation_hint must be a boolean")
         scope = self.packet["scope"]
         self.read_roots = scope["read"]
         self.forbidden_roots = scope["forbidden"]
@@ -1190,6 +1228,7 @@ class WorkerRuntime:
         self.repairs = 0
         self.edit_revision = 0
         self.validated_revision = -1
+        self.validation_phase = "check"
         self.validation: ValidationResult | None = None
         self.validation_count = 0
         self.validation_refs: list[str] = []
@@ -1595,9 +1634,10 @@ class WorkerRuntime:
 
     def system_prompt(self) -> str:
         return """You are a bounded local implementation worker. The current packet is authoritative.
-You may request exactly one action per turn and output only one flat JSON object:
-{"action":"READ_FILE","path":"src/example.py","start_line":1}
-Available actions:
+You may request exactly one action per turn. Output one JSON object with exactly
+two top-level fields: action (string) and arguments (object), matching the action schema:
+{"action":"READ_FILE","arguments":{"path":"src/example.py","start_line":1}}
+Available actions and their arguments:
 - READ_FILE: path, start_line?, end_line?
 - SEARCH: query, path?, glob?, mode? (literal by default; regex only when explicit),
   case_sensitive?, max_results?
@@ -1611,12 +1651,21 @@ Available actions:
   replacement "" blanks only that line; it does not shift or copy adjacent lines.
   To delete a statement, SAFE_REPLACE its exact text with replace "". Never
   substitute the next source line for the statement being removed.
-  Example: {"action":"SAFE_REPLACE_LINE","path":"src/a.py","expected_sha256":"<current hash>","line":12,"replacement":"value = 2"}.
-- VALIDATE: optional contract_check object. When the packet requires it, include
+  Example: {"action":"SAFE_REPLACE_LINE","arguments":{"path":"src/a.py","expected_sha256":"<current hash>","line":12,"replacement":"value = 2"}}.
+- VALIDATE: phase? (check by default; final only when ready to submit), optional
+  contract_check object. A passing check is a baseline/intermediate observation:
+  you may still edit or investigate. A passing final locks the current validated
+  inputs and permits only FINISH_SUCCESS. FINISH_SUCCESS also explicitly submits
+  a current passing check; legacy packets need no new field. When required, include
   required_behavior_ids, required_order_confirmed, forbidden_orderings_absent,
   observable_scenario_ids, and unrelated_changes. The observable_scenario_ids
   array must name every acceptance_scenarios entry with observables in the
   packet; passing tests do not fill this field automatically.
+  For check, ordering acknowledgements may be false (unmet) or null (unknown).
+  These are worker claims, not runtime proof. Final and FINISH_SUCCESS require
+  complete true acknowledgements from the current validation. A green fresh
+  baseline without an implementation edit cannot be submitted. Failed baseline
+  checks do not consume post-implementation repair cycles; inherited rework does.
 - FINISH_SUCCESS: summary, remaining_uncertainty
 - FINISH_FAILED: summary, reason, remaining_uncertainty
 - FINISH_BLOCKED: reason_code, reason, requested_scope?, evidence_refs?, proposed_next_step?
@@ -1663,8 +1712,11 @@ Do not reread line ranges already seen for the same file content. A single
 short, narrower range from a previous broad read may be replayed to restore
 context; this is not new evidence and must lead to an edit or VALIDATE.
 An already_read observation is not new content: continue to edit or VALIDATE.
-After a failed VALIDATE, treat repair_focus as the priority. Fix its exact
-source location before exploring unrelated code; read a narrow current range
+After a failed VALIDATE, treat repair_focus as the priority.
+JUnit exception messages describe the observed failure, not the expected outcome.
+Use the protected test assertion and packet contract to identify the expected
+exception or value; never change the requirement to match the observed failure.
+Fix its exact source location before exploring unrelated code; read a narrow current range
 only if needed for an edit. An unfinished_implementation_warnings entry is
 non-blocking for drafts, but executable placeholders cannot satisfy a required
 behavior. New evidence remains available; repeated no-evidence searches do not.
@@ -1822,8 +1874,6 @@ while removing only the unused binding. Previous attempts are context, not autho
                         raise WorkerError(
                             "current edited draft requires VALIDATE after a no-op replacement"
                         )
-                    if action["action"] == "VALIDATE":
-                        self.noop_validation_pending = False
                     if self._validated_terminal_state() and action["action"] != "FINISH_SUCCESS":
                         self._assert_validation_current()
                         if self.terminal_nudge_revision != self.edit_revision:
@@ -2330,8 +2380,24 @@ while removing only the unused binding. Previous attempts are context, not autho
                                 "A repeated omission counts toward the protocol error budget."
                             )
                     if error_code == "safe_replace_target_missing" and action is not None:
-                        self.post_edit_evidence_counts[self.edit_revision] = 0
-                        self.post_edit_progress_nudges.discard(self.edit_revision)
+                        # A failed edit is not progress and must not reset the
+                        # current draft's evidence/validation deadline.
+                        if (
+                            self.changed
+                            and self.validation is None
+                            and not self.pending_failed_validation
+                        ):
+                            self.noop_validation_pending = True
+                            observation["required_next_action"] = "VALIDATE"
+                            observation["validation_instruction"] = (
+                                "An edit already changed this draft, but the next replacement missed. "
+                                "Validate the current draft before further edits or documentation work. "
+                                "The failed replacement changed nothing; previous validation is not current."
+                            )
+                            self.archive.event(
+                                "edit_mismatch_validation_gate",
+                                {"turn": _turn, "edit_revision": self.edit_revision},
+                            )
                         target = action["arguments"]
                         if isinstance(target.get("path"), str):
                             self.replace_mismatch_paths.add(target["path"])
@@ -2346,8 +2412,8 @@ while removing only the unused binding. Previous attempts are context, not autho
                         observation["edit_repair"] = {
                             "instruction": (
                                 "The exact find block is absent. Do not repeat the same edit or "
-                                "reread an already-seen range. Use a short exact current source "
-                                "line if listed below; otherwise SEARCH a distinctive symbol "
+                                "reuse stale or approximate source text. READ_FILE the bounded "
+                                "current range suggested below, or SEARCH a distinctive symbol "
                                 "and READ_FILE its range before a smaller edit."
                             ),
                             "suggested_action": {
@@ -2371,6 +2437,18 @@ while removing only the unused binding. Previous attempts are context, not autho
                             )
                             if current_lines:
                                 observation["edit_repair"]["current_source_lines"] = current_lines
+                                first_line = min(item["line"] for item in current_lines)
+                                observation["edit_repair"]["suggested_action"] = {
+                                    "action": "READ_FILE",
+                                    "arguments": {
+                                        "path": target["path"],
+                                        "start_line": max(1, first_line - 3),
+                                        "end_line": first_line + 8,
+                                    },
+                                }
+                                observation["edit_repair"]["current_lines_are_navigation_only"] = (
+                                    True
+                                )
                     if error_code == "oversized_replace_after_mismatch":
                         observation["edit_repair"] = {
                             "instruction": (
@@ -2565,6 +2643,52 @@ while removing only the unused binding. Previous attempts are context, not autho
             self.close()
 
     def _trim_messages(self, messages: list[dict[str, str]]) -> list[dict[str, str]]:
+        if self.repair_focus_retention == "latest":
+            focuses = [
+                index
+                for index, message in enumerate(messages)
+                if index >= 2
+                and message.get("role") == "user"
+                and message.get("content", "").startswith("REPAIR_REQUIRED\n")
+            ]
+            obsolete = set()
+            for index in focuses[:-1]:
+                obsolete.add(index)
+                if index > 2 and messages[index - 1].get("role") == "assistant":
+                    try:
+                        preceding_action = json.loads(messages[index - 1].get("content", ""))
+                    except (ValueError, TypeError):
+                        preceding_action = None
+                    if (
+                        isinstance(preceding_action, dict)
+                        and preceding_action.get("action") == "VALIDATE"
+                    ):
+                        obsolete.add(index - 1)
+            messages = [message for index, message in enumerate(messages) if index not in obsolete]
+            if obsolete:
+                self.context_trimmed = True
+        if self.context_retention == "budgeted":
+            context = getattr(self.client, "context_length", None)
+            if type(context) is not int or context <= 0:
+                raise WorkerError("budgeted context retention requires a configured context length")
+            available = max(
+                0,
+                context
+                - getattr(self.client, "max_tokens", 2048)
+                - getattr(self.client, "context_safety_margin", 1024),
+            )
+            target = int(available * 0.8)
+            retained = list(messages)
+            # Preserve system/packet and the latest five exchanges. The existing
+            # client preflight still rejects an oversized irreducible request.
+            while len(retained) > 12 and (
+                len(retained) > 64
+                or (len(json.dumps(retained, ensure_ascii=False)) + 3) // 4 > target
+            ):
+                del retained[2:4]
+            if len(retained) != len(messages):
+                self.context_trimmed = True
+            return retained
         # The system prompt and packet remain authoritative. Older observations
         # are reproducible through READ_FILE/SEARCH, so retain only recent turns.
         if len(messages) <= 12:
@@ -2574,7 +2698,8 @@ while removing only the unused binding. Previous attempts are context, not autho
 
     def _validated_terminal_state(self) -> bool:
         return (
-            self.validation is not None
+            self.validation_phase == "final"
+            and self.validation is not None
             and self.validation.status == "passed"
             and self.validated_revision == self.edit_revision
             and self.validated_input_facts is not None
@@ -2600,6 +2725,8 @@ while removing only the unused binding. Previous attempts are context, not autho
             if self.validated_revision != self.edit_revision:
                 raise WorkerError("files changed after validation; run VALIDATE again")
             self._assert_validation_current()
+            self._assert_submission_contract()
+            self.validation_phase = "final"
             return {}, self.report(
                 "ready_for_review",
                 self._string_list(args.get("summary"), "summary"),
@@ -2729,6 +2856,10 @@ while removing only the unused binding. Previous attempts are context, not autho
                     "start_line": actual_end + 1,
                     "end_line": min(actual_end + 200, len(lines)),
                 }
+            if self.context_trimmed:
+                restored = self._restore_observed_read(duplicate)
+                if restored is not None:
+                    duplicate["source_context"] = restored
             return duplicate
         if prior_count >= self.max_reads_per_file_version:
             raise WorkerError(
@@ -2766,17 +2897,57 @@ while removing only the unused binding. Previous attempts are context, not autho
             )
         return observation
 
+    def _iter_read_files(self, root: Path):
+        """Prune unreadable/reparse directories before descent; guard every file."""
+        try:
+            if root == self.repo_root:
+                if "." not in self.read_roots:
+                    return
+                checked = root
+            else:
+                relative, checked = self._assert_read_allowed(
+                    root.relative_to(self.repo_root).as_posix()
+                )
+            if checked.is_file():
+                yield relative, checked
+                return
+        except (WorkerError, SafeEditError, OSError, ValueError):
+            return
+        for current, directories, names in os.walk(checked, followlinks=False):
+            allowed = []
+            for name in sorted(directories):
+                try:
+                    self._assert_read_allowed(
+                        (Path(current) / name).relative_to(self.repo_root).as_posix()
+                    )
+                except (WorkerError, SafeEditError, OSError, ValueError):
+                    continue
+                allowed.append(name)
+            directories[:] = allowed
+            for name in sorted(names):
+                try:
+                    relative, path = self._assert_read_allowed(
+                        (Path(current) / name).relative_to(self.repo_root).as_posix()
+                    )
+                    if path.is_file():
+                        yield relative, path
+                except (WorkerError, SafeEditError, OSError, ValueError):
+                    continue
+
     def search(self, args: dict[str, Any]) -> dict[str, Any]:
         query = require_string(args.get("query"), "query")
         root_raw = args.get("path", ".")
         search_roots: list[Path] = []
         if root_raw == ".":
             for readable_root in self.read_roots:
-                candidate = (
-                    self.repo_root
-                    if readable_root == "."
-                    else (self.repo_root / readable_root).resolve()
-                )
+                try:
+                    candidate = (
+                        self.repo_root
+                        if readable_root == "."
+                        else self._assert_read_allowed(readable_root)[1]
+                    )
+                except (WorkerError, SafeEditError, OSError):
+                    continue
                 if candidate.exists():
                     search_roots.append(candidate)
         else:
@@ -2799,13 +2970,9 @@ while removing only the unused binding. Previous attempts are context, not autho
         scanned = 0
         seen: set[str] = set()
         for root in search_roots:
-            candidates = [root] if root.is_file() else root.rglob("*")
-            for path in candidates:
+            for relative, path in self._iter_read_files(root):
                 if len(results) >= max_results or scanned >= 1000:
                     break
-                if not path.is_file() or any(part in EXCLUDED_PARTS for part in path.parts):
-                    continue
-                relative = path.relative_to(self.repo_root).as_posix()
                 if relative in seen or path_matches_any(relative, self.forbidden_roots):
                     continue
                 seen.add(relative)
@@ -2839,17 +3006,25 @@ while removing only the unused binding. Previous attempts are context, not autho
         }
 
     def _begin_edit(self) -> None:
-        if self.pending_failed_validation and self.repairs >= self.max_repairs:
+        if self._is_repair_edit() and self.repairs >= self.max_repairs:
             raise WorkerError("local repair budget is exhausted; finish with failure")
 
+    def _is_repair_edit(self) -> bool:
+        # A child call gets its own bounded budget, not a new initial implementation.
+        # Parent validation is never reused: current inputs must be validated again.
+        return self.pending_failed_validation and (
+            self.edit_revision > 0 or self.packet.get("parent_run_id") is not None
+        )
+
     def _record_edit(self, result: dict[str, str]) -> dict[str, Any]:
-        repair_edit = self.pending_failed_validation
+        repair_edit = self._is_repair_edit()
         if repair_edit:
             self.repairs += 1
-            self.pending_failed_validation = False
+        self.pending_failed_validation = False
         self.edit_revision += 1
         self.failed_validation_no_evidence_streak = 0
         self.validation = None
+        self.last_contract_check = None
         self.validated_input_facts = None
         self.changed[result["path"]] = result
         observation: dict[str, Any] = {
@@ -2858,6 +3033,19 @@ while removing only the unused binding. Previous attempts are context, not autho
             "edit_revision": self.edit_revision,
             "repair_edit": repair_edit,
         }
+        if self.post_edit_validation_hint and self.packet["contract_check_required"]:
+            check = self.contract_check_template()
+            check["required_order_confirmed"] = None
+            check["forbidden_orderings_absent"] = None
+            observation["validation_hint"] = {
+                "example": {"action": "VALIDATE", "arguments": {"contract_check": check}},
+                "instruction": (
+                    "Field shape only, not confirmation or validation evidence. "
+                    "Inspect the current diff against these packet IDs; set ordering "
+                    "acknowledgements to true only when actually verified. "
+                    "More in-scope edits remain allowed; no validation ran automatically."
+                ),
+            }
         issues = [
             item
             for item in self._introduced_text_quality_issues()
@@ -2866,7 +3054,13 @@ while removing only the unused binding. Previous attempts are context, not autho
         if issues:
             observation["diff_quality_warnings"] = issues[:8]
             observation["next_step"] = (
-                "Repair these exact path/line issues before VALIDATE; no test run is needed yet."
+                "VALIDATE the current draft with its contract_check. The configured formatter "
+                "may repair whitespace once; all quality gates and focused tests still run."
+                if self.config.get("autoformat_on_diff_whitespace") is True
+                and self._diff_whitespace_autoformat_eligible(
+                    issues, self.validation_profile(), self.python_path()
+                )
+                else "Repair these exact path/line issues before VALIDATE; no test run is needed yet."
             )
         placeholders = [
             item for item in self._introduced_placeholders() if item["path"] == result["path"]
@@ -3128,8 +3322,8 @@ while removing only the unused binding. Previous attempts are context, not autho
         }
 
     @staticmethod
-    def _junit_failures(root: ET.Element) -> list[dict[str, str]]:
-        failures: list[dict[str, str]] = []
+    def _junit_failures(root: ET.Element) -> list[dict[str, Any]]:
+        failures: list[dict[str, Any]] = []
         for case in root.iter("testcase"):
             failure = case.find("failure")
             if failure is None:
@@ -3137,6 +3331,18 @@ while removing only the unused binding. Previous attempts are context, not autho
             if failure is None:
                 continue
             detail = (failure.text or "").splitlines()
+            displayed_bindings = []
+            # Pytest renders parameter values in a leading traceback header.
+            # Preserve only displayed text; never evaluate it or infer types.
+            for line in detail[:8]:
+                match = re.fullmatch(r"([A-Za-z_]\w{0,31}) = (.+)", line)
+                if not match:
+                    break
+                displayed_bindings.append(
+                    {"name": match.group(1), "representation": match.group(2)[:120]}
+                )
+                if len(displayed_bindings) == 4:
+                    break
             location = next(
                 (line.strip() for line in reversed(detail) if re.search(r"\.py:\d+", line)),
                 "",
@@ -3148,6 +3354,8 @@ while removing only the unused binding. Previous attempts are context, not autho
                     "location": location[:250],
                 }
             )
+            if displayed_bindings:
+                failures[-1]["displayed_bindings"] = displayed_bindings
             if len(failures) >= 8:
                 break
         return failures
@@ -3176,7 +3384,14 @@ while removing only the unused binding. Previous attempts are context, not autho
             "unrelated_changes": [],
         }
 
-    def _contract_check(self, args: dict[str, Any]) -> dict[str, Any] | None:
+    def _assert_submission_contract(self) -> None:
+        if self.edit_revision == 0 and self.packet.get("parent_run_id") is None:
+            raise WorkerError("a green baseline is not an implemented unit; edit before submission")
+        self._contract_check({"contract_check": self.validation.contract_check})
+
+    def _contract_check(
+        self, args: dict[str, Any], *, diagnostic: bool = False
+    ) -> dict[str, Any] | None:
         if set(args) - {"contract_check"}:
             raise WorkerError("VALIDATE accepts only the optional contract_check object")
         value = args.get("contract_check")
@@ -3201,13 +3416,21 @@ while removing only the unused binding. Previous attempts are context, not autho
             raise WorkerError(
                 "contract_check is missing required behavior ids: " + ", ".join(missing)
             )
-        if self.packet["required_order"] and value.get("required_order_confirmed") is not True:
+        for field in ("required_order_confirmed", "forbidden_orderings_absent"):
+            if value.get(field) is not None and type(value[field]) is not bool:
+                raise WorkerError(f"contract_check.{field} must be boolean or null (unknown)")
+        if (
+            not diagnostic
+            and self.packet["required_order"]
+            and value.get("required_order_confirmed") is not True
+        ):
             raise WorkerError(
                 "contract_check.required_order_confirmed must be boolean true "
                 "after verifying the required order"
             )
         if (
-            self.packet["forbidden_orderings"]
+            not diagnostic
+            and self.packet["forbidden_orderings"]
             and value.get("forbidden_orderings_absent") is not True
         ):
             raise WorkerError(
@@ -3238,8 +3461,8 @@ while removing only the unused binding. Previous attempts are context, not autho
             )
         normalized = {
             "required_behavior_ids": sorted(checked),
-            "required_order_confirmed": value.get("required_order_confirmed") is True,
-            "forbidden_orderings_absent": value.get("forbidden_orderings_absent") is True,
+            "required_order_confirmed": value.get("required_order_confirmed"),
+            "forbidden_orderings_absent": value.get("forbidden_orderings_absent"),
             "observable_scenario_ids": sorted(covered),
             "unrelated_changes": [],
         }
@@ -3451,6 +3674,16 @@ while removing only the unused binding. Previous attempts are context, not autho
             test_id = failure.get("test") or failure.get("test_id") or failure.get("name")
             if test_id and len(item["tests"]) < 3:
                 item["tests"].append(str(test_id)[:180])
+            if (
+                failure.get("displayed_bindings")
+                and len(item.setdefault("failure_examples", [])) < 3
+            ):
+                item["failure_examples"].append(
+                    {
+                        "test": str(test_id)[:180],
+                        "displayed_bindings": failure["displayed_bindings"],
+                    }
+                )
         focus = []
         for item in groups.values():
             item["semantic_invariants"] = self._repair_semantic_invariants()
@@ -3527,18 +3760,13 @@ while removing only the unused binding. Previous attempts are context, not autho
                     and len(unchanged_candidates) == 1
                 ):
                     required_path = unchanged_candidates[0]
-                    item["candidate_edit_paths"] = [required_path]
-                    item["required_path"] = required_path
-                    item["path"] = required_path
-                    digest = self.observed_hashes.get(required_path)
-                    item["expected_sha256_by_path"] = {required_path: digest} if digest else {}
-                    if digest:
-                        item["expected_sha256"] = digest
+                    item["suggested_path"] = required_path
+                    item["suggestion_is_advisory"] = True
                     item["instruction"] = (
-                        "A prior edit resolved part of the failing set. Exactly one authorized "
-                        "writable candidate remains unchanged and is now the required repair "
-                        f"target: {required_path}. SAFE_REPLACE that path using its current hash, "
-                        "preserve the resolved behavior, then VALIDATE."
+                        "A prior edit resolved part of the failing set. The unchanged file is "
+                        "an advisory candidate, not proof of the cause. Repair may still belong "
+                        "in an already changed authorized file. Preserve resolved behavior, "
+                        "use current evidence and hash, then VALIDATE."
                     )
                 if len(candidates) == 1:
                     candidate = candidates[0]
@@ -3765,7 +3993,9 @@ while removing only the unused binding. Previous attempts are context, not autho
             "must_keep_passing": sorted(self.current_passing_test_ids),
         }
 
-    def _archive_validation_attempt(self, validation: ValidationResult) -> str | None:
+    def _archive_validation_attempt(
+        self, validation: ValidationResult, *, phase: str = "check"
+    ) -> str | None:
         if not self.archive.prepared:
             return None
         path = self.archive.run_root / f"validation-attempt-{self.validation_count}.json"
@@ -3774,6 +4004,7 @@ while removing only the unused binding. Previous attempts are context, not autho
             {
                 "attempt": self.validation_count,
                 "edit_revision": self.edit_revision,
+                "phase": phase,
                 "validation": validation.__dict__,
             },
         )
@@ -3782,6 +4013,10 @@ while removing only the unused binding. Previous attempts are context, not autho
         return reference
 
     def _validation_observation(self, validation: ValidationResult) -> dict[str, Any]:
+        # An invalid VALIDATE envelope must not release a draft gate. Release
+        # only after an actual attempt has produced current runtime evidence.
+        if self.validation is validation and self.validation_count > 0:
+            self.noop_validation_pending = False
         focused = validation.focused_tests
         diagnostic = focused.get("diagnostic") or {}
         current_failed = {
@@ -3805,6 +4040,7 @@ while removing only the unused binding. Previous attempts are context, not autho
         )
         observation = {
             "status": validation.status,
+            "phase": self.validation_phase,
             "repair_focus": repair_focus,
             "failure_delta": self.validation_failure_delta,
             "edit_revision": self.edit_revision,
@@ -3825,6 +4061,13 @@ while removing only the unused binding. Previous attempts are context, not autho
                 "inputs_unchanged": focused.get("inputs_unchanged"),
             },
         }
+        if focused.get("timed_out") is True:
+            observation["focused_tests"]["timed_out"] = True
+            observation["retry_constraint"] = (
+                "Focused tests timed out; repeating VALIDATE with unchanged validation inputs "
+                "is refused. Inspect new evidence or make a real correction before validation; "
+                "otherwise finish blocked/failed for Primary to investigate the environment."
+            )
         if repair_focus:
             self.archive.event(
                 "repair_focus_issued",
@@ -3848,7 +4091,41 @@ while removing only the unused binding. Previous attempts are context, not autho
         return observation
 
     def _validation_repair_focus(self, validation: ValidationResult) -> list[dict[str, Any]]:
-        focus = self._failed_test_repair_focus(validation.focused_tests)
+        focus = []
+        focused = validation.focused_tests
+        if focused.get("exit_code") == 4 and "file or directory not found:" in str(
+            focused.get("output", "")
+        ):
+            for target in self.packet["focused_tests"]:
+                path = target.split("::", 1)[0]
+                try:
+                    _, resolved = self.editor.resolve(path)
+                except SafeEditError:
+                    continue
+                if resolved.exists():
+                    continue
+                creatable = (
+                    path in self.packet["supplemental_tests"]
+                    and path in self.packet["scope"]["create"]
+                )
+                focus.append(
+                    {
+                        "path": path,
+                        "required_path": path,
+                        "reason_code": "missing_focused_test",
+                        "required_next_action": (
+                            "SAFE_CREATE" if creatable else "REQUEST_CONTRACT_REVISION"
+                        ),
+                        "instruction": (
+                            "Create this authorized supplemental test with meaningful assertions, "
+                            "then VALIDATE. Do not reread unrelated implementation."
+                            if creatable
+                            else "A required focused test is absent and cannot be created within "
+                            "this packet. Request a Primary contract/scope revision; do not skip it."
+                        ),
+                    }
+                )
+        focus.extend(self._failed_test_repair_focus(focused))
         hint = self._configured_check_repair_hint(validation.configured_checks or [])
         if hint is not None:
             focus.append(hint)
@@ -3909,6 +4186,13 @@ while removing only the unused binding. Previous attempts are context, not autho
         }
 
     def _compact_repair_payload(self, focus: dict[str, Any]) -> dict[str, Any]:
+        if focus.get("required_next_action") == "SAFE_CREATE":
+            return {
+                "required_next_action": "SAFE_CREATE",
+                "repair_focus": focus,
+                "required_behavior": self.packet.get("required_behavior", []),
+                "instruction": focus["instruction"],
+            }
         candidates = focus.get("candidate_edit_paths") or []
         if focus.get("path") and focus["path"] not in candidates:
             candidates = [focus["path"], *candidates]
@@ -3922,9 +4206,10 @@ while removing only the unused binding. Previous attempts are context, not autho
             if candidate not in self.packet["scope"]["modify"]:
                 continue
             try:
+                self._assert_read_allowed(candidate)
                 raw, digest = self.editor.read_bytes(candidate)
                 lines = raw.decode("utf-8-sig").splitlines()
-            except (SafeEditError, UnicodeError):
+            except (WorkerError, SafeEditError, OSError, UnicodeError):
                 continue
             anchor = anchors.get(candidate)
             anchor_line = next(
@@ -3953,32 +4238,39 @@ while removing only the unused binding. Previous attempts are context, not autho
         symbol = focus.get("symbol")
         if isinstance(symbol, str) and symbol:
             expression = re.compile(rf"\b{re.escape(symbol)}\b")
+            scanned = 0
             for read_root in self.packet["scope"]["read"]:
                 try:
-                    _relative, resolved = self.editor.resolve(read_root)
-                except SafeEditError:
+                    resolved = (
+                        self.repo_root
+                        if read_root == "."
+                        else self._assert_read_allowed(read_root)[1]
+                    )
+                except (WorkerError, SafeEditError, OSError):
                     continue
-                candidates_to_scan = [resolved] if resolved.is_file() else resolved.rglob("*.py")
-                for path in candidates_to_scan:
-                    if len(symbol_evidence) >= 5:
+                for relative, checked in self._iter_read_files(resolved):
+                    if len(symbol_evidence) >= 5 or scanned >= 1000:
                         break
-                    if not path.is_file() or any(part in EXCLUDED_PARTS for part in path.parts):
+                    if not relative.endswith(".py"):
                         continue
+                    scanned += 1
                     try:
-                        lines = path.read_text(encoding="utf-8-sig").splitlines()
-                    except (OSError, UnicodeError):
+                        if checked.stat().st_size > 2_000_000:
+                            continue
+                        lines = checked.read_text(encoding="utf-8-sig").splitlines()
+                    except (WorkerError, SafeEditError, OSError, UnicodeError, ValueError):
                         continue
                     for line_number, line in enumerate(lines, 1):
                         if expression.search(line):
                             symbol_evidence.append(
                                 {
-                                    "path": path.relative_to(self.repo_root).as_posix(),
+                                    "path": relative,
                                     "line": line_number,
                                     "quote": line[:500],
                                 }
                             )
                             break
-                if len(symbol_evidence) >= 5:
+                if len(symbol_evidence) >= 5 or scanned >= 1000:
                     break
         test_evidence = []
         if self.validation is not None:
@@ -3991,18 +4283,24 @@ while removing only the unused binding. Previous attempts are context, not autho
                     continue
                 test_path = match.group(1).replace("\\", "/")
                 line_number = int(match.group(2))
-                if test_path not in self.packet["focused_tests"]:
+                focused_paths = {
+                    target.split("::", 1)[0].replace("\\", "/")
+                    for target in self.packet["focused_tests"]
+                }
+                if test_path not in focused_paths:
                     continue
                 try:
-                    _relative, resolved = self.editor.resolve(test_path)
+                    _relative, resolved = self._assert_read_allowed(test_path)
                     lines = resolved.read_text(encoding="utf-8-sig").splitlines()
-                except (SafeEditError, OSError, UnicodeError):
+                except (WorkerError, SafeEditError, OSError, UnicodeError):
                     continue
                 start = max(1, line_number - 5)
                 end = min(len(lines), line_number + 3)
                 test_evidence.append(
                     {
                         "test": failure.get("test"),
+                        "failure_message": str(failure.get("message") or "")[:2000],
+                        "displayed_bindings": failure.get("displayed_bindings", []),
                         "path": test_path,
                         "start_line": start,
                         "end_line": end,
@@ -4036,6 +4334,9 @@ while removing only the unused binding. Previous attempts are context, not autho
                 "semantic_invariants lists tests already resolved or passing; preserve those "
                 "results on the next VALIDATE. Test names are navigation labels, not field "
                 "definitions or extra contract requirements. "
+                "test_evidence.failure_message is the observed validation failure, not the "
+                "desired behavior: compare it with the displayed assertion and contract. "
+                "Handle independent remaining failures separately without undoing resolved ones. "
                 "Do not READ, SEARCH, or VALIDATE first."
             ),
         }
@@ -4110,6 +4411,37 @@ while removing only the unused binding. Previous attempts are context, not autho
             for path in paths
         )
 
+    def _diff_whitespace_autoformat_eligible(
+        self, issues: list[dict[str, Any]], profile: dict[str, Any], python_path: Path
+    ) -> bool:
+        """Opt-in preparation, never a substitute for an executed validation."""
+        if (
+            self.config.get("autoformat_on_diff_whitespace") is not True
+            or self.config.get("autoformat_on_ruff_failure", True) is False
+            or self.autoformat_used
+            or not issues
+            or any(item.get("code") != "introduced_trailing_whitespace" for item in issues)
+        ):
+            return False
+        authorized = self.packet["scope"]["modify"] + self.packet["scope"]["create"]
+        if any(
+            item.get("path") not in self.changed
+            or item.get("path") not in authorized
+            or not item.get("path", "").endswith(".py")
+            for item in issues
+        ):
+            return False
+        for command in profile.get("commands", []):
+            if not isinstance(command, dict) or command.get("id") != "ruff-format":
+                continue
+            argv = command.get("argv")
+            if not isinstance(argv, list) or not all(isinstance(arg, str) for arg in argv):
+                continue
+            expanded = [arg.replace("{python}", str(python_path)) for arg in argv]
+            if expanded[:4] == [str(python_path), "-m", "ruff", "format"] and "--check" in expanded:
+                return True
+        return False
+
     def _try_autoformat(self, python_path: Path) -> bool:
         paths = sorted(path for path in self.changed if path.endswith(".py"))
         for path in paths:
@@ -4149,7 +4481,34 @@ while removing only the unused binding. Previous attempts are context, not autho
         return bool(changed)
 
     def validate(self, args: dict[str, Any]) -> dict[str, Any]:
-        contract_check = self._contract_check(args)
+        phase = args.get("phase", "check")
+        if not isinstance(phase, str) or phase not in {"check", "final"}:
+            raise WorkerError("VALIDATE phase must be check or final")
+        contract_check = self._contract_check(
+            {key: value for key, value in args.items() if key != "phase"},
+            diagnostic=phase == "check",
+        )
+        if self.validation is not None and self.validation.status == "failed":
+            previous = self.validation.focused_tests
+            if (
+                previous.get("timed_out") is True
+                and previous.get("inputs_unchanged") is True
+                and previous.get("input_facts") == self._validation_facts()
+            ):
+                self.archive.event(
+                    "unchanged_timed_out_validation_rejected",
+                    {
+                        "edit_revision": self.edit_revision,
+                        "validation_attempt_ref": self.validation_refs[-1]
+                        if self.validation_refs
+                        else None,
+                    },
+                )
+                raise WorkerError(
+                    "VALIDATE refused: previous focused tests timed out and validation inputs "
+                    "are unchanged; edit using the evidence or finish blocked/failed for Primary"
+                )
+        self.validation_phase = "check"
         self.validation_count += 1
         profile = self.validation_profile()
         python_path = self.python_path()
@@ -4194,6 +4553,11 @@ while removing only the unused binding. Previous attempts are context, not autho
                     "snapshot": snapshot,
                 },
             )
+            if self._diff_whitespace_autoformat_eligible(text_quality_issues, profile, python_path):
+                # Keep the rejected attempt immutable. Formatting is a scoped
+                # mutation; acceptance requires a fresh full validation below.
+                if self._try_autoformat(python_path):
+                    return self.validate(args)
             return {"status": "failed", "validation": self._validation_observation(validation)}
         test_quality_issues = self._changed_test_quality_issues()
         if test_quality_issues:
@@ -4317,10 +4681,32 @@ while removing only the unused binding. Previous attempts are context, not autho
         configured_commands = profile.get("commands", [])
         if not isinstance(configured_commands, list):
             raise WorkerError("validation profile commands must be an array")
-        if status == "passed":
+        for command in configured_commands:
+            if (
+                isinstance(command, dict)
+                and type(command.get("run_on_test_failure", False)) is not bool
+            ):
+                raise WorkerError("validation profile run_on_test_failure must be boolean")
+        focused_gate_passed = status == "passed"
+        diagnostic_checks_allowed = (
+            test_result["status"] == "failed"
+            and inputs_unchanged
+            and junit.get("available") is True
+            and junit.get("executed", 0) > 0
+            and any(
+                isinstance(command, dict) and command.get("run_on_test_failure") is True
+                for command in configured_commands
+            )
+        )
+        if focused_gate_passed or diagnostic_checks_allowed:
             for index, command in enumerate(configured_commands, 1):
                 if not isinstance(command, dict):
                     raise WorkerError(f"validation profile commands[{index}] must be an object")
+                if not focused_gate_passed:
+                    if command.get("run_on_test_failure") is not True:
+                        continue
+                    if self._validation_facts() != input_facts_before:
+                        break
                 check_id = require_identifier(
                     command.get("id"), f"validation profile commands[{index}].id"
                 )
@@ -4343,7 +4729,9 @@ while removing only the unused binding. Previous attempts are context, not autho
                 result["diagnostic"] = self._diagnostic(result.get("output", ""))
                 configured_checks.append({"id": check_id, **result})
                 if result["status"] != "passed":
-                    if self._autoformat_eligible(check_id, expanded, result, python_path):
+                    if focused_gate_passed and self._autoformat_eligible(
+                        check_id, expanded, result, python_path
+                    ):
                         failed_validation = ValidationResult(
                             "failed",
                             {"status": "passed", "files": compile_results},
@@ -4378,7 +4766,8 @@ while removing only the unused binding. Previous attempts are context, not autho
                             "validation": self._validation_observation(failed_validation),
                         }
                     status = "failed"
-                    break
+                    if focused_gate_passed:
+                        break
         final_input_facts = self._validation_facts()
         if final_input_facts != input_facts_before:
             status = "failed"
@@ -4402,7 +4791,12 @@ while removing only the unused binding. Previous attempts are context, not autho
             configured_checks,
         )
         self.validation = validation
-        snapshot = self._archive_validation_attempt(validation)
+        effective_phase = (
+            phase
+            if status == "passed" and (self.edit_revision > 0 or self.packet.get("parent_run_id"))
+            else "check"
+        )
+        snapshot = self._archive_validation_attempt(validation, phase=effective_phase)
         failures = test_result["diagnostic"].get("failures", [])
         if status == "failed" and failures and test_result["status"] == "failed":
             signature = tuple(sorted((item["test"], item["message"][:160]) for item in failures))
@@ -4425,6 +4819,7 @@ while removing only the unused binding. Previous attempts are context, not autho
             self.last_test_failure_signature = None
             self.last_test_failure_edit_revision = None
         if status == "passed":
+            self.validation_phase = effective_phase
             self.validated_revision = self.edit_revision
             self.validated_input_facts = input_facts_after
             self.pending_failed_validation = False
@@ -4793,7 +5188,7 @@ def write_report(report: dict[str, Any], path: Path | None, *, compact: bool = T
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(allow_abbrev=False)
     parser.add_argument("--packet", required=True)
     parser.add_argument("--config", default=str(SCRIPT_DIR / "config.json"))
     parser.add_argument("--report")

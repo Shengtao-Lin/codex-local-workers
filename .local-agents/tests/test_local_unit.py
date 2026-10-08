@@ -18,6 +18,56 @@ SPEC.loader.exec_module(UNIT)
 
 
 class HandoffTests(unittest.TestCase):
+    def test_v13_legacy_contract_ids_remain_compatible_at_handoff(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            report, run = self.fixture(root)
+            packet = UNIT._object(run / "packet.json")
+            packet.update(
+                schema_version=1,
+                required_behavior=["VALUE is 2"],
+                contract_check_required=True,
+                required_order=["read then write"],
+                acceptance_scenarios=["Legacy normal scenario"],
+            )
+            (run / "packet.json").write_text(json.dumps(packet), encoding="utf-8")
+            validation = UNIT._object(run / "validation.json")
+            validation["contract_check"] = {
+                "required_behavior_ids": ["behavior-1"],
+                "required_order_confirmed": True,
+                "unrelated_changes": [],
+            }
+            (run / "validation.json").write_text(json.dumps(validation), encoding="utf-8")
+            self.assertEqual(UNIT.verify_handoff(root, report)["run_id"], "run")
+
+    def test_v13_green_diagnostic_claims_cannot_bypass_handoff(self) -> None:
+        for acknowledgement in (False, None, "true", True):
+            with self.subTest(acknowledgement=acknowledgement), TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                report, run = self.fixture(root)
+                packet = UNIT._object(run / "packet.json")
+                packet.update(
+                    contract_check_required=True,
+                    required_behavior=[{"id": "contract-value"}],
+                    required_order=["read before write"],
+                    forbidden_orderings=["write before read"],
+                )
+                (run / "packet.json").write_text(json.dumps(packet), encoding="utf-8")
+                validation = UNIT._object(run / "validation.json")
+                validation["contract_check"] = {
+                    "required_behavior_ids": ["contract-value"],
+                    "required_order_confirmed": acknowledgement,
+                    "forbidden_orderings_absent": acknowledgement,
+                    "observable_scenario_ids": [],
+                    "unrelated_changes": [],
+                }
+                (run / "validation.json").write_text(json.dumps(validation), encoding="utf-8")
+                if acknowledgement is True:
+                    self.assertEqual(UNIT.verify_handoff(root, report)["run_id"], "run")
+                else:
+                    with self.assertRaisesRegex(UNIT.HandoffError, "not submission eligible"):
+                        UNIT.verify_handoff(root, report)
+
     def test_reviewer_retry_is_bounded_to_transient_startup_failure(self) -> None:
         self.assertTrue(
             UNIT._retryable_reviewer_startup_failure(

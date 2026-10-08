@@ -215,6 +215,15 @@ class ExplorerError(RuntimeError):
     pass
 
 
+class ExplorerSourceReferenceError(ExplorerError):
+    """Source evidence and report formatting have different recovery actions."""
+
+    def __init__(self, message: str, category: str, read_paths: tuple[str, ...] = ()) -> None:
+        super().__init__(message)
+        self.category = category
+        self.read_paths = read_paths
+
+
 class ExplorerMissingAction(ExplorerError):
     """A terminal attempt is premature, not a report-formatting failure."""
 
@@ -428,20 +437,6 @@ class LMStudioClient:
                     )
         return payload
 
-    @staticmethod
-    def _embedded_action(text: str) -> str | None:
-        decoder = json.JSONDecoder()
-        for index, character in enumerate(text):
-            if character != "{":
-                continue
-            try:
-                value, _ = decoder.raw_decode(text[index:])
-            except ValueError:
-                continue
-            if isinstance(value, dict) and isinstance(value.get("action"), str):
-                return json.dumps(value, ensure_ascii=False)
-        return None
-
     def complete(self, messages: list[dict[str, str]]) -> str:
         request_messages = messages
         last_diagnostic = ""
@@ -514,17 +509,13 @@ class LMStudioClient:
                             {"action": name, "arguments": parsed_arguments}, ensure_ascii=False
                         )
             reasoning = message.get("reasoning", "") if isinstance(message, dict) else ""
-            if isinstance(reasoning, str):
-                embedded = self._embedded_action(reasoning)
-                if embedded is not None:
-                    return embedded
-                if reasoning.lstrip().startswith("<|channel|>"):
-                    return reasoning.strip()
+            # Draft reasoning may contain discarded actions or protocol examples.
+            # Only final content or an explicit tool call can authorize dispatch.
+            # Keep metadata for diagnostics, never replay or log the draft text.
             last_diagnostic = (
                 f"finish_reason={choice.get('finish_reason')!r}, "
                 f"reasoning_chars={len(reasoning) if isinstance(reasoning, str) else 0}, "
-                f"tool_calls={len(tool_calls) if isinstance(tool_calls, list) else 0}, "
-                f"reasoning_excerpt={reasoning[:200]!r}"
+                f"tool_calls={len(tool_calls) if isinstance(tool_calls, list) else 0}"
             )
             last_finish_reason = choice.get("finish_reason")
             if attempt == 0:
@@ -718,7 +709,31 @@ class ExplorerRuntime:
         self.mode = config.get("explorer_mode", "investigate")
         if not isinstance(self.mode, str) or self.mode not in {"investigate", "locate"}:
             raise ExplorerPreflightBlocked("invalid_config", "unknown explorer_mode")
-        self.cache_task = self.task if self.mode == "investigate" else "LOCATE_V1\n" + self.task
+        self.output_limit_recovery = config.get("explorer_output_limit_recovery", False)
+        if not isinstance(self.output_limit_recovery, bool):
+            raise ExplorerPreflightBlocked(
+                "invalid_config", "explorer_output_limit_recovery must be a boolean"
+            )
+        self.duplicate_action_report_recovery = config.get(
+            "explorer_duplicate_action_report_recovery", False
+        )
+        if not isinstance(self.duplicate_action_report_recovery, bool):
+            raise ExplorerPreflightBlocked(
+                "invalid_config", "explorer_duplicate_action_report_recovery must be a boolean"
+            )
+        # Cached research must satisfy the current evidence/action obligations.
+        # Preserve old entries under their namespace rather than deleting history.
+        self.cache_task = "FINAL_ACTION_V3\n" + json.dumps(
+            {
+                "mode": self.mode,
+                "task": self.task,
+                "required_citation_paths": config.get("explorer_required_citation_paths", []),
+                "required_trace_symbol": config.get("explorer_require_trace_symbol"),
+                "required_regex_search": bool(config.get("explorer_require_regex_search", False)),
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+        )
         if self.mode == "locate" and hasattr(client, "native_tools"):
             client.native_tools = [
                 self.localization_tool() if tool["function"]["name"] == "FINISH_SUCCESS" else tool
@@ -1016,6 +1031,50 @@ finding or concluding the current question is answered."""
                 request_stats = getattr(self.client, "last_request_stats", None)
                 if isinstance(request_stats, dict) and request_stats:
                     self.diagnostic_event("model_request", dict(request_stats))
+                required_paths = self.config.get("explorer_required_citation_paths", [])
+                has_source_and_test = any(p.startswith("tests/") for p in self.read_files) and any(
+                    not p.startswith("tests/") for p in self.read_files
+                )
+                if (
+                    self.output_limit_recovery
+                    and self.mode == "locate"
+                    and exc.reason_code == "output_token_limit"
+                    and has_source_and_test
+                    and all(p in self.read_files for p in required_paths)
+                    and not self.finish_repair_used
+                    and _turn + 1 < self.max_turns
+                ):
+                    # Discard the incomplete response completely. The remaining
+                    # existing turn may submit only fresh, verified locations.
+                    self.finish_repair_pending = True
+                    self.finish_repair_used = True
+                    replay = "\n".join(
+                        f"{path}\n{content}"
+                        for path, content in sorted(self.read_observations.items())
+                    )[:12000]
+                    messages = messages[:2] + [
+                        {
+                            "role": "user",
+                            "content": (
+                                "OUTPUT_LIMIT_REPORT_RECOVERY\n"
+                                "The prior reply was truncated and discarded; no action ran. "
+                                "Return only FINISH_SUCCESS with source_refs and uncertainties. "
+                                "Use displayed paths and narrow line ranges, at most 6 references "
+                                "and 80 total lines. Do not quote code, explain, read, or search. "
+                                "Evidence requirements still apply. This is the only recovery turn.\n"
+                                + replay
+                            ),
+                        }
+                    ]
+                    self.diagnostic_event(
+                        "output_limit_report_recovery",
+                        {
+                            "turn": _turn + 1,
+                            "reason_code": exc.reason_code,
+                            "observed_files": len(self.read_files),
+                        },
+                    )
+                    continue
                 return self._finish_run(
                     self.report(
                         "failed",
@@ -1086,6 +1145,11 @@ finding or concluding the current question is answered."""
                     }
                 )
                 observation = {"status": "error", "error": str(exc)}
+                if isinstance(exc, ExplorerSourceReferenceError):
+                    observation["source_ref_error"] = {
+                        "category": exc.category,
+                        "read_paths": list(exc.read_paths),
+                    }
                 final = None
                 repeated_output = (
                     envelope is None
@@ -1097,8 +1161,20 @@ finding or concluding the current question is answered."""
                 has_source_and_test = has_source_and_test and any(
                     not path.startswith("tests/") for path in self.read_files
                 )
+                duplicate_action = (
+                    self.duplicate_action_report_recovery
+                    and self.mode == "locate"
+                    and envelope is not None
+                    and envelope["action"] in {"READ_FILE", "SEARCH"}
+                    and str(exc).startswith("identical read/search already performed;")
+                    and all(
+                        path in self.read_files
+                        for path in self.config.get("explorer_required_citation_paths", [])
+                    )
+                    and _turn + 1 < self.max_turns
+                )
                 if (
-                    repeated_output
+                    (repeated_output or duplicate_action)
                     and has_source_and_test
                     and not self.finish_repair_used
                     and self.protocol_errors < self.max_protocol_errors
@@ -1106,7 +1182,7 @@ finding or concluding the current question is answered."""
                     self.finish_repair_pending = True
                     self.finish_repair_used = True
                     observation["next_step"] = (
-                        "The same malformed action repeated after source and test reads. "
+                        "An unproductive action repeated after source and test reads. "
                         "Next turn is report-only: use FINISH_SUCCESS with observed "
                         "source/test line citations and explicit uncertainty."
                     )
@@ -1137,14 +1213,7 @@ finding or concluding the current question is answered."""
                     )
                 ):
                     needs_read = self.mode == "locate" and (
-                        str(exc).startswith("source_refs contain unread lines:")
-                        or (
-                            str(exc).startswith("source_refs missing required paths:")
-                            and any(
-                                path.strip() not in self.read_files
-                                for path in str(exc).split(":", 1)[1].split(",")
-                            )
-                        )
+                        isinstance(exc, ExplorerSourceReferenceError) and bool(exc.read_paths)
                     )
                     if needs_read:
                         observation["next_step"] = (
@@ -1152,6 +1221,7 @@ finding or concluding the current question is answered."""
                             "then retry FINISH_SUCCESS with observed line ranges. "
                             "A SEARCH hit alone is not a cited read."
                         )
+                        observation["next_step"] += " Required reads: " + ", ".join(exc.read_paths)
                     else:
                         self.finish_repair_pending = True
                         self.finish_repair_used = True
@@ -1172,6 +1242,25 @@ finding or concluding the current question is answered."""
                                 "Keep controlling values and relevant assertions; omit optional "
                                 "context ranges rather than citing whole files."
                             )
+                            required = self.config.get("explorer_required_citation_paths", [])
+                            if isinstance(required, list) and all(
+                                isinstance(p, str) for p in required
+                            ):
+                                paths = sorted({normalize_relative_path(p) for p in required})
+                                observation["required_citation_paths"] = paths
+                                if paths:
+                                    observation["next_step"] += (
+                                        " Keep every required path when reducing references: "
+                                        + ", ".join(paths)
+                                        + ". Use one reference per path; combine multiple relevant "
+                                        "locations in the same file into one bounded range. "
+                                        "Never drop a required file to meet the count limit."
+                                    )
+                                    if len(paths) == 6:
+                                        observation["next_step"] += (
+                                            " There are six required paths: return exactly six "
+                                            "reference objects, one for each path."
+                                        )
                 if self.protocol_errors >= self.max_protocol_errors:
                     self.diagnostic_event(
                         "turn",
@@ -1518,6 +1607,13 @@ finding or concluding the current question is answered."""
             "mode": mode,
             "results": results,
             "truncated": len(results) >= limit,
+            "navigation_hint": (
+                "SEARCH matches file contents, not filenames. For filename discovery use "
+                "LIST_FILES with path and glob; for a known path use READ_FILE. Empty content "
+                "results do not establish that a file is absent."
+                if not results
+                else None
+            ),
         }
 
     def _consume_search_budget(self) -> None:
@@ -1851,7 +1947,14 @@ finding or concluding the current question is answered."""
                 raise ExplorerError("source_refs require positive ordered integer lines")
             total_lines += end - start + 1
             if total_lines > 80:
-                raise ExplorerError("source_refs exceed 80 total lines")
+                required = self.config.get("explorer_required_citation_paths", [])
+                if not isinstance(required, list) or any(not isinstance(p, str) for p in required):
+                    raise ExplorerError("explorer_required_citation_paths must be paths")
+                raise ExplorerSourceReferenceError(
+                    "source_refs exceed 80 total lines",
+                    "line_budget",
+                    tuple(sorted({normalize_relative_path(p) for p in required} - self.read_files)),
+                )
             if not isinstance(ref["kind"], str) or ref["kind"] not in {
                 "implementation",
                 "test",
@@ -1868,8 +1971,25 @@ finding or concluding the current question is answered."""
                     if end > line_count
                     else "; READ_FILE the missing range before citing it"
                 )
-                raise ExplorerError(
-                    f"source_refs contain unread lines: {relative}:{start}-{end}" + correction
+                beyond_eof = end > line_count
+                read_paths = (
+                    tuple(
+                        sorted(
+                            {
+                                normalize_relative_path(p)
+                                for p in self.config.get("explorer_required_citation_paths", [])
+                                if normalize_relative_path(p) not in self.read_files
+                            }
+                            | ({relative} if relative not in self.read_files else set())
+                        )
+                    )
+                    if beyond_eof
+                    else (relative,)
+                )
+                raise ExplorerSourceReferenceError(
+                    f"source_refs contain unread lines: {relative}:{start}-{end}" + correction,
+                    "beyond_eof" if beyond_eof else "unread_range",
+                    read_paths,
                 )
             content = path.read_bytes()
             digest = hashlib.sha256(content).hexdigest()
@@ -1886,7 +2006,11 @@ finding or concluding the current question is answered."""
         present = {ref["path"] for ref in materialized}
         missing = {normalize_relative_path(path) for path in required} - present
         if missing:
-            raise ExplorerError("source_refs missing required paths: " + ", ".join(sorted(missing)))
+            raise ExplorerSourceReferenceError(
+                "source_refs missing required paths: " + ", ".join(sorted(missing)),
+                "missing_required_paths",
+                tuple(sorted(missing - self.read_files)),
+            )
         if self.config.get("explorer_require_test_assertion_citation", False):
             if not any(
                 ref["kind"] == "test"
@@ -2028,7 +2152,7 @@ def write_report(report: dict[str, Any], path: Path | None, *, compact: bool = T
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(allow_abbrev=False)
     parser.add_argument("--task", required=True)
     parser.add_argument("--task-id")
     parser.add_argument("--config", default=str(SCRIPT_DIR / "config.json"))

@@ -13,6 +13,26 @@ sys.modules[SPEC.name] = STABILITY
 SPEC.loader.exec_module(STABILITY)
 
 
+def test_pinned_cache_never_accepts_missing_or_corrupt_bytes(tmp_path, monkeypatch):
+    import pytest
+
+    case = STABILITY.CASES[0]
+    source = case.copies[0]
+    origin = tmp_path / "origin"
+    live = origin / source.relative
+    live.parent.mkdir(parents=True)
+    live.write_bytes(b"changed source")
+    cache = tmp_path / "cache"
+    monkeypatch.setitem(STABILITY.SOURCES, source.repository, origin)
+    monkeypatch.setattr(STABILITY, "PINNED_SOURCES", cache)
+    with pytest.raises(ValueError, match="source snapshot changed"):
+        STABILITY.prepare(case, tmp_path / "missing", {})
+    cache.mkdir()
+    (cache / source.sha256).write_bytes(b"wrong pinned source")
+    with pytest.raises(ValueError, match="pinned source cache changed"):
+        STABILITY.prepare(case, tmp_path / "corrupt", {})
+
+
 def test_localization_requires_actual_faulty_branch_not_just_correct_file():
     case = STABILITY.CASES[0]
     report = {

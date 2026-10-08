@@ -88,26 +88,49 @@ def inherit_lifecycle_config(source: dict, target: dict) -> None:
             target[key] = source[key]
 
 
-def run(config_path: Path, *, explorer_mode: str | None = None) -> dict:
+def run(
+    config_path: Path,
+    *,
+    explorer_mode: str | None = None,
+    existing_python: Path | None = None,
+    workspace_parent: Path | None = None,
+) -> dict:
     source_config = json.loads(config_path.read_text(encoding="utf-8-sig"))
+    if existing_python is not None:
+        existing_python = existing_python.resolve(strict=True)
+        subprocess.run(
+            [str(existing_python), "-c", "import pytest, ruff"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
     root = (
-        Path(tempfile.gettempdir()) / f"local-worker-live-smoke-{uuid.uuid4().hex[:12]}"
-    )
+        workspace_parent.resolve()
+        if workspace_parent is not None
+        else Path(tempfile.gettempdir())
+    ) / f"local-worker-live-smoke-{uuid.uuid4().hex[:12]}"
     root.mkdir(parents=True, exist_ok=False)
     install(KIT, root, apply=True)
-    uv = shutil.which("uv")
-    if not uv:
-        raise RuntimeError("uv is required to create the replayable smoke environment")
-    venv_python = root / ".venv" / "Scripts" / "python.exe"
-    subprocess.run(
-        [uv, "venv", str(root / ".venv")], check=True, capture_output=True, text=True
-    )
-    subprocess.run(
-        [uv, "pip", "install", "--python", str(venv_python), "pytest", "ruff"],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    venv_python = existing_python
+    if venv_python is None:
+        uv = shutil.which("uv")
+        if not uv:
+            raise RuntimeError(
+                "uv is required to create the replayable smoke environment"
+            )
+        venv_python = root / ".venv" / "Scripts" / "python.exe"
+        subprocess.run(
+            [uv, "venv", str(root / ".venv")],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            [uv, "pip", "install", "--python", str(venv_python), "pytest", "ruff"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
     (root / "src").mkdir()
     (root / "tests").mkdir()
     (root / ".agent").mkdir()
@@ -342,8 +365,14 @@ def main() -> int:
     parser.add_argument(
         "--config", type=Path, default=KIT / ".local-agents" / "config.json"
     )
+    parser.add_argument("--existing-python", type=Path)
+    parser.add_argument("--workspace-parent", type=Path)
     args = parser.parse_args()
-    result = run(args.config)
+    result = run(
+        args.config,
+        existing_python=args.existing_python,
+        workspace_parent=args.workspace_parent,
+    )
     print(json.dumps(result, indent=2))
     return (
         0

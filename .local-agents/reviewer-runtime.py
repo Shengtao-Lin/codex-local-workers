@@ -84,6 +84,33 @@ REVIEW_NATIVE_TOOLS = [
                 },
                 "findings": {"type": "array", "items": {"type": "object"}},
                 "verified_contract_ids": {"type": "array", "items": {"type": "string"}},
+                "unverified_claims": {"type": "array", "items": {"type": "string"}},
+                "ordering_review": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "constraint_id": {"type": "string"},
+                            "status": {
+                                "type": "string",
+                                "enum": ["verified", "violated", "uncertain"],
+                            },
+                            "evidence_type": {"type": "string", "enum": ["source", "diff"]},
+                            "path": {"type": ["string", "null"]},
+                            "line": {"type": ["integer", "null"]},
+                            "evidence": {"type": "string"},
+                        },
+                        "required": [
+                            "constraint_id",
+                            "status",
+                            "evidence_type",
+                            "path",
+                            "line",
+                            "evidence",
+                        ],
+                        "additionalProperties": False,
+                    },
+                },
                 "contract_review": {
                     "type": "array",
                     "items": {
@@ -101,7 +128,7 @@ REVIEW_NATIVE_TOOLS = [
                 },
                 "verified_check_ids": {"type": "array", "items": {"type": "string"}},
             },
-            ["decision", "findings"],
+            ["decision", "findings", "ordering_review"],
         ),
     )
 ]
@@ -188,6 +215,17 @@ class ReviewerRuntime:
         self.same_protocol_error_streak = 0
         self.read_paths: set[str] = set()
         self.read_lines: dict[str, set[int]] = {}
+        self.context_recovery = config.get("reviewer_context_recovery", False)
+        if type(self.context_recovery) is not bool:
+            raise ReviewError("reviewer_context_recovery must be boolean")
+        self.context_retention = config.get("reviewer_context_retention", "recent")
+        if not isinstance(self.context_retention, str) or self.context_retention not in {
+            "recent",
+            "budgeted",
+        }:
+            raise ReviewError("reviewer_context_retention must be recent or budgeted")
+        self.active_read_lines: dict[str, set[int]] | None = None
+        self.context_recoveries: dict[tuple[str, int, int], int] = {}
         self.duplicate_read_streak = 0
         if (
             self.max_turns < 1
@@ -274,7 +312,38 @@ class ReviewerRuntime:
         seen_lines = self.read_lines.setdefault(relative, set())
         visible_lines = set(range(start, start + visible_count))
         new_lines = visible_lines - seen_lines
-        if not new_lines:
+        if not new_lines and visible_count:
+            recovery_key = (relative, start, start + visible_count - 1)
+            if (
+                self.context_recovery
+                and self.active_read_lines is not None
+                and not visible_lines <= self.active_read_lines.get(relative, set())
+                and visible_count <= 40
+                and self.context_recoveries.get(recovery_key, 0) < 2
+                and sum(self.context_recoveries.values()) < 8
+            ):
+                self.context_recoveries[recovery_key] = (
+                    self.context_recoveries.get(recovery_key, 0) + 1
+                )
+                self.event(
+                    "read_context_restored",
+                    {
+                        "path": relative,
+                        "start_line": start,
+                        "end_line": recovery_key[2],
+                        "new_evidence_count": 0,
+                    },
+                )
+                return {
+                    "status": "context_restored",
+                    "path": relative,
+                    "start_line": start,
+                    "end_line": recovery_key[2],
+                    "content": visible,
+                    "truncated": len(content) > self.max_output,
+                    "new_evidence_count": 0,
+                    "next_step": "Previously read source restored. Continue investigating relevant dependencies or report when ready.",
+                }
             next_unread = next(
                 (number for number in range(1, len(lines) + 1) if number not in seen_lines),
                 None,
@@ -299,6 +368,56 @@ class ReviewerRuntime:
                         "end_line": min(next_unread + 39, len(lines)),
                     },
                 }
+            if (
+                self.config.get("reviewer_require_source_and_test_reads", False)
+                and relative not in self.focused_test_paths()
+                and not any(self.read_lines.get(path) for path in self.focused_test_paths())
+            ):
+                # A missing protected test is more useful than an arbitrary unread
+                # import. Only actually displayed, scope-checked lines enter the
+                # existing read ledger; no contract verdict is inferred here.
+                for selector in self.packet["focused_tests"]:
+                    test_path = selector.split("::", 1)[0]
+                    try:
+                        _, resolved = self._assert_read_allowed(test_path)
+                        lines = resolved.read_text(encoding="utf-8-sig").splitlines()
+                        name = selector.split("::")[-1] if "::" in selector else None
+                        start_line = next(
+                            (
+                                i
+                                for i, line in enumerate(lines, 1)
+                                if (
+                                    name
+                                    and line.lstrip().startswith(
+                                        (f"def {name}(", f"async def {name}(")
+                                    )
+                                )
+                                or (
+                                    not name
+                                    and line.lstrip().startswith(("def test_", "async def test_"))
+                                )
+                            ),
+                            1,
+                        )
+                        evidence = self.read_file(
+                            {
+                                "path": test_path,
+                                "start_line": start_line,
+                                "end_line": min(start_line + 39, len(lines)),
+                            }
+                        )
+                        observation["required_test_read"] = evidence
+                        self.event(
+                            "required_test_evidence_prefetched",
+                            {
+                                "path": test_path,
+                                "start_line": start_line,
+                                "visible_end_line": evidence.get("end_line"),
+                            },
+                        )
+                        break
+                    except (OSError, UnicodeError, ReviewError, SAFE_EDIT.SafeEditError):
+                        continue
             if self.required_reads_complete():
                 observation["required_next_action"] = "REPORT"
                 observation["evidence_replay"] = self.replay_read_evidence()
@@ -325,6 +444,59 @@ class ReviewerRuntime:
                 "before citing source evidence."
             )
         return observation
+
+    def _trim_messages(self, messages: list[dict[str, str]]) -> list[dict[str, str]]:
+        if self.context_retention == "recent":
+            return messages if len(messages) <= 12 else messages[:2] + messages[-10:]
+        context = getattr(self.client, "context_length", None)
+        if type(context) is not int or context <= 0:
+            raise ReviewError("budgeted reviewer retention requires configured context length")
+        available = max(
+            0,
+            context
+            - getattr(self.client, "max_tokens", 4096)
+            - getattr(self.client, "context_safety_margin", 1024),
+        )
+        target = int(available * 0.8)
+        retained = list(messages)
+        # Same conservative estimate as Coder. Client preflight remains authoritative;
+        # preserve the initial contract and latest five exchanges even if irreducible.
+        while len(retained) > 12 and (
+            len(retained) > 64 or (len(json.dumps(retained, ensure_ascii=False)) + 3) // 4 > target
+        ):
+            del retained[2:4]
+        return retained
+
+    def _update_active_read_context(self, messages: list[dict[str, str]]) -> None:
+        """Track structured source observations actually retained in the next request.
+
+        This is a visibility index, never a replacement for the citation ledger.
+        Replay strings are deliberately not parsed into new source authority.
+        """
+        active: dict[str, set[int]] = {}
+
+        def visit(value: Any) -> None:
+            if isinstance(value, dict):
+                path, content = value.get("path"), value.get("content")
+                if isinstance(path, str) and isinstance(content, str):
+                    for line in content.splitlines():
+                        number, sep, _text = line.partition(": ")
+                        if sep and number.isdigit():
+                            active.setdefault(path, set()).add(int(number))
+                for child in value.values():
+                    visit(child)
+            elif isinstance(value, list):
+                for child in value:
+                    visit(child)
+
+        for message in messages:
+            content = message.get("content", "")
+            if message.get("role") == "user" and content.startswith("OBSERVATION\n"):
+                try:
+                    visit(json.loads(content.split("\n", 1)[1]))
+                except ValueError:
+                    continue
+        self.active_read_lines = active
 
     def replay_read_evidence(self) -> str:
         """Restore previously displayed changed-source and focused-test lines first."""
@@ -558,6 +730,30 @@ listed in approved_execution and never claim an unexecuted check passed.
 Passing focused tests do not prove untested inputs. For each added conditional or
 early return in the cumulative diff, check whether it bypasses required behavior
 or validation on an untested path before choosing pass_to_primary.
+For changed exception handlers, trace both the original failure and failures of
+cleanup operations (rollback, release, close, compensating writes). An awaited
+cleanup call can raise before a later raise/return executes. Check which exception
+actually reaches the caller, what state remains, and whether the packet requires
+preserving the original error. A bare raise after cleanup alone does not prove
+that guarantee. Assess the contract, not a preferred implementation shape; do not
+invent a defect when the contract permits cleanup errors or source handles them.
+Explain uncovered error-path reasoning in the relevant contract_review evidence.
+
+Review this implementation unit, not premature completion of the whole feature.
+Use owned_contract_ids and required_behavior to distinguish a defect of this unit
+from unfinished behavior explicitly owned by a separate pending unit. Do not
+assign that other unit's known pending work to an owned contract merely because
+its caller is readable. Example: a correct collector preserves each fetched
+value, while an unchanged receipt caller still passes raw labels; if the packet
+explicitly assigns receipt composition elsewhere, that pending caller is not a
+collector rework finding. Record pending integration uncertainty in
+unverified_claims; the unit pass never accepts the whole feature.
+Counterexample: if the changed collector drops zero values or changes exception
+propagation, report the owned-contract defect even when the caller is unchanged
+or read-only. Read-only location alone never excludes a genuine regression.
+If the packet does not establish ownership or a cross-unit requirement conflicts,
+escalate with evidence instead of assuming pending work is safe or requiring
+an out-of-scope implementation.
 
 REPORT arguments: decision, findings, verified_contract_ids, unverified_claims,
 ordering_review, contract_review, verified_check_ids. Pass requires no findings,
@@ -822,10 +1018,64 @@ all constraints are verified. If evidence is missing, choose rework or escalate.
                 "line supports the obligation; otherwise report rework or escalate. Do not "
                 "resubmit the previous REPORT unchanged or reread an already displayed range."
             )
+        elif (
+            "ordering_review.path must be a non-empty string" in error
+            or "source evidence line must be a positive integer" in error
+        ):
+            repair["evidence_shapes"] = {
+                "source": {
+                    "path": "non-empty actually read source path",
+                    "line": "positive actually read integer line",
+                },
+                "diff": {"path": "actual changed path or null", "line": None},
+            }
+            repair["read_changed_source_paths"] = [
+                path
+                for path in self.diff_paths()
+                if self.read_lines.get(path) and path not in self.focused_test_paths()
+            ]
+            repair["instruction"] = (
+                "For evidence_type=source, path cannot be null or empty and line must be a "
+                "positive integer from an actual READ_FILE observation. Choose the read source "
+                "whose lines establish this constraint, or READ_FILE the needed source first. "
+                "Required order needs source evidence. Forbidden order may instead use actual "
+                "cumulative diff evidence with line=null. Do not mark a constraint verified "
+                "merely to repair field shape; if evidence is insufficient, report escalate."
+            )
         elif "diff evidence must not claim a source line" in error:
+            repair["evidence_shapes"] = {
+                "source": {
+                    "path": "actually read source path",
+                    "line": "positive actually read line",
+                },
+                "diff": {"path": "actual changed path or null", "line": None},
+            }
             repair["instruction"] = (
                 "For evidence_type=diff, set line to null and cite the actual cumulative "
                 "diff; otherwise use evidence_type=source after READ_FILE."
+            )
+        elif "every ordering constraint" in error:
+            entries = args.get("ordering_review", [])
+            supplied = {
+                item["constraint_id"]: item
+                for item in (entries if isinstance(entries, list) else [])
+                if isinstance(item, dict) and isinstance(item.get("constraint_id"), str)
+            }
+            repair["unverified_constraints"] = [
+                {
+                    "constraint_id": item["id"],
+                    "text": item["text"],
+                    "allowed_evidence_types": item["allowed_evidence_types"],
+                }
+                for item in self.ordering_constraints()
+                if supplied.get(item["id"], {}).get("status") != "verified"
+            ]
+            repair["instruction"] = (
+                "Do not omit ordering_review when retrying. For a pass, independently assess "
+                "every listed constraint and include its exact ID once with verified evidence. "
+                "Required order needs read source path/line. Forbidden order also permits "
+                "actual cumulative diff evidence with line=null. If any constraint is violated "
+                "or uncertain, choose rework or escalate; do not manufacture verification."
             )
         elif "pass requires READ_FILE of at least one focused test file" in error:
             repair["suggested_action"] = {
@@ -856,9 +1106,9 @@ all constraints are verified. If evidence is missing, choose rework or escalate.
         return {
             "action": "REPORT",
             "arguments": {
-                "decision": "pass_to_primary",
+                "decision": "CHOOSE pass_to_primary, rework, or escalate AFTER reviewing",
                 "findings": [],
-                "verified_contract_ids": self.packet["owned_contract_ids"],
+                "verified_contract_ids": [],
                 "unverified_claims": [],
                 "verified_check_ids": [
                     item["id"]
@@ -868,7 +1118,7 @@ all constraints are verified. If evidence is missing, choose rework or escalate.
                 "contract_review": [
                     {
                         "obligation_id": item["id"],
-                        "status": "verified",
+                        "status": "CHOOSE verified, violated, or uncertain",
                         "source_ref": {
                             "path": "REPLACE WITH READABLE SOURCE PATH",
                             "start_line": 1,
@@ -1058,7 +1308,7 @@ all constraints are verified. If evidence is missing, choose rework or escalate.
             or any(item["status"] != "verified" for item in reviewed.values())
         ):
             raise ReviewError(
-                "pass_to_primary requires verified source evidence for every ordering constraint"
+                "pass_to_primary requires verified evidence of an allowed type for every ordering constraint"
             )
         obligations = {item["id"]: item for item in self.review_obligations()}
         contract_review = args.get("contract_review", [])
@@ -1355,6 +1605,8 @@ all constraints are verified. If evidence is missing, choose rework or escalate.
             try:
                 try:
                     try:
+                        if self.context_recovery:
+                            self._update_active_read_context(messages)
                         raw = self.client.complete(messages)
                     except WORKER.WorkerError as fallback_exc:
                         fallback_detail = str(fallback_exc)
@@ -1618,8 +1870,8 @@ all constraints are verified. If evidence is missing, choose rework or escalate.
                 and observation.get("required_next_action") == "REPORT"
             ):
                 messages = messages[:2] + messages[-2:]
-            elif len(messages) > 12:
-                messages = messages[:2] + messages[-10:]
+            else:
+                messages = self._trim_messages(messages)
         raise ReviewError("reviewer model turn limit exhausted")
 
 
@@ -1638,7 +1890,7 @@ def write_report(report: dict[str, Any], path: Path | None) -> bool:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(allow_abbrev=False)
     parser.add_argument("--request", required=True)
     parser.add_argument("--config", default=str(SCRIPT_DIR / "config.json"))
     parser.add_argument("--report")

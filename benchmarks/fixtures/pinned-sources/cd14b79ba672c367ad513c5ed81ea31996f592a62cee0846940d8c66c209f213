@@ -1,0 +1,163 @@
+"""Public control-plane contracts shared by API and workers."""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Annotated, Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
+
+
+class StrictModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class WorkspaceSpec(StrictModel):
+    workspace_id: str = Field(pattern=r"^[a-zA-Z][a-zA-Z0-9_.-]{0,127}$")
+    display_name: str = Field(min_length=1, max_length=256)
+    description: str | None = Field(default=None, max_length=2_000)
+    enabled: bool = True
+
+
+class ApplicationSpec(StrictModel):
+    workspace_id: str = Field(default="default", pattern=r"^[a-zA-Z][a-zA-Z0-9_.-]{0,127}$")
+    application_id: str = Field(pattern=r"^[a-zA-Z][a-zA-Z0-9_.-]{0,127}$")
+    display_name: str = Field(min_length=1, max_length=256)
+    environment: str = Field(min_length=1, max_length=64)
+    trace_source_id: str = Field(min_length=1, max_length=128)
+    adapter_name: str = Field(min_length=1, max_length=128)
+    adapter_version: str = Field(min_length=1, max_length=64)
+    source_filter: dict[str, Any] = Field(default_factory=dict)
+    mlflow_experiment_id: str | None = Field(default=None, min_length=1, max_length=256)
+    mlflow_experiment_name: str | None = Field(default=None, min_length=1, max_length=512)
+    enabled: bool = True
+
+
+class ScorerContract(StrictModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    scorer_id: str = Field(pattern=r"^[a-zA-Z][a-zA-Z0-9_.-]{0,127}$")
+    version: str = Field(pattern=r"^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$")
+    display_name: str = Field(min_length=1, max_length=256)
+    scorer_type: Literal["code", "judge"]
+    input_schema: dict[str, Any]
+    config_schema: dict[str, Any] = Field(default_factory=dict)
+    output_schema: dict[str, Any]
+    default_threshold: float | None = None
+    cacheable: bool = True
+    timeout_seconds: float = Field(default=30, gt=0, le=3_600)
+    implementation_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    artifact_schema_version: str = "1.0"
+
+
+class SelectionPolicy(StrictModel):
+    strategy: Literal["all", "random", "percentage", "limit"] = "all"
+    seed: int = 0
+    percentage: float | None = Field(default=None, gt=0, le=100)
+    limit: int | None = Field(default=None, ge=1)
+    order: Literal["newest", "oldest"] = "newest"
+    attributes: dict[str, str] = Field(default_factory=dict)
+    statuses: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_strategy_options(self) -> SelectionPolicy:
+        if self.strategy == "percentage" and self.percentage is None:
+            raise ValueError("percentage is required for percentage selection")
+        if self.strategy in {"random", "limit"} and self.limit is None:
+            raise ValueError("limit is required for random or limit selection")
+        return self
+
+
+class SamplingPlanSpec(StrictModel):
+    plan_id: str = Field(pattern=r"^[a-zA-Z][a-zA-Z0-9_.-]{0,127}$")
+    workspace_id: str = Field(default="default", pattern=r"^[a-zA-Z][a-zA-Z0-9_.-]{0,127}$")
+    application_id: str = Field(pattern=r"^[a-zA-Z][a-zA-Z0-9_.-]{0,127}$")
+    environment: str = Field(min_length=1, max_length=64)
+    name: str = Field(min_length=1, max_length=256)
+    dataset_name: str = Field(min_length=1, max_length=256)
+    row_mode: Literal["trace", "turn"] = "trace"
+    selection: SelectionPolicy = Field(default_factory=SelectionPolicy)
+    adapter_name: str
+    adapter_version: str
+    include_feedback: bool = True
+    lookback_seconds: int = Field(default=3_600, ge=60, le=31_536_000)
+    enabled: bool = True
+
+
+class DatasetGenerationRequest(StrictModel):
+    workspace_id: str = Field(default="default", pattern=r"^[a-zA-Z][a-zA-Z0-9_.-]{0,127}$")
+    application_id: str
+    environment: str | None = Field(default=None, min_length=1, max_length=64)
+    name: str = Field(min_length=1, max_length=256)
+    start_time: datetime
+    end_time: datetime
+    row_mode: Literal["trace", "turn"]
+    selection: SelectionPolicy = Field(default_factory=SelectionPolicy)
+    adapter_name: str
+    adapter_version: str
+    include_feedback: bool = True
+    sampling_plan_id: str | None = None
+    sampling_run_id: str | None = None
+    trigger_type: Literal["on_demand", "scheduled", "upload"] = "on_demand"
+
+    @model_validator(mode="after")
+    def validate_window(self) -> DatasetGenerationRequest:
+        if self.start_time >= self.end_time:
+            raise ValueError("start_time must be before end_time")
+        if self.start_time.tzinfo is None or self.end_time.tzinfo is None:
+            raise ValueError("start_time and end_time must be timezone-aware")
+        return self
+
+
+class SamplingPlanRunRequest(StrictModel):
+    start_time: datetime
+    end_time: datetime
+
+    @model_validator(mode="after")
+    def validate_window(self) -> SamplingPlanRunRequest:
+        if self.start_time >= self.end_time:
+            raise ValueError("start_time must be before end_time")
+        if self.start_time.tzinfo is None or self.end_time.tzinfo is None:
+            raise ValueError("start_time and end_time must be timezone-aware")
+        return self
+
+
+class EvaluationRequest(StrictModel):
+    dataset_id: str
+    scorer_refs: list[str] = Field(min_length=1, max_length=32)
+    concurrency: int = Field(default=4, ge=1, le=64)
+    failure_threshold: float = Field(default=1.0, ge=0, le=1)
+    cost_budget_usd: float | None = Field(default=None, ge=0)
+    scorer_thresholds: dict[str, Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]] = Field(
+        default_factory=dict
+    )
+    judge_repetitions: dict[str, StrictInt] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_scorer_thresholds(self) -> EvaluationRequest:
+        for key in self.scorer_thresholds:
+            if key not in self.scorer_refs:
+                raise ValueError(f"Unknown scorer reference: {key}")
+        return self
+
+    @model_validator(mode="after")
+    def validate_judge_repetitions(self) -> EvaluationRequest:
+        for key, value in self.judge_repetitions.items():
+            if key not in self.scorer_refs:
+                raise ValueError(f"Unknown scorer reference in judge_repetitions: {key}")
+            scorer_id, separator, version = key.partition("@")
+            if not scorer_id or not separator or not version:
+                raise ValueError(f"Judge repetitions require scorer_id@version: {key}")
+            if value < 1 or value > 100:
+                raise ValueError(f"judge_repetitions count must be between 1 and 100: {value}")
+        return self
+
+
+class ReviewRequest(StrictModel):
+    sample_id: str
+    evaluation_id: str | None = None
+    score_result_id: str | None = None
+    reviewer_id: str = Field(min_length=1, max_length=256)
+    label: str = Field(min_length=1, max_length=128)
+    score: float | None = None
+    comment: str | None = Field(default=None, max_length=8_000)

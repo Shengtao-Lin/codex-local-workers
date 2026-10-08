@@ -243,6 +243,8 @@ def main() -> int:
         "--config", type=Path, default=KIT / ".local-agents" / "config.json"
     )
     parser.add_argument("--explorer-mode", choices=("investigate", "locate"))
+    parser.add_argument("--existing-python", type=Path)
+    parser.add_argument("--workspace-parent", type=Path)
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -266,7 +268,12 @@ def main() -> int:
         ):
             raise SystemExit("stored smoke has a different Explorer capability mode")
     else:
-        smoke = live_smoke.run(args.config.resolve(), explorer_mode=args.explorer_mode)
+        smoke = live_smoke.run(
+            args.config.resolve(),
+            explorer_mode=args.explorer_mode,
+            existing_python=args.existing_python,
+            workspace_parent=args.workspace_parent,
+        )
     result = evaluate(smoke, config)
     result["result_path"] = str(store(result, args.output_dir.resolve()))
     print(json.dumps(result, indent=2))

@@ -241,6 +241,19 @@ class RequiredTestReadClient:
 
 
 class ExplorerRuntimeTests(unittest.TestCase):
+    def test_filename_search_hint_does_not_claim_source_evidence(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            runtime = RUNTIME.ExplorerRuntime(root, "Locate.", {}, AdaptiveExplorerClient())
+            result = runtime.search({"path": "tests", "query": "test_greeting.py"})
+            self.assertEqual(result["results"], [])
+            self.assertIn("LIST_FILES", result["navigation_hint"])
+            self.assertIn(
+                "tests/test_greeting.py",
+                runtime.list_files({"path": "tests", "glob": "*test_greeting.py"})["files"],
+            )
+
     def test_globstar_does_not_hide_root_level_test_directory(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -877,6 +890,81 @@ class ExplorerRuntimeTests(unittest.TestCase):
             "from greeting import build_greeting\n", encoding="utf-8"
         )
 
+    def test_cached_success_cannot_bypass_new_evidence_obligations(self) -> None:
+        settings = (
+            {"explorer_required_citation_paths": ["tests/test_greeting.py"]},
+            {"explorer_require_trace_symbol": "build_greeting"},
+            {"explorer_require_regex_search": True},
+        )
+        for extra in settings:
+            with self.subTest(extra=extra), TemporaryDirectory() as directory:
+                root = Path(directory)
+                self.make_tree(root)
+                actions = [
+                    {"action": "READ_FILE", "path": "greeting.py"},
+                    {
+                        "action": "FINISH_SUCCESS",
+                        "source_refs": [
+                            {
+                                "path": "greeting.py",
+                                "start_line": 1,
+                                "end_line": 1,
+                                "kind": "implementation",
+                            }
+                        ],
+                        "uncertainties": [],
+                    },
+                ]
+
+                class Client:
+                    def complete(self, _messages):
+                        return json.dumps(actions.pop(0))
+
+                task = "Locate the greeting implementation."
+                weak = RUNTIME.ExplorerRuntime(root, task, {"explorer_mode": "locate"}, Client())
+                first = weak.run()
+                self.assertEqual(first["status"], "success")
+                same = RUNTIME.ExplorerRuntime(
+                    root, task, {"explorer_mode": "locate"}, FailIfCalledClient()
+                ).run()
+                self.assertTrue(same["cache"]["hit"])
+                strict = RUNTIME.ExplorerRuntime(
+                    root, task, {"explorer_mode": "locate", **extra}, InfraFailureClient()
+                )
+                result = strict.run()
+                self.assertFalse(strict.cache_hit)
+                self.assertEqual(result["status"], "failed")
+                self.assertNotEqual(strict.cache_task, weak.cache_task)
+                self.assertIsNotNone(
+                    weak.evidence_cache.lookup(weak.cache_task, weak.cache_fingerprint)
+                )
+
+    def test_legacy_cached_reports_cannot_bypass_final_channel_authority(self) -> None:
+        for mode in ("investigate", "locate"):
+            with self.subTest(mode=mode), TemporaryDirectory() as directory:
+                root = Path(directory)
+                self.make_tree(root)
+                task = "Inspect greeting."
+                config = {"explorer_mode": mode}
+                runtime = RUNTIME.ExplorerRuntime(root, task, config, InfraFailureClient())
+                fingerprint = RUNTIME.EVIDENCE_CACHE.repository_fingerprint(root)
+                legacy_key = task if mode == "investigate" else "LOCATE_V1\n" + task
+                legacy = {"status": "success", "observed_hashes": {}, "findings": ["legacy"]}
+                self.assertTrue(runtime.evidence_cache.store(legacy_key, fingerprint, legacy))
+                self.assertEqual(runtime.evidence_cache.lookup(legacy_key, fingerprint), legacy)
+                self.assertNotEqual(runtime.cache_task, legacy_key)
+                result = runtime.run()
+                self.assertEqual(result["status"], "failed")
+                self.assertFalse(runtime.cache_hit)
+                self.assertEqual(runtime.evidence_cache.lookup(legacy_key, fingerprint), legacy)
+                current = {"status": "success", "observed_hashes": {}, "findings": ["current"]}
+                self.assertTrue(
+                    runtime.evidence_cache.store(runtime.cache_task, fingerprint, current)
+                )
+                cached = RUNTIME.ExplorerRuntime(root, task, config, FailIfCalledClient()).run()
+                self.assertTrue(cached["cache"]["hit"])
+                self.assertEqual(cached["findings"], ["current"])
+
     def test_read_only_exploration_returns_evidence_backed_report(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1116,6 +1204,75 @@ class ExplorerRuntimeTests(unittest.TestCase):
         self.assertEqual([item["role"] for item in retry_messages], ["system", "user"])
         self.assertIn("Task\n\nHints", retry_messages[1]["content"])
         self.assertIn("previous response had no executable action", retry_messages[1]["content"])
+
+    def test_reasoning_candidates_never_become_executable_actions(self) -> None:
+        for reasoning in (
+            'Candidate only: {"action":"READ_FILE","path":"wrong.py"}',
+            '<|channel|>analysis {"action":"READ_FILE","path":"wrong.py"}',
+            '{"action":"FINISH_SUCCESS","findings":["not submitted"]}',
+        ):
+            with self.subTest(reasoning=reasoning):
+                client = RUNTIME.LMStudioClient("http://localhost:1234/v1", "explorer", timeout=9)
+                tentative = {
+                    "choices": [
+                        {
+                            "message": {"content": "", "reasoning": reasoning},
+                            "finish_reason": "stop",
+                        }
+                    ]
+                }
+                final = {
+                    "choices": [
+                        {
+                            "message": {"content": '{"action":"READ_FILE","path":"actual.py"}'},
+                            "finish_reason": "stop",
+                        }
+                    ]
+                }
+                messages = [{"role": "user", "content": "Read actual.py"}]
+                with patch.object(client, "_post", side_effect=[tentative, final]) as post:
+                    result = json.loads(client.complete(messages))
+                self.assertEqual(result, {"action": "READ_FILE", "path": "actual.py"})
+                self.assertEqual(post.call_count, 2)
+                self.assertEqual(client.empty_response_repairs, 1)
+                self.assertNotIn(reasoning, json.dumps(post.call_args_list[1].args[0]))
+
+    def test_repeated_reasoning_only_fails_closed_without_raw_excerpt(self) -> None:
+        client = RUNTIME.LMStudioClient("http://localhost:1234/v1", "explorer", timeout=9)
+        secret = 'PRIVATE_DRAFT {"action":"READ_FILE","path":"wrong.py"}'
+        tentative = {
+            "choices": [
+                {"message": {"content": None, "reasoning": secret}, "finish_reason": "stop"}
+            ]
+        }
+        with patch.object(client, "_post", return_value=tentative) as post:
+            with self.assertRaisesRegex(RUNTIME.ExplorerError, "after one repair") as raised:
+                client.complete([{"role": "user", "content": "Inspect"}])
+        self.assertEqual(post.call_count, 2)
+        self.assertNotIn("PRIVATE_DRAFT", str(raised.exception))
+        self.assertNotIn("wrong.py", str(raised.exception))
+
+    def test_final_native_call_remains_authoritative_with_reasoning_present(self) -> None:
+        client = RUNTIME.LMStudioClient("http://localhost:1234/v1", "explorer", timeout=9)
+        response = {
+            "choices": [
+                {
+                    "message": {
+                        "content": None,
+                        "reasoning": '{"action":"FINISH_FAILED","reason":"discarded candidate"}',
+                        "tool_calls": [
+                            {"function": {"name": "READ_FILE", "arguments": '{"path":"actual.py"}'}}
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ]
+        }
+        with patch.object(client, "_post", return_value=response) as post:
+            result = json.loads(client.complete([{"role": "user", "content": "Inspect"}]))
+        self.assertEqual(result, {"action": "READ_FILE", "arguments": {"path": "actual.py"}})
+        self.assertEqual(post.call_count, 1)
+        self.assertEqual(client.empty_response_repairs, 0)
 
     def test_output_length_failure_is_infrastructure_not_worker_quality(self) -> None:
         client = RUNTIME.LMStudioClient("http://localhost:1234/v1", "explorer", timeout=9)

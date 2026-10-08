@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "rounds": 2,
+  "acceptance": "Executed protected tests and configured checks, fresh Reviewer and immutable Primary acceptance for every unit, then whole-feature integration. No takeover credited as worker success.",
+  "cases": [
+    {
+      "case_id": "bounded-report",
+      "origin": "primary-authored",
+      "goal": "Accept a bounded report limit, then return that many records deterministically through the public report entry point.",
+      "feature_risk": "medium",
+      "integration_risk": "medium",
+      "files": {
+        "src/product/__init__.py": "",
+        "src/product/config.py": "def parse_limit(value):\n    return int(value)\n",
+        "src/product/report.py": "from product.config import parse_limit\n\n\ndef select_rows(rows, limit):\n    return rows[:limit]\n\n\ndef build_report(rows, value):\n    return select_rows(rows, parse_limit(value))\n",
+        "tests/test_config.py": "import pytest\n\nfrom product.config import parse_limit\n\n\n@pytest.mark.parametrize('value', [1, 100, '1', '100'])\ndef test_valid(value):\n    assert parse_limit(value) == int(value)\n\n\n@pytest.mark.parametrize('value', [True, False, 0, 101, -1, 1.5, None, '1.5', '', ' 2', '+2'])\ndef test_invalid(value):\n    with pytest.raises(ValueError):\n        parse_limit(value)\n",
+        "tests/test_report.py": "import pytest\n\nfrom product.report import build_report\n\n\ndef test_roundtrip():\n    rows = [{'id': 'b'}, {'id': 'a'}, {'id': 'c'}]\n    assert build_report(rows, '2') == [{'id': 'a'}, {'id': 'b'}]\n    assert rows == [{'id': 'b'}, {'id': 'a'}, {'id': 'c'}]\n    assert build_report([], 1) == []\n    assert build_report(rows, 100) == [{'id': 'a'}, {'id': 'b'}, {'id': 'c'}]\n\n\ndef test_rejection():\n    with pytest.raises(ValueError):\n        build_report([], True)\n"
+      },
+      "units": [
+        {"unit_id": "limit-contract", "risk": "medium", "dependencies": [], "path": "src/product/config.py", "anchor": "def parse_limit", "tests": ["tests/test_config.py"], "contract": "Accept integers excluding bool or strings of ASCII digits without whitespace/signs, range 1..100 inclusive; return int. Reject every other input with ValueError, not TypeError. Preserve caller compatibility."},
+        {"unit_id": "report-roundtrip", "risk": "medium", "dependencies": ["limit-contract"], "path": "src/product/report.py", "anchor": "def select_rows", "tests": ["tests/test_report.py", "tests/test_config.py"], "contract": "build_report routes the exact input through the accepted parse_limit contract. Select rows sorted ascending by id, then limit, without mutating the input list. Empty input and limits above row count work; invalid limits reject even for empty rows. Do not edit the accepted config unit."}
+      ]
+    },
+    {
+      "case_id": "async-score-summary",
+      "origin": "primary-authored-derived-diagnostic",
+      "goal": "Read one evaluation's persisted score summary asynchronously and expose a stable read-only response including missing-evaluation behavior.",
+      "feature_risk": "high",
+      "integration_risk": "high",
+      "files": {
+        "src/product/__init__.py": "",
+        "src/product/query.py": "from sqlalchemy import Column, Integer, MetaData, String, Table, select\n\nmetadata = MetaData()\nresults = Table('results', metadata, Column('id', Integer, primary_key=True), Column('evaluation_id', String), Column('status', String), Column('reused_from', Integer))\n\n\nasync def summarize(session, evaluation_id):\n    result = session.execute(select(results).where(results.c.evaluation_id == evaluation_id))\n    return result.one()\n",
+        "src/product/service.py": "from product.query import summarize\n\n\nasync def score_summary(session, evaluation_id):\n    return await summarize(session, evaluation_id)\n",
+        "tests/test_query.py": "import asyncio\n\nfrom sqlalchemy import create_engine\nfrom product.query import metadata, results, summarize\n\n\nclass Session:\n    def __init__(self, connection):\n        self.connection = connection\n        self.calls = 0\n\n    async def execute(self, statement):\n        self.calls += 1\n        return self.connection.execute(statement)\n\n\ndef test_counts():\n    engine = create_engine('sqlite://')\n    metadata.create_all(engine)\n    with engine.begin() as connection:\n        connection.execute(results.insert(), [{'evaluation_id': eid, 'status': status, 'reused_from': reused} for eid, status, reused in [('a', 'succeeded', 1), ('a', 'succeeded', None), ('a', 'failed', 2), ('a', 'skipped', None), ('b', 'succeeded', 3)]])\n        session = Session(connection)\n        assert asyncio.run(summarize(session, 'a')) == {'total': 4, 'succeeded': 2, 'failed': 1, 'skipped': 1, 'reused': 1}\n        assert session.calls == 1\n        assert asyncio.run(summarize(session, 'missing')) == dict.fromkeys(['total', 'succeeded', 'failed', 'skipped', 'reused'], 0)\n",
+        "tests/test_service.py": "import asyncio\n\nimport pytest\n\nfrom product.service import score_summary\n\n\nclass Session:\n    def __init__(self, present):\n        self.present = present\n        self.events = []\n\n    async def get_evaluation(self, evaluation_id):\n        self.events.append(('get', evaluation_id))\n        return {'reuse_scores': True} if self.present else None\n\n    async def execute(self, statement):\n        self.events.append(('aggregate', statement))\n        class Result:\n            def one(self):\n                return (0, 0, 0, 0, 0)\n        return Result()\n\n\ndef test_present():\n    session = Session(True)\n    assert asyncio.run(score_summary(session, 'a')) == {'evaluation_id': 'a', 'reuse_scores': True, 'total': 0, 'succeeded': 0, 'failed': 0, 'skipped': 0, 'reused': 0}\n    assert [event[0] for event in session.events] == ['get', 'aggregate']\n\n\ndef test_missing():\n    session = Session(False)\n    with pytest.raises(LookupError):\n        asyncio.run(score_summary(session, 'a'))\n    assert [event[0] for event in session.events] == ['get']\n"
+      },
+      "units": [
+        {"unit_id": "aggregate-query", "risk": "high", "dependencies": [], "path": "src/product/query.py", "anchor": "async def summarize", "tests": ["tests/test_query.py"], "contract": "Await session.execute exactly once with one aggregate SELECT filtered by evaluation_id; never fetch all score rows. Return a dict of integer total/succeeded/failed/skipped/reused counts, empty counts zero. Reused counts only succeeded rows with nonnull reused_from. Do not mutate or commit. SQLAlchemy 2 case conditions use (condition, value) tuples and SQL expressions, not Python boolean conjunctions."},
+        {"unit_id": "summary-response", "risk": "high", "dependencies": ["aggregate-query"], "path": "src/product/service.py", "anchor": "async def score_summary", "tests": ["tests/test_service.py", "tests/test_query.py"], "contract": "First await session.get_evaluation(evaluation_id). Missing evaluation raises LookupError with no aggregate execution. Present evaluation returns evaluation_id, persisted reuse_scores bool default false, and all five counts from awaiting summarize. Read-only, no commits/mutations/scoring; do not edit the accepted query implementation."}
+      ]
+    }
+  ],
+  "external_cases": [
+    {"case_id": "reuse-scores", "origin": "real-task-adapted-replay", "archive_task": "reuse-scores-20261003", "archive_run": "reuse-scores-20261003-a3", "risk": "high", "atomic_unit": true},
+    {"case_id": "score-summary", "origin": "real-task-adapted-replay", "archive_task": "score-summary-20261003", "archive_run": "score-summary-20261003-a1", "risk": "high", "atomic_unit": true},
+    {"case_id": "pallets__flask-4992", "origin": "SWE-bench-Lite", "repo": "pallets/flask", "base_commit": "4c288bc97ea371817199908d0d9b12de9dae327e", "title": "Add a file mode parameter to flask.Config.from_file()", "official_score": false},
+    {"case_id": "pallets__flask-4045", "origin": "SWE-bench-Lite", "repo": "pallets/flask", "base_commit": "d8c37f43724cd9fb0870f77877b7c4c7e38a19e0", "title": "Raise error when blueprint name contains a dot", "official_score": false}
+  ]
+}

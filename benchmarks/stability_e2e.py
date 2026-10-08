@@ -23,6 +23,7 @@ from pathlib import Path
 KIT = Path(__file__).resolve().parents[1]
 PLAN_VERSION = "v1.2"
 WORK = KIT / "benchmarks" / "work" / "stability-v1"
+PINNED_SOURCES = KIT / "benchmarks/fixtures/pinned-sources"
 SOURCES = {
     "harness": Path("F:/ChatGPT/agent-evaluation-harness"),
     "runtime": Path("F:/ChatGPT/agent-runtime-kit"),
@@ -762,7 +763,12 @@ def prepare(
         raw = original.read_bytes()
         digest = hashlib.sha256(raw).hexdigest()
         if digest != source.sha256:
-            raise ValueError(f"source snapshot changed: {original} ({digest})")
+            cached = PINNED_SOURCES / source.sha256
+            if not cached.is_file():
+                raise ValueError(f"source snapshot changed: {original} ({digest})")
+            raw = cached.read_bytes()
+            if hashlib.sha256(raw).hexdigest() != source.sha256:
+                raise ValueError(f"pinned source cache changed: {cached}")
         destination = root / source.relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(raw)

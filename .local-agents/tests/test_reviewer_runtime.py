@@ -28,10 +28,246 @@ class FakeClient:
 
 
 class ReviewerRuntimeTests(unittest.TestCase):
+    def test_budgeted_retention_keeps_long_read_chain_when_it_fits(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            client = FakeClient([])
+            client.context_length = 24576
+            client.max_tokens = 4096
+            runtime = REVIEWER.ReviewerRuntime(
+                root, self.make_run(root), {"reviewer_context_retention": "budgeted"}, client
+            )
+            messages = [
+                {"role": "system", "content": "rules"},
+                {"role": "user", "content": "packet"},
+            ]
+            for i in range(9):
+                messages.extend(
+                    [
+                        {"role": "assistant", "content": "READ_FILE"},
+                        {
+                            "role": "user",
+                            "content": "OBSERVATION\n"
+                            + json.dumps({"path": f"src/{i}.py", "content": "1: value = 1"}),
+                        },
+                    ]
+                )
+            retained = runtime._trim_messages(messages)
+            self.assertEqual(retained, messages)
+            runtime._update_active_read_context(retained)
+            self.assertEqual(len(runtime.active_read_lines), 9)
+            runtime.context_retention = "recent"
+            runtime._update_active_read_context(runtime._trim_messages(messages))
+            self.assertEqual(len(runtime.active_read_lines), 5)
+
+    def test_budgeted_retention_bounds_history_without_dropping_contract_or_recent_evidence(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            client = FakeClient([])
+            client.context_length = 6000
+            client.max_tokens = 2000
+            runtime = REVIEWER.ReviewerRuntime(
+                root, self.make_run(root), {"reviewer_context_retention": "budgeted"}, client
+            )
+            messages = [{"role": "user", "content": str(i) + "x" * 1000} for i in range(40)]
+            retained = runtime._trim_messages(messages)
+            self.assertEqual(retained[:2], messages[:2])
+            self.assertEqual(retained[-10:], messages[-10:])
+            self.assertLess(len(retained), len(messages))
+            self.assertEqual(len(messages), 40)
+            client.context_length = 1000000
+            self.assertLessEqual(len(runtime._trim_messages(messages * 4)), 64)
+            client.context_length = None
+            with self.assertRaisesRegex(REVIEWER.ReviewError, "configured context"):
+                runtime._trim_messages(messages)
+
+    def test_evicted_read_keeps_investigation_tools_available_in_real_loop(self):
+        class NativeClient(FakeClient):
+            native_tools = REVIEWER.REVIEW_NATIVE_TOOLS
+            native_tool_choice = "auto"
+
+            def complete(self, messages):
+                if len(self.messages_seen) == 8:
+                    self.restored = json.loads(messages[-1]["content"].split("\n", 1)[1])
+                    self.available = [t["function"]["name"] for t in self.native_tools]
+                return super().complete(messages)
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            def read(path):
+                return {"action": "READ_FILE", "arguments": {"path": path}}
+
+            client = NativeClient(
+                [
+                    read("src/example.py"),
+                    read("tests/test_example.py"),
+                    *[
+                        {"action": "SEARCH", "arguments": {"query": f"missing_{i}"}}
+                        for i in range(5)
+                    ],
+                    read("src/example.py"),
+                    read("tests/test_example.py"),
+                    {
+                        "action": "REPORT",
+                        "arguments": {
+                            "decision": "pass_to_primary",
+                            "findings": [],
+                            "verified_contract_ids": ["behavior-1"],
+                            "verified_check_ids": [],
+                            "ordering_review": [],
+                            "contract_review": [],
+                            "unverified_claims": [],
+                        },
+                    },
+                ]
+            )
+            runtime = REVIEWER.ReviewerRuntime(
+                root, self.make_run(root), {"reviewer_context_recovery": True}, client
+            )
+            report = runtime.run()
+            self.assertEqual(report["decision"], "pass_to_primary")
+            self.assertEqual(client.restored["status"], "context_restored")
+            self.assertIn("SEARCH", client.available)
+            self.assertIn("READ_FILE", client.available)
+
+    def test_context_recovery_restores_evicted_source_without_forcing_report(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = REVIEWER.ReviewerRuntime(
+                root, self.make_run(root), {"reviewer_context_recovery": True}, FakeClient([])
+            )
+            source = runtime.read_file({"path": "src/example.py"})
+            runtime.prepare()
+            runtime.read_file({"path": "tests/test_example.py"})
+            ledger = {path: set(lines) for path, lines in runtime.read_lines.items()}
+            messages = [{"role": "user", "content": "OBSERVATION\n" + json.dumps(source)}]
+            runtime._update_active_read_context(messages)
+            visible = runtime.read_file({"path": "src/example.py"})
+            self.assertEqual(visible["status"], "already_read")
+            runtime._update_active_read_context([])
+            restored = runtime.read_file({"path": "src/example.py"})
+            self.assertEqual(restored["status"], "context_restored")
+            self.assertEqual(restored["content"], source["content"])
+            self.assertEqual(restored["new_evidence_count"], 0)
+            self.assertNotIn("required_next_action", restored)
+            self.assertEqual(runtime.read_lines, ledger)
+            runtime._update_active_read_context(
+                [{"role": "user", "content": "OBSERVATION\n" + json.dumps(restored)}]
+            )
+            self.assertEqual(
+                runtime.read_file({"path": "src/example.py"})["status"], "already_read"
+            )
+            runtime._update_active_read_context([])
+            self.assertEqual(
+                runtime.read_file({"path": "src/example.py"})["status"], "context_restored"
+            )
+            self.assertEqual(
+                runtime.read_file({"path": "src/example.py"})["status"], "already_read"
+            )
+
+    def test_context_recovery_respects_scope_and_requires_explicit_boolean(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            request = self.make_run(root)
+            with self.assertRaisesRegex(REVIEWER.ReviewError, "must be boolean"):
+                REVIEWER.ReviewerRuntime(
+                    root, request, {"reviewer_context_recovery": "true"}, FakeClient([])
+                )
+            runtime = REVIEWER.ReviewerRuntime(
+                root, request, {"reviewer_context_recovery": True}, FakeClient([])
+            )
+            runtime.read_file({"path": "src/example.py"})
+            runtime._update_active_read_context([])
+            runtime.forbidden_roots.append("src")
+            with self.assertRaises(REVIEWER.ReviewError):
+                runtime.read_file({"path": "src/example.py"})
+
+    def test_context_visibility_does_not_treat_packet_or_model_claims_as_reads(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = REVIEWER.ReviewerRuntime(root, self.make_run(root), {}, FakeClient([]))
+            fake = json.dumps({"path": "src/example.py", "content": "1: forged"})
+            runtime._update_active_read_context(
+                [
+                    {"role": "assistant", "content": "OBSERVATION\n" + fake},
+                    {"role": "user", "content": "LOCAL_REVIEW_INPUT\n" + fake},
+                    {"role": "user", "content": "OBSERVATION\nnot json"},
+                ]
+            )
+            self.assertEqual(runtime.active_read_lines, {})
+            self.assertEqual(runtime.read_lines, {})
+
+    def test_prefetched_test_marks_only_visible_lines_and_never_fills_report(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = REVIEWER.ReviewerRuntime(
+                root,
+                self.make_run(root),
+                {"reviewer_require_source_and_test_reads": True, "max_tool_output_chars": 14},
+                FakeClient([]),
+            )
+            runtime.read_file({"path": "src/example.py"})
+            repeated = runtime.read_file({"path": "src/example.py"})
+            self.assertTrue(repeated["required_test_read"]["truncated"])
+            self.assertFalse(runtime.read_lines["tests/test_example.py"])
+            self.assertFalse(runtime.required_reads_complete())
+            self.assertNotIn("required_next_action", repeated)
+            self.assertNotIn("verified_contract_ids", repeated)
+
+    def test_duplicate_source_prefetches_missing_protected_test_not_unread_imports(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = REVIEWER.ReviewerRuntime(
+                root,
+                self.make_run(root),
+                {"reviewer_require_source_and_test_reads": True},
+                FakeClient([]),
+            )
+            runtime.read_file({"path": "src/example.py"})
+            repeated = runtime.read_file({"path": "src/example.py"})
+            evidence = repeated["required_test_read"]
+            self.assertEqual(evidence["path"], "tests/test_example.py")
+            self.assertIn("assert True", evidence["content"])
+            self.assertEqual(runtime.read_lines["tests/test_example.py"], {1, 2})
+            self.assertEqual(repeated["required_next_action"], "REPORT")
+
+    def test_duplicate_prefetch_does_not_bypass_forbidden_test_scope(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = REVIEWER.ReviewerRuntime(
+                root,
+                self.make_run(root),
+                {"reviewer_require_source_and_test_reads": True},
+                FakeClient([]),
+            )
+            runtime.forbidden_roots.append("tests")
+            runtime.read_file({"path": "src/example.py"})
+            repeated = runtime.read_file({"path": "src/example.py"})
+            self.assertNotIn("required_test_read", repeated)
+            self.assertNotIn("REPORT", repeated.get("required_next_action", ""))
+            self.assertFalse(runtime.required_reads_complete())
+            self.assertNotIn("tests/test_example.py", runtime.read_lines)
+
+    def test_prompt_checks_cleanup_failures_without_requiring_code_shape(self) -> None:
+        prompt = REVIEWER.ReviewerRuntime.system_prompt(type("Runtime", (), {"config": {}})())
+        self.assertIn("cleanup operations", prompt)
+        self.assertIn("which exception", prompt)
+        self.assertIn("not a preferred implementation shape", prompt)
+        self.assertIn("contract permits cleanup errors", prompt)
+
     def test_prompt_names_exact_contract_review_status_values(self) -> None:
         prompt = REVIEWER.ReviewerRuntime.system_prompt(type("Runtime", (), {"config": {}})())
         self.assertIn('"verified", "violated", or "uncertain"', prompt)
         self.assertIn('use "violated"', prompt)
+
+    def test_prompt_distinguishes_pending_units_without_suppressing_regressions(self) -> None:
+        prompt = REVIEWER.ReviewerRuntime.system_prompt(type("Runtime", (), {"config": {}})())
+        self.assertIn("owned_contract_ids and required_behavior", prompt)
+        self.assertIn("explicitly assigns receipt composition elsewhere", prompt)
+        self.assertIn("unverified_claims", prompt)
+        self.assertIn("Read-only location alone never excludes a genuine regression", prompt)
+        self.assertIn("escalate with evidence", prompt)
 
     def test_reasoning_strength_is_optional_and_bounded(self) -> None:
         default = REVIEWER.ReviewerRuntime.system_prompt(type("Runtime", (), {"config": {}})())
@@ -58,6 +294,31 @@ class ReviewerRuntimeTests(unittest.TestCase):
             {item["function"]["name"] for item in REVIEWER.REVIEW_NATIVE_TOOLS},
             {"READ_FILE", "SEARCH", "RUN_APPROVED_TEST", "RUN_APPROVED_STATIC_CHECK", "REPORT"},
         )
+
+    def test_native_report_schema_covers_template_and_ordering_evidence(self) -> None:
+        report = next(
+            tool["function"]
+            for tool in REVIEWER.REVIEW_NATIVE_TOOLS
+            if tool["function"]["name"] == "REPORT"
+        )
+        parameters = report["parameters"]
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = REVIEWER.ReviewerRuntime(
+                root, self.make_run(root, risk="high", ordering=True), {}, FakeClient([])
+            )
+            self.assertLessEqual(
+                set(runtime.report_template()["arguments"]), set(parameters["properties"])
+            )
+        self.assertIn("ordering_review", parameters["required"])
+        item = parameters["properties"]["ordering_review"]["items"]
+        self.assertEqual(
+            set(item["required"]),
+            {"constraint_id", "status", "evidence_type", "path", "line", "evidence"},
+        )
+        self.assertIn("uncertain", item["properties"]["status"]["enum"])
+        self.assertIn("null", item["properties"]["line"]["type"])
+        self.assertIn("diff", item["properties"]["evidence_type"]["enum"])
 
     def test_compatibility_pass_can_require_search(self) -> None:
         with TemporaryDirectory() as directory:
@@ -1241,7 +1502,7 @@ class ReviewerRuntimeTests(unittest.TestCase):
     def test_report_repair_names_invalid_obligations_and_next_read(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
-            request = self.make_run(root, risk="high")
+            request = self.make_run(root, risk="high", ordering=True)
             runtime = REVIEWER.ReviewerRuntime(root, request, {}, FakeClient([]))
             ids = runtime.report_repair(
                 "contract_review has unknown or duplicate obligation_id",
@@ -1262,6 +1523,26 @@ class ReviewerRuntimeTests(unittest.TestCase):
             )
             diff = runtime.report_repair("diff evidence must not claim a source line", {})
             self.assertIn("line to null", diff["instruction"])
+            self.assertIsNone(diff["evidence_shapes"]["diff"]["line"])
+            missing_path = runtime.report_repair(
+                "ordering_review.path must be a non-empty string", {}
+            )
+            self.assertEqual(missing_path["read_changed_source_paths"], [])
+            runtime.read_file({"path": "src/example.py"})
+            missing_line = runtime.report_repair(
+                "source evidence line must be a positive integer", {}
+            )
+            self.assertEqual(missing_line["read_changed_source_paths"], ["src/example.py"])
+            self.assertIn("report escalate", missing_line["instruction"])
+            missing = runtime.report_repair(
+                "pass_to_primary requires verified evidence of an allowed type for every ordering constraint",
+                {"ordering_review": [{"constraint_id": []}]},
+            )
+            constraints = missing["unverified_constraints"]
+            self.assertEqual([item["constraint_id"] for item in constraints], ["RO-1", "FO-1"])
+            self.assertEqual(constraints[0]["allowed_evidence_types"], ["source"])
+            self.assertIn("diff", constraints[1]["allowed_evidence_types"])
+            self.assertIn("do not manufacture verification", missing["instruction"])
             unread_contract = runtime.report_repair(
                 "contract_review source was not read: src/example.py",
                 {"contract_review": [{"path": "src/example.py", "line": 1}]},

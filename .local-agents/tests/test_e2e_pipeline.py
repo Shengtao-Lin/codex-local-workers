@@ -88,9 +88,14 @@ class ScriptedModel:
                 and message["content"].startswith("LOCAL_REVIEW_INPUT\n")
             )
             report = review_input["report_template_replace_evidence_before_use"]
+            # A real reviewer must choose a decision; the neutral shape is not
+            # itself a pass report. This scripted endpoint reviews CORRECT.
+            report["arguments"]["decision"] = "pass_to_primary"
+            report["arguments"]["verified_contract_ids"] = ["guard"]
             if report["arguments"]["contract_review"]:
                 report["arguments"]["contract_review"][0].update(
                     {
+                        "status": "verified",
                         "source_ref": {
                             "path": "src/division.py",
                             "start_line": 5,

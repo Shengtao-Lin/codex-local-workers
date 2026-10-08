@@ -28,6 +28,27 @@ class FakeClient:
         return next(self.responses)
 
 
+class JUnitDisplayedBindingTests(unittest.TestCase):
+    def test_bounded_actual_header_bindings_preserved_without_evaluation(self):
+        root = ET.fromstring(
+            '<testsuite><testcase name="invalid[True]"><failure message="Failed: DID NOT RAISE ValueError">width = True\nother = &quot;literal&quot;\n\nsource = must_not_be_captured\ntests/test_x.py:4: Failed</failure></testcase></testsuite>'
+        )
+        failure = RUNTIME.WorkerRuntime._junit_failures(root)[0]
+        self.assertEqual(
+            failure["displayed_bindings"],
+            [
+                {"name": "width", "representation": "True"},
+                {"name": "other", "representation": '"literal"'},
+            ],
+        )
+        oversized = "\n".join(f"arg{i} = " + "x" * 500 for i in range(8))
+        node = ET.fromstring('<testsuite><testcase name="x"><failure /></testcase></testsuite>')
+        node.find(".//failure").text = oversized
+        bindings = RUNTIME.WorkerRuntime._junit_failures(node)[0]["displayed_bindings"]
+        self.assertEqual(len(bindings), 4)
+        self.assertTrue(all(len(b["representation"]) <= 120 for b in bindings))
+
+
 class RawClient(FakeClient):
     def __init__(self, responses: list[str]) -> None:
         self.responses = iter(responses)
@@ -110,6 +131,479 @@ def packet_v2() -> dict:
 
 
 class WorkerRuntimeTests(unittest.TestCase):
+    def test_guarded_search_and_prefetch_preserve_repository_read_root(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            (root / "src/secret.py").write_text("VALUE = 'private'\n", encoding="utf-8")
+            (root / ".agent").mkdir()
+            (root / ".agent/secret.py").write_text("VALUE = 'excluded'\n", encoding="utf-8")
+            value = packet_v2()
+            value["scope"]["read"] = ["."]
+            runtime = RUNTIME.WorkerRuntime(root, value, {}, FakeClient([]))
+            self.assertEqual(
+                [
+                    x["path"]
+                    for x in runtime.search({"query": "VALUE", "case_sensitive": True})["results"]
+                ],
+                ["src/example.py"],
+            )
+            self.assertEqual(
+                [
+                    x["path"]
+                    for x in runtime._compact_repair_payload({"symbol": "VALUE"})["symbol_evidence"]
+                ],
+                ["src/example.py"],
+            )
+
+    def test_search_and_repair_scan_skip_reparse_files_and_directories(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            (root / "src/link.py").write_text("SCAN_TOKEN = 'linked-file'\n", encoding="utf-8")
+            (root / "src/junction").mkdir()
+            (root / "src/junction/other.py").write_text(
+                "SCAN_TOKEN = 'linked-dir'\n", encoding="utf-8"
+            )
+            (root / "src/example.py").write_text("SCAN_TOKEN = 'allowed'\n", encoding="utf-8")
+            runtime = RUNTIME.WorkerRuntime(root, packet_v2(), {}, FakeClient([]))
+            original = RUNTIME.SAFE_EDIT.is_reparse_point
+
+            def reparse(path):
+                return path.name in {"link.py", "junction"} or original(path)
+
+            with patch.object(RUNTIME.SAFE_EDIT, "is_reparse_point", side_effect=reparse):
+                search = runtime.search({"query": "SCAN_TOKEN"})
+                repair = runtime._compact_repair_payload({"symbol": "SCAN_TOKEN"})
+            self.assertEqual([p["path"] for p in search["results"]], ["src/example.py"])
+            self.assertEqual([p["path"] for p in repair["symbol_evidence"]], ["src/example.py"])
+
+    def test_repair_prefetch_never_reads_forbidden_source_or_symbol_evidence(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            (root / "src/secret.py").write_text(
+                "PRIVATE_TOKEN = 'do-not-disclose'\n", encoding="utf-8"
+            )
+            (root / "src/example.py").write_text("PUBLIC_TOKEN = 2\n", encoding="utf-8")
+            runtime = RUNTIME.WorkerRuntime(root, packet_v2(), {}, FakeClient([]))
+            original_guard = runtime._assert_read_allowed
+            seen = []
+
+            def guard(path):
+                seen.append(path)
+                return original_guard(path)
+
+            with patch.object(runtime, "_assert_read_allowed", side_effect=guard):
+                result = runtime._compact_repair_payload(
+                    {"symbol": "PRIVATE_TOKEN", "candidate_edit_paths": ["src/example.py"]}
+                )
+            self.assertNotIn("do-not-disclose", json.dumps(result))
+            self.assertEqual(result["symbol_evidence"], [])
+            self.assertIn("src/secret.py", seen)
+            allowed = runtime._compact_repair_payload({"symbol": "PUBLIC_TOKEN"})
+            self.assertEqual(allowed["symbol_evidence"][0]["path"], "src/example.py")
+
+    def test_repair_prefetch_test_evidence_honors_scope_read_guard(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            runtime = RUNTIME.WorkerRuntime(root, packet_v2(), {}, FakeClient([]))
+            runtime.validation = RUNTIME.ValidationResult(
+                "failed",
+                {},
+                {
+                    "diagnostic": {
+                        "failures": [
+                            {
+                                "test": "test_example",
+                                "location": "tests/test_example.py:1",
+                                "message": "failed",
+                            }
+                        ]
+                    }
+                },
+                None,
+            )
+            with patch.object(
+                runtime, "_assert_read_allowed", side_effect=RUNTIME.WorkerError("blocked read")
+            ):
+                payload = runtime._compact_repair_payload(
+                    {"candidate_edit_paths": ["src/example.py"]}
+                )
+            self.assertEqual(payload["source_excerpts"], [])
+            self.assertEqual(payload["test_evidence"], [])
+
+    def test_prompt_examples_match_canonical_action_schema_with_legacy_parsing_preserved(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            runtime = RUNTIME.WorkerRuntime(root, packet_v2(), {}, FakeClient([]))
+            prompt = runtime.system_prompt()
+            self.assertNotIn("flat JSON object", prompt)
+            examples = []
+            for line in prompt.splitlines():
+                candidate = line.strip().removeprefix("Example: ").removesuffix(".")
+                if candidate.startswith('{"action":'):
+                    example = json.loads(candidate)
+                    self.assertEqual(set(example), {"action", "arguments"})
+                    self.assertIsInstance(example["arguments"], dict)
+                    self.assertIn(
+                        example["action"],
+                        RUNTIME.CODER_ACTION_SCHEMA["properties"]["action"]["enum"],
+                    )
+                    canonical = RUNTIME.parse_action(json.dumps(example))
+                    legacy = RUNTIME.parse_action(
+                        json.dumps({"action": example["action"], **example["arguments"]})
+                    )
+                    self.assertEqual(canonical["action"], legacy["action"])
+                    self.assertEqual(canonical["arguments"], legacy["arguments"])
+                    examples.append(example)
+            self.assertEqual(len(examples), 2)
+
+    def test_real_focused_timeout_is_archived_once_and_not_reexecuted(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            (root / "tests/test_example.py").write_text(
+                "import time\nfrom pathlib import Path\nPath('started.flag').write_text('yes')\ntime.sleep(4)\ndef test_wait():\n    assert True\n",
+                encoding="utf-8",
+            )
+            runtime = RUNTIME.WorkerRuntime(
+                root,
+                packet_v2(),
+                {
+                    "python": sys.executable,
+                    "command_timeout_seconds": 2,
+                    "invocation_timeout_seconds": 30,
+                },
+                FakeClient([]),
+            )
+            runtime.write_lock.acquire()
+            try:
+                runtime._prepare_run_archive()
+                result = runtime.validate({})
+                self.assertEqual(result["status"], "failed")
+                self.assertTrue(runtime.validation.focused_tests["timed_out"])
+                self.assertTrue((root / "started.flag").exists())
+                self.assertEqual(len(runtime.validation_refs), 1)
+                previous = runtime.validation_refs[0]
+                with patch.object(runtime, "_run_command") as command:
+                    with self.assertRaisesRegex(
+                        RUNTIME.WorkerError, "previous focused tests timed out"
+                    ):
+                        runtime.validate({})
+                    command.assert_not_called()
+                self.assertEqual(runtime.validation_refs, [previous])
+                self.assertEqual(runtime.validation.status, "failed")
+            finally:
+                runtime.close()
+
+    def test_unchanged_timed_out_validation_refused_before_command(self):
+        for phase in ("check", "final"):
+            with self.subTest(phase=phase), TemporaryDirectory() as directory:
+                root = Path(directory)
+                self.make_tree(root)
+                runtime = RUNTIME.WorkerRuntime(
+                    root, packet_v2(), {"python": sys.executable}, FakeClient([])
+                )
+                runtime.write_lock.acquire()
+                try:
+                    runtime._prepare_run_archive()
+                    runtime.validation = RUNTIME.ValidationResult(
+                        "failed",
+                        {"status": "passed"},
+                        {
+                            "status": "failed",
+                            "timed_out": True,
+                            "inputs_unchanged": True,
+                            "input_facts": runtime._validation_facts(),
+                        },
+                        None,
+                    )
+                    before = runtime.validation_count
+                    with patch.object(runtime, "_run_command") as command:
+                        with self.assertRaisesRegex(
+                            RUNTIME.WorkerError, "previous focused tests timed out"
+                        ):
+                            runtime.validate({"phase": phase})
+                        command.assert_not_called()
+                    self.assertEqual(runtime.validation_count, before)
+                    self.assertEqual(runtime.validation_refs, [])
+                    observation = runtime._validation_observation(runtime.validation)
+                    self.assertTrue(observation["focused_tests"]["timed_out"])
+                    self.assertIn("unchanged", observation["retry_constraint"])
+                finally:
+                    runtime.close()
+
+    def test_timeout_retry_allowed_after_changed_inputs_or_for_other_failure(self):
+        for change in ("source", "test", "not_timeout", "inputs_changed_during_validation"):
+            with self.subTest(change=change), TemporaryDirectory() as directory:
+                root = Path(directory)
+                self.make_tree(root)
+                runtime = RUNTIME.WorkerRuntime(
+                    root, packet_v2(), {"python": sys.executable}, FakeClient([])
+                )
+                runtime.write_lock.acquire()
+                try:
+                    runtime._prepare_run_archive()
+                    runtime.validation = RUNTIME.ValidationResult(
+                        "failed",
+                        {"status": "passed"},
+                        {
+                            "status": "failed",
+                            "timed_out": True,
+                            "inputs_unchanged": True,
+                            "input_facts": runtime._validation_facts(),
+                        },
+                        None,
+                    )
+                    if change == "source":
+                        (root / "src/example.py").write_text("VALUE = 2\n", encoding="utf-8")
+                    elif change == "test":
+                        path = root / "tests/test_example.py"
+                        path.write_text(
+                            path.read_text(encoding="utf-8")
+                            + "\n# Primary revised diagnostic fixture\n",
+                            encoding="utf-8",
+                        )
+                    elif change == "not_timeout":
+                        runtime.validation.focused_tests["timed_out"] = False
+                    else:
+                        runtime.validation.focused_tests["inputs_unchanged"] = False
+                    with patch.object(
+                        runtime, "_run_command", side_effect=RuntimeError("command reached")
+                    ):
+                        with self.assertRaisesRegex(RuntimeError, "command reached"):
+                            runtime.validate({})
+                finally:
+                    runtime.close()
+
+    def test_v13_truthful_diagnostic_is_not_submission(self) -> None:
+        for acknowledgement in (False, None):
+            with self.subTest(acknowledgement=acknowledgement), TemporaryDirectory() as directory:
+                root = Path(directory)
+                self.make_tree(root)
+                value = packet_v2()
+                value["contract_check_required"] = True
+                value["required_order"] = ["read before write"]
+                value["forbidden_orderings"] = ["write before read"]
+                runtime = RUNTIME.WorkerRuntime(
+                    root, value, {"python": sys.executable}, FakeClient([])
+                )
+                runtime.write_lock.acquire()
+                try:
+                    runtime._prepare_run_archive()
+                    check = runtime.contract_check_template()
+                    check["required_order_confirmed"] = acknowledgement
+                    check["forbidden_orderings_absent"] = acknowledgement
+                    result = runtime.validate({"phase": "check", "contract_check": check})
+                    self.assertEqual(result["status"], "passed")
+                    self.assertIs(
+                        runtime.validation.contract_check["required_order_confirmed"],
+                        acknowledgement,
+                    )
+                    self.assertFalse(runtime._validated_terminal_state())
+                    with self.assertRaises(RUNTIME.WorkerError):
+                        runtime.execute(
+                            {"action": "FINISH_SUCCESS", "arguments": {"summary": ["done"]}}
+                        )
+                    with self.assertRaises(RUNTIME.WorkerError):
+                        runtime.validate({"phase": "final", "contract_check": check})
+                    self.assertEqual(runtime.validation_count, 1)
+                finally:
+                    runtime.close()
+
+    def test_v13_green_original_cannot_finish_an_unimplemented_goal(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            runtime = RUNTIME.WorkerRuntime(
+                root, packet(), {"python": sys.executable}, FakeClient([])
+            )
+            runtime.write_lock.acquire()
+            try:
+                runtime._prepare_run_archive()
+                self.assertEqual(runtime.validate({"phase": "final"})["status"], "passed")
+                self.assertFalse(runtime._validated_terminal_state())
+                with self.assertRaises(RUNTIME.WorkerError):
+                    runtime.execute(
+                        {"action": "FINISH_SUCCESS", "arguments": {"summary": ["done"]}}
+                    )
+            finally:
+                runtime.close()
+
+    def test_v13_baseline_does_not_spend_two_post_implementation_repairs(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            (root / "tests/test_example.py").write_text(
+                "from src.example import VALUE\ndef test_value():\n    assert VALUE == 2\n",
+                encoding="utf-8",
+            )
+            runtime = RUNTIME.WorkerRuntime(
+                root, packet(), {"python": sys.executable}, FakeClient([])
+            )
+            runtime.write_lock.acquire()
+            try:
+                runtime._prepare_run_archive()
+                self.assertEqual(runtime.validate({})["status"], "failed")
+                self.assertEqual(runtime.validate({})["status"], "failed")
+
+                def edit(old: int, new: int) -> dict:
+                    observed = runtime.read_file({"path": "src/example.py"})
+                    return runtime.safe_replace(
+                        {
+                            "path": "src/example.py",
+                            "expected_sha256": observed["sha256"],
+                            "find": f"VALUE = {old}",
+                            "replace": f"VALUE = {new}",
+                        }
+                    )
+
+                self.assertFalse(edit(1, 3)["repair_edit"])
+                self.assertEqual(runtime.repairs, 0)
+                self.assertFalse(runtime.pending_failed_validation)
+                self.assertEqual(runtime.validate({})["status"], "failed")
+                self.assertTrue(edit(3, 4)["repair_edit"])
+                self.assertFalse(edit(4, 5)["repair_edit"])
+                self.assertEqual(runtime.repairs, 1)
+                self.assertEqual(runtime.validate({})["status"], "failed")
+                self.assertTrue(edit(5, 6)["repair_edit"])
+                self.assertEqual(runtime.repairs, 2)
+                self.assertEqual(runtime.validate({})["status"], "failed")
+                with self.assertRaisesRegex(RUNTIME.WorkerError, "budget is exhausted"):
+                    edit(6, 7)
+                self.assertEqual((root / "src/example.py").read_text(), "VALUE = 6\n")
+                self.assertEqual(len(runtime.validation_refs), 5)
+            finally:
+                runtime.close()
+
+    def test_v13_inherited_run_cannot_claim_fresh_baseline_budget(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            value = packet_v2()
+            value["parent_run_id"] = "previous-draft"
+            runtime = RUNTIME.WorkerRuntime(root, value, {"python": sys.executable}, FakeClient([]))
+            runtime.write_lock.acquire()
+            try:
+                runtime.pending_failed_validation = True
+                observed = runtime.read_file({"path": "src/example.py"})
+                result = runtime.safe_replace(
+                    {
+                        "path": "src/example.py",
+                        "expected_sha256": observed["sha256"],
+                        "find": "VALUE = 1",
+                        "replace": "VALUE = 2",
+                    }
+                )
+                self.assertTrue(result["repair_edit"])
+                self.assertEqual(runtime.repairs, 1)
+            finally:
+                runtime.close()
+
+    def test_green_baseline_allows_edit_and_legacy_finish_requires_current_check(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            (root / "tests/test_example.py").write_text(
+                "from src.example import VALUE\n\ndef test_value():\n    assert VALUE in (1, 2)\n",
+                encoding="utf-8",
+            )
+            runtime = RUNTIME.WorkerRuntime(
+                root, packet(), {"python": sys.executable}, FakeClient([])
+            )
+            runtime.write_lock.acquire()
+            try:
+                runtime._prepare_run_archive()
+                observed = runtime.read_file({"path": "src/example.py"})
+                result = runtime.validate({})
+                self.assertEqual(result["status"], "passed", result)
+                baseline_archive = json.loads(
+                    (runtime.archive.run_root / "validation-attempt-1.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                self.assertEqual(baseline_archive["phase"], "check")
+                self.assertFalse(runtime._validated_terminal_state())
+                runtime.safe_replace(
+                    {
+                        "path": "src/example.py",
+                        "expected_sha256": observed["sha256"],
+                        "find": "VALUE = 1",
+                        "replace": "VALUE = 2",
+                    }
+                )
+                with self.assertRaises(RUNTIME.WorkerError):
+                    runtime.execute(
+                        {"action": "FINISH_SUCCESS", "arguments": {"summary": ["done"]}}
+                    )
+                self.assertEqual(runtime.validate({})["status"], "passed")
+                _, report = runtime.execute(
+                    {"action": "FINISH_SUCCESS", "arguments": {"summary": ["done"]}}
+                )
+                self.assertEqual(report["status"], "ready_for_review")
+                (root / "src/example.py").write_text("VALUE = 3\n", encoding="utf-8")
+                self.assertFalse(runtime._validated_terminal_state())
+                with self.assertRaises(RUNTIME.WorkerError):
+                    runtime.execute(
+                        {"action": "FINISH_SUCCESS", "arguments": {"summary": ["done"]}}
+                    )
+            finally:
+                runtime.close()
+
+    def test_final_validation_archive_records_final_only_after_passing(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            (root / "tests/test_example.py").write_text(
+                "from src.example import VALUE\n\ndef test_value():\n    assert VALUE == 2\n",
+                encoding="utf-8",
+            )
+            runtime = RUNTIME.WorkerRuntime(
+                root, packet(), {"python": sys.executable}, FakeClient([])
+            )
+            runtime.write_lock.acquire()
+            try:
+                runtime._prepare_run_archive()
+                self.assertEqual(runtime.validate({"phase": "final"})["status"], "failed")
+                observed = runtime.read_file({"path": "src/example.py"})
+                runtime.safe_replace(
+                    {
+                        "path": "src/example.py",
+                        "expected_sha256": observed["sha256"],
+                        "find": "VALUE = 1",
+                        "replace": "VALUE = 2",
+                    }
+                )
+                self.assertEqual(runtime.validate({"phase": "final"})["status"], "passed")
+                self.assertTrue(runtime._validated_terminal_state())
+                phases = [
+                    json.loads(
+                        (runtime.archive.run_root / f"validation-attempt-{number}.json").read_text(
+                            encoding="utf-8"
+                        )
+                    )["phase"]
+                    for number in (1, 2)
+                ]
+                self.assertEqual(phases, ["check", "final"])
+            finally:
+                runtime.close()
+
+    def test_invalid_final_phase_does_not_promote_old_success(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            runtime = RUNTIME.WorkerRuntime(
+                root, packet_v2(), {"python": sys.executable}, FakeClient([])
+            )
+            for phase in ([], True, "unknown"):
+                with self.assertRaises(RUNTIME.WorkerError):
+                    runtime.validate({"phase": phase})
+            self.assertFalse(runtime._validated_terminal_state())
+            self.assertEqual(runtime.validation_count, 0)
+
     def test_multiline_line_edit_hint_is_observed_version_bound_and_never_executes(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -182,6 +676,8 @@ class WorkerRuntimeTests(unittest.TestCase):
     def test_prompt_distinguishes_fresh_prevalidation_from_inherited_rework(self) -> None:
         prompt = RUNTIME.WorkerRuntime.system_prompt(None)
         self.assertIn("For a fresh unit", prompt)
+        self.assertIn("observed failure, not the expected outcome", prompt)
+        self.assertIn("protected test assertion and packet contract", prompt)
         self.assertIn("validated input\nhashes still match", prompt)
         self.assertIn("If the parent edited after its\nlast failed validation", prompt)
         self.assertIn("then edit before\nanother VALIDATE", prompt)
@@ -240,6 +736,36 @@ class WorkerRuntimeTests(unittest.TestCase):
             self.assertLess(
                 json.dumps(observation).index('"repair_focus"'),
                 json.dumps(observation).index('"focused_tests"'),
+            )
+
+    def test_grouped_failure_examples_keep_bindings_in_compact_evidence(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            runtime = RUNTIME.WorkerRuntime(
+                root, packet_v2(), {"python": sys.executable}, FakeClient([])
+            )
+            failures = [
+                {
+                    "test": f"test_invalid[{value}]",
+                    "message": "Failed: DID NOT RAISE ValueError",
+                    "location": "tests/test_example.py:1: Failed",
+                    "displayed_bindings": [{"name": "width", "representation": value}],
+                }
+                for value in ("True", "False")
+            ]
+            focused = {"diagnostic": {"failures": failures}}
+            runtime.validation = RUNTIME.ValidationResult("failed", {"status": "passed"}, focused)
+            focus = runtime._failed_test_repair_focus(focused)[0]
+            self.assertEqual(focus["test_count"], 2)
+            self.assertEqual(
+                [e["displayed_bindings"][0]["representation"] for e in focus["failure_examples"]],
+                ["True", "False"],
+            )
+            payload = runtime._compact_repair_payload(focus)
+            self.assertEqual(len(payload["test_evidence"]), 2)
+            self.assertEqual(
+                payload["test_evidence"][0]["displayed_bindings"], failures[0]["displayed_bindings"]
             )
 
     def test_name_error_focus_identifies_verified_type_checking_import(self) -> None:
@@ -591,13 +1117,13 @@ class WorkerRuntimeTests(unittest.TestCase):
                 }
             }
             focus = runtime._failed_test_repair_focus(focused)[0]
-            self.assertEqual(focus["candidate_edit_paths"], ["src/second.py"])
-            self.assertEqual(focus["required_path"], "src/second.py")
-            self.assertEqual(focus["path"], "src/second.py")
             self.assertEqual(
-                focus["expected_sha256_by_path"],
-                {"src/second.py": "b" * 64},
+                set(focus["candidate_edit_paths"]), {"src/example.py", "src/second.py"}
             )
+            self.assertNotIn("required_path", focus)
+            self.assertEqual(focus["suggested_path"], "src/second.py")
+            self.assertTrue(focus["suggestion_is_advisory"])
+            self.assertEqual(focus["expected_sha256_by_path"]["src/example.py"], "a" * 64)
 
     def test_failed_test_symbol_selects_matching_edit_target_and_narrow_excerpt(self) -> None:
         with TemporaryDirectory() as directory:
@@ -1399,6 +1925,88 @@ class WorkerRuntimeTests(unittest.TestCase):
             )
             self.assertEqual(snapshot["validation"]["status"], "failed")
 
+    def test_invalid_validation_does_not_release_draft_gate(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            value = packet_v2()
+            value["contract_check_required"] = True
+            runtime = RUNTIME.WorkerRuntime(root, value, {"python": sys.executable}, FakeClient([]))
+            try:
+                runtime.noop_validation_pending = True
+                with self.assertRaisesRegex(RUNTIME.WorkerError, "contract_check"):
+                    runtime.validate({})
+                self.assertTrue(runtime.noop_validation_pending)
+                self.assertEqual(runtime.validation_count, 0)
+            finally:
+                runtime.close()
+
+    def test_mismatch_after_edit_requires_current_draft_validation(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            (root / "tests/test_example.py").write_text(
+                "import runpy\n\ndef test_value():\n    assert runpy.run_path('src/example.py')['VALUE'] == 2\n",
+                encoding="utf-8",
+            )
+            original_bytes = (root / "src/example.py").read_bytes()
+            before = RUNTIME.SAFE_EDIT.sha256_bytes(original_bytes)
+            after = RUNTIME.SAFE_EDIT.sha256_bytes(
+                original_bytes.replace(b"VALUE = 1", b"VALUE = 2")
+            )
+            client = FakeClient(
+                [
+                    {"action": "READ_FILE", "arguments": {"path": "src/example.py"}},
+                    {
+                        "action": "SAFE_REPLACE",
+                        "arguments": {
+                            "path": "src/example.py",
+                            "expected_sha256": before,
+                            "find": "VALUE = 1",
+                            "replace": "VALUE = 2",
+                        },
+                    },
+                    {
+                        "action": "SAFE_REPLACE",
+                        "arguments": {
+                            "path": "src/example.py",
+                            "expected_sha256": after,
+                            "find": "VALUE = 999",
+                            "replace": "VALUE = 3",
+                        },
+                    },
+                    {
+                        "action": "SAFE_REPLACE",
+                        "arguments": {
+                            "path": "src/example.py",
+                            "expected_sha256": after,
+                            "find": "VALUE = 2",
+                            "replace": "VALUE = 3",
+                        },
+                    },
+                    {"action": "VALIDATE", "arguments": {}},
+                    {
+                        "action": "FINISH_SUCCESS",
+                        "arguments": {"summary": ["Validated."], "remaining_uncertainty": []},
+                    },
+                ]
+            )
+            runtime = RUNTIME.WorkerRuntime(root, packet(), {"python": sys.executable}, client)
+            report = runtime.run()
+            self.assertEqual(report["status"], "ready_for_review", json.dumps(report))
+            self.assertEqual(runtime.validation_count, 1)
+            self.assertEqual((root / "src/example.py").read_text(), "VALUE = 2\n")
+            mismatch_observation = json.loads(
+                client.messages_seen[3][-1]["content"].split("\n", 1)[1]
+            )
+            self.assertEqual(mismatch_observation["required_next_action"], "VALIDATE")
+            self.assertTrue(
+                mismatch_observation["edit_repair"]["current_lines_are_navigation_only"]
+            )
+            self.assertEqual(
+                mismatch_observation["edit_repair"]["suggested_action"]["action"], "READ_FILE"
+            )
+
     def test_replace_mismatch_rejects_large_retry_and_reports_quality_lines(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1820,7 +2428,7 @@ class WorkerRuntimeTests(unittest.TestCase):
             report = RUNTIME.WorkerRuntime(root, value, {"python": sys.executable}, client).run()
             self.assertEqual(report["protocol_error_count"], 1)
             feedback = json.loads(client.messages_seen[1][-1]["content"].split("\n", 1)[1])
-            self.assertIn("must be boolean true", feedback["error"])
+            self.assertIn("must be boolean or null", feedback["error"])
             template = feedback["validate_repair"]["example"]["arguments"]["contract_check"]
             self.assertIs(template["forbidden_orderings_absent"], True)
             self.assertEqual(template["required_behavior_ids"], ["behavior-value"])
@@ -1977,6 +2585,9 @@ class WorkerRuntimeTests(unittest.TestCase):
     def test_validated_terminal_gate_rejects_then_finalizes(self) -> None:
         class TerminalDriftClient(AdaptiveSuccessClient):
             def complete(self, messages: list[dict[str, str]]) -> str:
+                if self.step == 2:
+                    self.step += 1
+                    return json.dumps({"action": "VALIDATE", "arguments": {"phase": "final"}})
                 if self.step == 3:
                     self.step += 1
                     return json.dumps(
@@ -2362,11 +2973,45 @@ class WorkerRuntimeTests(unittest.TestCase):
         )
         self.assertNotIn("response_format", captured["body"])
         self.assertEqual(captured["body"]["tool_choice"], "auto")
+        self.assertIs(captured["body"]["parallel_tool_calls"], False)
         self.assertEqual(client.last_request_stats["native_tool_call"], "READ_FILE")
         client.native_tool_choice = "required"
         with patch.object(RUNTIME.urllib.request, "urlopen", side_effect=fake_urlopen):
             client.complete([{"role": "user", "content": "report now"}])
         self.assertEqual(captured["body"]["tool_choice"], "required")
+
+    def test_native_schema_cost_blocks_oversized_request_before_http(self) -> None:
+        tools = [{"type": "function", "function": {"name": "READ_FILE", "description": "x" * 5000}}]
+        client = RUNTIME.LMStudioClient(
+            "http://localhost:1234/v1",
+            "reviewer",
+            native_tools=tools,
+            context_length=1200,
+            max_tokens=100,
+            context_safety_margin=100,
+        )
+        with patch.object(RUNTIME.urllib.request, "urlopen") as send:
+            with self.assertRaises(RUNTIME.ModelRequestError) as caught:
+                client.complete([{"role": "user", "content": "small"}])
+        send.assert_not_called()
+        self.assertEqual(caught.exception.reason_code, "input_too_large")
+        self.assertGreater(client.last_request_stats["native_schema_chars"], 5000)
+        self.assertGreater(client.last_request_stats["estimated_input_tokens"], 1200)
+
+    def test_native_parallel_response_still_fails_closed(self) -> None:
+        call = {"type": "function", "function": {"name": "READ_FILE", "arguments": "{}"}}
+        payload = {"choices": [{"message": {"tool_calls": [call, call]}}]}
+        client = RUNTIME.LMStudioClient(
+            "http://localhost:1234/v1",
+            "reviewer",
+            native_tools=[call],
+        )
+        with patch.object(
+            RUNTIME.urllib.request, "urlopen", return_value=io.BytesIO(json.dumps(payload).encode())
+        ):
+            with self.assertRaisesRegex(RUNTIME.WorkerError, "exactly one"):
+                client.complete([{"role": "user", "content": "act"}])
+        self.assertNotIn("native_tool_call", client.last_request_stats)
 
     def test_lmstudio_client_preserves_bounded_http_error_body(self) -> None:
         client = RUNTIME.LMStudioClient("http://localhost:1234/v1", "reviewer")
@@ -2931,6 +3576,185 @@ class WorkerRuntimeTests(unittest.TestCase):
             self.assertEqual(issues[0]["code"], "introduced_trailing_whitespace")
             self.assertEqual(issues[0]["line"], 2)
 
+    def test_diff_whitespace_preparation_is_opt_in_and_requires_trusted_profile(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            runtime = RUNTIME.WorkerRuntime(root, packet_v2(), {}, FakeClient([]))
+            runtime.changed["src/example.py"] = {"operation": "modified"}
+            issue = {"code": "introduced_trailing_whitespace", "path": "src/example.py"}
+            command = {
+                "id": "ruff-format",
+                "argv": ["{python}", "-m", "ruff", "format", "--check", "src"],
+            }
+            profile = {"commands": [command]}
+
+            def eligible(issues, selected):
+                return runtime._diff_whitespace_autoformat_eligible(
+                    issues, selected, Path(sys.executable)
+                )
+
+            self.assertFalse(eligible([issue], profile))
+            runtime.config["autoformat_on_diff_whitespace"] = "true"
+            self.assertFalse(eligible([issue], profile))
+            runtime.config["autoformat_on_diff_whitespace"] = True
+            self.assertTrue(eligible([issue], profile))
+            self.assertFalse(eligible([], profile))
+            self.assertFalse(eligible([issue], {"commands": []}))
+            self.assertFalse(eligible([issue], {"commands": [{**command, "id": "custom"}]}))
+            self.assertFalse(eligible([issue], {"commands": [{**command, "argv": ["ruff"]}]}))
+            self.assertFalse(eligible([{**issue, "path": "tests/test_example.py"}], profile))
+            self.assertFalse(
+                eligible([{**issue, "code": "introduced_unreachable_duplicate_raise"}], profile)
+            )
+            runtime.autoformat_used = True
+            self.assertFalse(eligible([issue], profile))
+
+    def test_diff_whitespace_preparation_revalidates_and_never_hides_failed_tests(self):
+        for outcome in ("pass", "fail", "no-change", "unexpected-change"):
+            with self.subTest(outcome=outcome), TemporaryDirectory() as directory:
+                root = Path(directory)
+                self.make_tree(root)
+                config = {
+                    "autoformat_on_diff_whitespace": True,
+                    "validation_profiles": {
+                        "python-focused": {
+                            "python": sys.executable,
+                            "commands": [
+                                {
+                                    "id": "ruff-format",
+                                    "argv": [
+                                        "{python}",
+                                        "-m",
+                                        "ruff",
+                                        "format",
+                                        "--check",
+                                        "src",
+                                        "tests",
+                                    ],
+                                }
+                            ],
+                        }
+                    },
+                }
+                runtime = RUNTIME.WorkerRuntime(root, packet_v2(), config, FakeClient([]))
+                runtime.write_lock.acquire()
+                target = root / "src/example.py"
+                protected = root / "tests/test_example.py"
+                before = protected.read_bytes()
+                calls = []
+
+                def command(argv):
+                    calls.append(argv)
+                    if argv[1:4] == ["-m", "ruff", "format"] and "--check" not in argv:
+                        self.assertEqual(argv[4:], ["src/example.py"])
+                        if outcome != "no-change":
+                            target.write_text("VALUE = 2\n", encoding="utf-8")
+                        if outcome == "unexpected-change":
+                            protected.write_text("# changed protected input\n", encoding="utf-8")
+                    junit = next((a for a in argv if a.startswith("--junitxml=")), None)
+                    failed = outcome == "fail" and junit is not None
+                    if junit:
+                        Path(junit.split("=", 1)[1]).write_text(
+                            '<testsuites><testsuite tests="1" failures="'
+                            + str(int(failed))
+                            + '" errors="0" skipped="0"><testcase name="boundary">'
+                            + ('<failure message="semantic mismatch"/>' if failed else "")
+                            + "</testcase></testsuite></testsuites>",
+                            encoding="utf-8",
+                        )
+                    return {
+                        "status": "failed" if failed else "passed",
+                        "exit_code": int(failed),
+                        "output": "semantic mismatch" if failed else "ok",
+                        "argv": argv,
+                    }
+
+                try:
+                    runtime._prepare_run_archive()
+                    observed = runtime.read_file({"path": "src/example.py"})
+                    edit = runtime.safe_replace(
+                        {
+                            "path": "src/example.py",
+                            "expected_sha256": observed["sha256"],
+                            "find": "VALUE = 1\n",
+                            "replace": "VALUE = 2  \n",
+                        }
+                    )
+                    self.assertIn("VALIDATE", edit["next_step"])
+                    with patch.object(runtime, "_run_command", side_effect=command):
+                        if outcome == "unexpected-change":
+                            with self.assertRaises(RUNTIME.PolicyViolation):
+                                runtime.validate({"phase": "final"})
+                            self.assertFalse(runtime._validated_terminal_state())
+                            continue
+                        result = runtime.validate({"phase": "final"})
+                    self.assertEqual(result["status"], "passed" if outcome == "pass" else "failed")
+                    self.assertEqual(runtime._validated_terminal_state(), outcome == "pass")
+                    first = json.loads((root / runtime.validation_refs[0]).read_text())
+                    self.assertEqual(first["validation"]["quality_gate"]["stage"], "diff_quality")
+                    self.assertEqual(first["phase"], "check")
+                    self.assertEqual(
+                        len(runtime.validation_refs), 1 if outcome == "no-change" else 2
+                    )
+                    self.assertEqual(protected.read_bytes(), before)
+                    self.assertEqual(
+                        sum(
+                            a[1:4] == ["-m", "ruff", "format"] and "--check" not in a for a in calls
+                        ),
+                        1,
+                    )
+                    if outcome != "no-change":
+                        self.assertTrue(
+                            any(any(a.startswith("--junitxml=") for a in argv) for argv in calls)
+                        )
+                        self.assertEqual(runtime.edit_revision, 2)
+                finally:
+                    runtime.close()
+
+    def test_real_formatter_preserves_significant_string_whitespace_and_gate(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            runtime = RUNTIME.WorkerRuntime(
+                root,
+                packet_v2(),
+                {
+                    "autoformat_on_diff_whitespace": True,
+                    "validation_profiles": {
+                        "python-focused": {
+                            "python": sys.executable,
+                            "commands": [
+                                {
+                                    "id": "ruff-format",
+                                    "argv": ["{python}", "-m", "ruff", "format", "--check", "src"],
+                                }
+                            ],
+                        }
+                    },
+                },
+                FakeClient([]),
+            )
+            runtime.write_lock.acquire()
+            try:
+                runtime._prepare_run_archive()
+                observed = runtime.read_file({"path": "src/example.py"})
+                runtime.safe_replace(
+                    {
+                        "path": "src/example.py",
+                        "expected_sha256": observed["sha256"],
+                        "find": "VALUE = 1\n",
+                        "replace": 'VALUE = """first  \nsecond"""\n',
+                    }
+                )
+                result = runtime.validate({})
+                self.assertEqual(result["status"], "failed")
+                self.assertIn("first  \nsecond", (root / "src/example.py").read_text())
+                self.assertTrue(runtime.autoformat_used)
+                self.assertFalse(runtime._validated_terminal_state())
+            finally:
+                runtime.close()
+
     def test_diff_quality_gate_blocks_new_duplicate_unreachable_raise(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -3026,6 +3850,20 @@ class WorkerRuntimeTests(unittest.TestCase):
             self.assertEqual(trace["changed_paths"], ["src/example.py"])
             self.assertEqual(trace["failed_test_ids"], ["tests/test_example.py::test_value"])
             self.assertEqual(trace["last_protocol_error"], "safe_replace_target_missing")
+            self.assertEqual(resolved["_inheritance"]["parent_input_state"]["status"], "unknown")
+            self.make_tree(root)
+            RUNTIME.RUN_STATE.write_json_once(
+                parent_path.with_name("post-state.json"),
+                {"validation_inputs": RUNTIME.RUN_STATE.facts_for_paths(root, ["src/example.py"])},
+            )
+            unchanged = RUNTIME.resolve_inherited_packet(root, child)
+            self.assertEqual(unchanged["_inheritance"]["parent_input_state"]["status"], "unchanged")
+            (root / "src/example.py").write_text("VALUE = 9\n", encoding="utf-8")
+            drifted = RUNTIME.resolve_inherited_packet(root, child)
+            self.assertEqual(
+                drifted["_inheritance"]["parent_input_state"]["drifted_paths"], ["src/example.py"]
+            )
+            self.assertFalse(drifted["_inheritance"]["parent_input_state"]["validation_reusable"])
 
     def test_contract_check_and_changed_test_quality_gate(self) -> None:
         with TemporaryDirectory() as directory:
@@ -3100,6 +3938,7 @@ class WorkerRuntimeTests(unittest.TestCase):
             )
             runtime.write_lock.acquire()
             try:
+                runtime.edit_revision = 1
                 runtime.pending_failed_validation = True
                 _, digest = runtime.editor.read_bytes("src/example.py")
                 observation = runtime.safe_replace(
@@ -3130,6 +3969,8 @@ class WorkerRuntimeTests(unittest.TestCase):
             runtime.edit_revision = 2
             runtime.validated_revision = 2
             runtime.validated_input_facts = runtime._validation_facts()
+            self.assertFalse(runtime._validated_terminal_state())
+            runtime.validation_phase = "final"
             self.assertTrue(runtime._validated_terminal_state())
             runtime.edit_revision = 3
             self.assertFalse(runtime._validated_terminal_state())
@@ -3151,6 +3992,105 @@ class WorkerRuntimeTests(unittest.TestCase):
             self.assertEqual(payload["previous_noop_repair_attempts"], 1)
             self.assertEqual(payload["required_behavior"][0]["id"], "behavior-value")
             self.assertIn("must differ", payload["prohibited_attempts"][1])
+
+    def test_compact_repair_retains_bounded_observed_failure_not_inferred_answer(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            runtime = RUNTIME.WorkerRuntime(
+                root, packet_v2(), {"python": sys.executable}, FakeClient([])
+            )
+            message = "AssertionError: observed 7 != expected 2 " + "x" * 3000
+            runtime.validation = RUNTIME.ValidationResult(
+                "failed",
+                {},
+                {
+                    "diagnostic": {
+                        "failures": [
+                            {
+                                "test": "test_example",
+                                "message": message,
+                                "location": "tests/test_example.py:1: AssertionError",
+                            },
+                            {
+                                "test": "outside",
+                                "message": "must not leak",
+                                "location": "outside.py:1: AssertionError",
+                            },
+                        ]
+                    }
+                },
+            )
+            payload = runtime._compact_repair_payload(
+                {"required_next_action": "SAFE_REPLACE", "candidate_edit_paths": ["src/example.py"]}
+            )
+            self.assertEqual(len(payload["test_evidence"]), 1)
+            evidence = payload["test_evidence"][0]
+            self.assertEqual(evidence["failure_message"], message[:2000])
+            self.assertNotIn("expected", {key for key in evidence if key != "failure_message"})
+            self.assertIn("observed validation failure", payload["instruction"])
+            runtime.close()
+
+    def test_compact_repair_test_evidence_accepts_node_ids_without_scope_expansion(self) -> None:
+        selectors = (
+            "tests/test_example.py",
+            "tests/test_example.py::test_value",
+            "tests/test_example.py::TestValue::test_value[param::value]",
+            "tests\\test_example.py::test_value[param]",
+        )
+        for selector in selectors:
+            with self.subTest(selector=selector), TemporaryDirectory() as directory:
+                root = Path(directory)
+                self.make_tree(root)
+                packet = packet_v2()
+                packet["focused_tests"] = [selector]
+                runtime = RUNTIME.WorkerRuntime(
+                    root, packet, {"python": sys.executable}, FakeClient([])
+                )
+                before = (root / "tests/test_example.py").read_bytes()
+                runtime.validation = RUNTIME.ValidationResult(
+                    "failed",
+                    {},
+                    {
+                        "diagnostic": {
+                            "failures": [
+                                {
+                                    "test": "test_value",
+                                    "message": "AssertionError: observed mismatch",
+                                    "location": "tests\\test_example.py:1: AssertionError",
+                                },
+                                {
+                                    "test": "unfocused",
+                                    "message": "must not leak",
+                                    "location": "outside.py:1: AssertionError",
+                                },
+                            ]
+                        }
+                    },
+                )
+                payload = runtime._compact_repair_payload(
+                    {
+                        "required_next_action": "SAFE_REPLACE",
+                        "candidate_edit_paths": ["src/example.py"],
+                    }
+                )
+                self.assertEqual(len(payload["test_evidence"]), 1)
+                evidence = payload["test_evidence"][0]
+                self.assertEqual(evidence["path"], "tests/test_example.py")
+                self.assertIn("1:", evidence["content"])
+                self.assertEqual((root / "tests/test_example.py").read_bytes(), before)
+                with patch.object(
+                    runtime,
+                    "_assert_read_allowed",
+                    side_effect=RUNTIME.WorkerError("blocked read"),
+                ):
+                    blocked = runtime._compact_repair_payload(
+                        {
+                            "candidate_edit_paths": ["src/example.py"],
+                        }
+                    )
+                self.assertEqual(blocked["test_evidence"], [])
+                runtime.close()
 
     def test_repair_context_restores_only_unchanged_previously_read_lines(self) -> None:
         with TemporaryDirectory() as directory:
@@ -3188,6 +4128,158 @@ class WorkerRuntimeTests(unittest.TestCase):
             self.assertEqual(restored["new_evidence_count"], 0)
             self.assertIn("VALUE = 1", restored["content"])
             self.assertEqual(runtime.read_file(arguments)["status"], "already_read")
+
+    def test_budgeted_history_retains_early_evidence_until_input_budget(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            client = FakeClient([])
+            client.context_length = 24576
+            client.max_tokens = 2048
+            client.context_safety_margin = 1024
+            runtime = RUNTIME.WorkerRuntime(
+                root,
+                packet_v2(),
+                {"python": sys.executable, "coder_context_retention": "budgeted"},
+                client,
+            )
+            messages = [{"role": "user", "content": str(index)} for index in range(22)]
+            self.assertEqual(runtime._trim_messages(messages), messages)
+            self.assertFalse(runtime.context_trimmed)
+            large = [{"role": "user", "content": str(index) + "x" * 12000} for index in range(22)]
+            trimmed = runtime._trim_messages(large)
+            self.assertEqual(trimmed[:2], large[:2])
+            self.assertEqual(trimmed[-10:], large[-10:])
+            self.assertTrue(runtime.context_trimmed)
+            self.assertEqual(len(large), 22)
+            self.assertLess(len(trimmed), len(large))
+            many = messages * 4
+            capped = runtime._trim_messages(many)
+            self.assertLessEqual(len(capped), 64)
+            self.assertEqual(capped[:2], many[:2])
+            self.assertEqual(capped[-10:], many[-10:])
+
+    def test_latest_repair_focus_preserves_source_observations_and_packet(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            client = FakeClient([])
+            client.context_length = 24576
+            client.max_tokens = 4096
+            client.context_safety_margin = 1024
+            runtime = RUNTIME.WorkerRuntime(
+                root,
+                packet_v2(),
+                {
+                    "python": sys.executable,
+                    "coder_context_retention": "budgeted",
+                    "coder_repair_focus_retention": "latest",
+                },
+                client,
+            )
+            messages = [
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "packet"},
+                {"role": "assistant", "content": "READ_FILE tests"},
+                {"role": "user", "content": "OBSERVATION protected assertions"},
+                {
+                    "role": "assistant",
+                    "content": json.dumps({"action": "VALIDATE", "arguments": {}}),
+                },
+                {"role": "user", "content": "REPAIR_REQUIRED\nold"},
+                {"role": "assistant", "content": "SAFE_REPLACE"},
+                {"role": "user", "content": "OBSERVATION current hash"},
+                {
+                    "role": "assistant",
+                    "content": json.dumps({"action": "VALIDATE", "arguments": {}}),
+                },
+                {"role": "user", "content": "REPAIR_REQUIRED\nnew"},
+            ]
+            retained = runtime._trim_messages(messages)
+            self.assertEqual(retained, messages[:4] + messages[6:])
+            self.assertEqual(len(messages), 10)
+            self.assertTrue(runtime.context_trimmed)
+            alternate = list(messages)
+            alternate[4] = {
+                "role": "assistant",
+                "content": json.dumps(
+                    {"action": "READ_FILE", "arguments": {"path": "src/example.py"}}
+                ),
+            }
+            self.assertIn(alternate[4], runtime._trim_messages(alternate))
+            runtime.repair_focus_retention = "all"
+            self.assertEqual(runtime._trim_messages(messages), messages)
+
+    def test_budgeted_history_requires_known_context_and_valid_mode(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            with self.assertRaisesRegex(RUNTIME.WorkerError, "recent or budgeted"):
+                RUNTIME.WorkerRuntime(
+                    root, packet_v2(), {"coder_context_retention": []}, FakeClient([])
+                )
+            runtime = RUNTIME.WorkerRuntime(
+                root,
+                packet_v2(),
+                {"python": sys.executable, "coder_context_retention": "budgeted"},
+                FakeClient([]),
+            )
+            with self.assertRaisesRegex(RUNTIME.WorkerError, "configured context length"):
+                runtime._trim_messages([{"role": "user", "content": "packet"}])
+
+    def test_missing_supplemental_test_has_scoped_create_feedback(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            value = packet()
+            value["scope"]["create"] = ["tests/test_supplement.py"]
+            value["focused_tests"].append("tests/test_supplement.py")
+            value["supplemental_tests"] = ["tests/test_supplement.py"]
+            runtime = RUNTIME.WorkerRuntime(root, value, {"python": sys.executable}, FakeClient([]))
+            try:
+                validation = RUNTIME.ValidationResult(
+                    "failed",
+                    {},
+                    {
+                        "exit_code": 4,
+                        "output": "ERROR: file or directory not found: tests/test_supplement.py",
+                    },
+                )
+                focus = runtime._validation_repair_focus(validation)[0]
+                self.assertEqual(focus["required_next_action"], "SAFE_CREATE")
+                self.assertEqual(focus["required_path"], "tests/test_supplement.py")
+                self.assertEqual(
+                    runtime._compact_repair_payload(focus)["required_next_action"], "SAFE_CREATE"
+                )
+                runtime.packet["scope"]["create"] = []
+                self.assertEqual(
+                    runtime._validation_repair_focus(validation)[0]["required_next_action"],
+                    "REQUEST_CONTRACT_REVISION",
+                )
+                validation.focused_tests["exit_code"] = 1
+                self.assertEqual(runtime._validation_repair_focus(validation), [])
+            finally:
+                runtime.close()
+
+    def test_trimmed_duplicate_read_keeps_bounded_source_without_new_evidence(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            runtime = RUNTIME.WorkerRuntime(
+                root, packet_v2(), {"python": sys.executable}, FakeClient([])
+            )
+            try:
+                runtime.read_file({"path": "src/example.py"})
+                runtime.context_trimmed = True
+                runtime.replayed_after_trim_file_versions.add(
+                    ("src/example.py", runtime.observed_hashes["src/example.py"])
+                )
+                duplicate = runtime.read_file({"path": "src/example.py"})
+                self.assertEqual(duplicate["status"], "already_read")
+                self.assertIn("VALUE = 1", duplicate["source_context"]["content"])
+                self.assertEqual(duplicate["new_evidence_count"], 0)
+            finally:
+                runtime.close()
 
     def test_repair_nudge_restores_duplicate_read_after_compaction(self) -> None:
         with TemporaryDirectory() as directory:
@@ -3283,6 +4375,9 @@ class WorkerRuntimeTests(unittest.TestCase):
                         }
                     )
                 if self.turn == 2:
+                    self.source_hash = json.loads(_messages[-1]["content"].split("\n", 1)[1])[
+                        "sha256"
+                    ]
                     return json.dumps(
                         {
                             "action": "READ_FILE",
@@ -3292,8 +4387,13 @@ class WorkerRuntimeTests(unittest.TestCase):
                 if self.turn == 3:
                     return json.dumps(
                         {
-                            "action": "SEARCH",
-                            "arguments": {"query": "VALUE", "path": "src"},
+                            "action": "SAFE_REPLACE",
+                            "arguments": {
+                                "path": "src/example.py",
+                                "expected_sha256": self.source_hash,
+                                "find": "VALUE = 1",
+                                "replace": "VALUE = 2",
+                            },
                         }
                     )
                 if self.turn == 4:
@@ -3437,6 +4537,132 @@ class WorkerRuntimeTests(unittest.TestCase):
                 runtime.close()
             self.assertEqual(result["status"], "passed")
             self.assertEqual(result["validation"]["configured_checks"][0]["id"], "ruff-check")
+
+    def test_failed_tests_only_run_explicit_diagnostics_with_current_nonzero_junit(self) -> None:
+        for mode in (
+            "opted",
+            "default",
+            "missing",
+            "skipped",
+            "drifted",
+            "zero",
+            "static-drift",
+            "invalid",
+            "edited",
+        ):
+            with self.subTest(mode=mode), TemporaryDirectory() as directory:
+                root = Path(directory)
+                self.make_tree(root)
+                commands = [
+                    {
+                        "id": "ruff-format",
+                        "argv": ["{python}", "-m", "ruff", "format", "--check", "src"],
+                    },
+                    {"id": "ruff-check", "argv": ["{python}", "-m", "ruff", "check", "src"]},
+                    {"id": "unmarked", "argv": ["{python}", "-c", "pass"]},
+                ]
+                if mode != "default":
+                    for command in commands[:2]:
+                        command["run_on_test_failure"] = True
+                if mode == "invalid":
+                    commands[0]["run_on_test_failure"] = "yes"
+                config = {
+                    "validation_profiles": {
+                        "python-focused": {"python": sys.executable, "commands": commands}
+                    }
+                }
+                runtime = RUNTIME.WorkerRuntime(root, packet_v2(), config, FakeClient([]))
+                runtime.write_lock.acquire()
+                calls = []
+                try:
+                    runtime._prepare_run_archive()
+                    if mode == "edited":
+                        observed = runtime.read_file({"path": "src/example.py"})
+                        runtime.safe_replace(
+                            {
+                                "path": "src/example.py",
+                                "expected_sha256": observed["sha256"],
+                                "find": "VALUE = 1",
+                                "replace": "VALUE = 3",
+                            }
+                        )
+
+                    def fake_command(argv):
+                        calls.append(argv)
+                        junit_arg = next(
+                            (item for item in argv if item.startswith("--junitxml=")), None
+                        )
+                        if junit_arg:
+                            if mode != "missing":
+                                tests, skipped = (
+                                    (0, 0) if mode == "zero" else (1, int(mode == "skipped"))
+                                )
+                                Path(junit_arg.split("=", 1)[1]).write_text(
+                                    f'<testsuite tests="{tests}" failures="1" errors="0" skipped="{skipped}"><testcase name="test_value"><failure message="AssertionError">failed</failure></testcase></testsuite>'
+                                )
+                            if mode == "drifted":
+                                (root / "src/example.py").write_text("VALUE = 9\n")
+                            return {
+                                "status": "failed",
+                                "exit_code": 1,
+                                "output": "assertion failed",
+                                "argv": argv,
+                            }
+                        if "ruff" in argv:
+                            if mode == "static-drift":
+                                (root / "src/example.py").write_text("VALUE = 9\n")
+                            return {
+                                "status": "failed",
+                                "exit_code": 1,
+                                "output": "1 file would be reformatted"
+                                if "format" in argv
+                                else "src/example.py:1:1: F821 Undefined name `missing`",
+                                "argv": argv,
+                            }
+                        return {"status": "passed", "exit_code": 0, "output": "ok", "argv": argv}
+
+                    with (
+                        patch.object(runtime, "_run_command", side_effect=fake_command),
+                        patch.object(
+                            runtime,
+                            "_try_autoformat",
+                            side_effect=AssertionError("must not autoformat failed tests"),
+                        ),
+                    ):
+                        if mode == "invalid":
+                            with self.assertRaisesRegex(RUNTIME.WorkerError, "must be boolean"):
+                                runtime.validate({})
+                            self.assertFalse(any("ruff" in argv for argv in calls))
+                            continue
+                        result = runtime.validate({})
+                    static_calls = [argv for argv in calls if "ruff" in argv]
+                    self.assertEqual(
+                        len(static_calls),
+                        2 if mode in {"opted", "edited"} else 1 if mode == "static-drift" else 0,
+                    )
+                    self.assertEqual(result["status"], "failed")
+                    self.assertTrue(runtime.pending_failed_validation)
+                    self.assertFalse(runtime._validated_terminal_state())
+                    self.assertEqual(runtime.edit_revision, int(mode == "edited"))
+                    self.assertEqual(runtime.repairs, 0)
+                    if mode == "opted":
+                        self.assertEqual(
+                            [check["id"] for check in runtime.validation.configured_checks],
+                            ["ruff-format", "ruff-check"],
+                        )
+                        self.assertEqual(runtime.validation.focused_tests["status"], "failed")
+                    if mode == "static-drift":
+                        self.assertFalse(runtime.validation.focused_tests["inputs_unchanged"])
+                    if mode == "edited":
+                        check = runtime.validation.configured_checks[0]
+                        self.assertTrue(
+                            runtime._autoformat_eligible(
+                                check["id"], check["argv"], check, Path(sys.executable)
+                            )
+                        )
+                        self.assertEqual(runtime.validation_count, 1)
+                finally:
+                    runtime.close()
 
     def test_ruff_autoformat_changes_only_authorized_file_and_revalidates(self) -> None:
         with TemporaryDirectory() as directory:

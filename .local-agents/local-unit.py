@@ -197,6 +197,52 @@ def verify_handoff(repo_root: Path, coder_report: dict[str, Any]) -> dict[str, s
         or any(item.get("status") != "passed" for item in validation.get("configured_checks", []))
     ):
         raise HandoffError("Coder deterministic validation is incomplete or failed")
+    # Diagnostic acknowledgements may be false/unknown; green tests do not
+    # upgrade those model claims into submission eligibility.
+    acknowledgement = validation.get("contract_check")
+    if packet.get("contract_check_required") and not isinstance(acknowledgement, dict):
+        raise HandoffError("Coder submission contract acknowledgement is missing")
+    if (
+        acknowledgement is not None
+        or packet.get("required_order")
+        or packet.get("forbidden_orderings")
+    ):
+        if not isinstance(acknowledgement, dict):
+            raise HandoffError("Coder submission contract acknowledgement is missing")
+        required_ids = {
+            f"behavior-{index}" if isinstance(item, str) else item["id"]
+            for index, item in enumerate(packet.get("required_behavior", []), 1)
+        }
+        observable_ids = {
+            item["id"]
+            for item in packet.get("acceptance_scenarios", [])
+            if isinstance(item, dict) and item.get("observables")
+        }
+        for field, expected in (
+            ("required_behavior_ids", required_ids),
+            ("observable_scenario_ids", observable_ids),
+        ):
+            supplied = acknowledgement.get(field, [])
+            if (
+                not isinstance(supplied, list)
+                or any(not isinstance(item, str) for item in supplied)
+                or not expected <= set(supplied)
+            ):
+                raise HandoffError("Coder submission contract acknowledgement is incomplete")
+        if (
+            (
+                packet.get("required_order")
+                and acknowledgement.get("required_order_confirmed") is not True
+            )
+            or (
+                packet.get("forbidden_orderings")
+                and acknowledgement.get("forbidden_orderings_absent") is not True
+            )
+            or acknowledgement.get("unrelated_changes", []) != []
+        ):
+            raise HandoffError(
+                "Coder diagnostic contract acknowledgement is not submission eligible"
+            )
     if changes.get("unattributed_relevant_changes"):
         raise HandoffError("unattributed relevant changes require Primary inspection")
     allowed = set(packet["scope"]["modify"] + packet["scope"]["create"])
@@ -415,7 +461,7 @@ def run_unit(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(allow_abbrev=False)
     parser.add_argument("--packet", required=True, type=Path)
     parser.add_argument("--config", type=Path, default=SCRIPT_DIR / "config.json")
     parser.add_argument(
