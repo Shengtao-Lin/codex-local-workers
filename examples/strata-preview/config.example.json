@@ -1,0 +1,44 @@
+{
+  "strata_node_path": "C:/Strata/node/node.exe",
+  "strata_harness_root": "C:/Strata/harness",
+  "strata_base_url": "http://127.0.0.1:47831/v1",
+  "coder_model": "iq3_s",
+  "python": "C:/work/my-project/.venv/Scripts/python.exe",
+  "coordinator_enabled": false,
+  "experimental_strata_subagent": true,
+  "bounded_execution_profile": "bounded-v1",
+  "bounded_compatibility_profile": "flat-v1",
+  "bounded_evidence_profile": "pytest-source-v1",
+  "experimental_consolidated_harness": true,
+  "host_proposal_enabled": true,
+  "coder_single_function": {
+    "path": "src/your_package/module.py",
+    "symbol": "target_function",
+    "dependencies": "Read approved source manifest for actual dependencies; no unverified implementation guidance."
+  },
+  "experimental_approved_imports": [],
+  "coder_block_edits_only": true,
+  "require_edit_targets": true,
+  "max_model_turns": 12,
+  "hard_max_model_turns": 12,
+  "repair_turn_reserve": 0,
+  "prevalidation_edit_turn_reserve": 0,
+  "max_local_repairs": 2,
+  "max_validation_runs": 4,
+  "invocation_timeout_seconds": 900,
+  "command_timeout_seconds": 180,
+  "autoformat_on_ruff_failure": false,
+  "autoformat_on_diff_whitespace": true,
+  "validation_profiles": {
+    "project-strict": {
+      "python": "C:/work/my-project/.venv/Scripts/python.exe",
+      "compile": true,
+      "pytest_argv": ["-B", "-m", "pytest"],
+      "commands": [
+        {"id": "ruff-format", "argv": ["{python}", "-m", "ruff", "format", "--check", "src", "tests"]},
+        {"id": "ruff-check", "argv": ["{python}", "-m", "ruff", "check", "src", "tests"]},
+        {"id": "pyright", "argv": ["{python}", "-m", "pyright", "--pythonpath", "{python}"]}
+      ]
+    }
+  }
+}

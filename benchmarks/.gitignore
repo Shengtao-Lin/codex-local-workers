@@ -1,5 +1,0 @@
-work/
-results/*
-!results/summary.json
-__pycache__/
-config.local.json

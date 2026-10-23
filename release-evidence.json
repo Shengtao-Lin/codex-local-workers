@@ -1,0 +1,33 @@
+{
+  "version": "0.1.0-preview.1",
+  "documentation_revision": 2,
+  "runtime_build": "0.1.0-preview-candidate.4.1",
+  "status": "LIMITED_SUPERVISED_PREVIEW_CANDIDATE",
+  "matrix": "strata-release-v4-20261023-2",
+  "accepted": 6,
+  "executed": 6,
+  "not_run": 0,
+  "families": [
+    "strict UTF8 mapping_raw",
+    "chronological collect_tools",
+    "top-level request_hash transient keys"
+  ],
+  "live_http_requests": 13,
+  "host_seconds": 293.531,
+  "historical_holds": [
+    "strata-native-v2-20261023-1:5/6",
+    "strata-native-v3-20261023-1:5/6",
+    "strata-release-v4-20261023-1:0executed,6NOT_RUN,offline fault"
+  ],
+  "no_claims": [
+    "general coding",
+    "multifile",
+    "unseen-repo transfer",
+    "live semantic recovery",
+    "cloud usage savings",
+    "Coordinator",
+    "fresh Local Reviewer"
+  ],
+  "primary": "Detailed frozen contracts/tests reused, independent complete diff/checks on each task; no live guidance or takeover; preparation/final-review active time and cloud tokens unknown",
+  "upstream": "Strata/harness/Node/model not redistributed; configured local existing dependencies only"
+}
