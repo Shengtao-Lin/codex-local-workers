@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import re
@@ -25,6 +26,15 @@ def load_run_state() -> Any:
 RUN_STATE = load_run_state()
 
 
+def load_disposition() -> Any:
+    spec = importlib.util.spec_from_file_location(
+        "primary_review_disposition", SCRIPT_DIR / "review-disposition.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def load_evidence_cache() -> Any:
     spec = importlib.util.spec_from_file_location(
         "local_worker_review_evidence", SCRIPT_DIR / "evidence-cache.py"
@@ -37,7 +47,7 @@ def load_evidence_cache() -> Any:
 
 
 def identifier(value: str, name: str) -> str:
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", value):
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", value):
         raise ValueError(f"invalid {name}")
     return value
 
@@ -88,6 +98,12 @@ def main() -> int:
     )
     parser.add_argument("--summary", required=True)
     parser.add_argument("--repo", default=".")
+    parser.add_argument(
+        "--config", type=Path, help="Trusted configuration for host-proposal acceptance"
+    )
+    parser.add_argument(
+        "--disposition", type=Path, help="Primary-authored, report-bound finding adjudication"
+    )
     args = parser.parse_args()
     try:
         task_id = identifier(args.task_id, "task-id")
@@ -109,6 +125,56 @@ def main() -> int:
         if not isinstance(unit_id, str):
             raise ValueError("handoff is missing unit identity")
         local_review = passing_local_review(task_root, task_id, unit_id, run_id)
+        if args.decision == "accept" and (
+            handoff.get("execution_protocol") is not None
+            or handoff.get("status") == "validation_passed_pending_review"
+        ):
+            spec = importlib.util.spec_from_file_location(
+                "primary_host_gate", SCRIPT_DIR / "local-unit.py"
+            )
+            gate = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(gate)
+            config_path = args.config or repo_root / ".local-agents/config.json"
+            gate.verify_handoff(repo_root, handoff, config=load_object(config_path))
+            if local_review is None:
+                raise ValueError("Host acceptance requires independent Local Reviewer")
+        disposition = None
+        if args.disposition is not None:
+            payload = load_object(args.disposition)
+            review_id = identifier(payload.get("identity", {}).get("review_id", ""), "review-id")
+            report_path = task_root / "reviews" / review_id / "handoff.json"
+            report = load_object(report_path)
+            review_completed = load_object(report_path.with_name("completed.json"))
+            if any(
+                report.get("identity", {}).get(k) != v
+                for k, v in (("task_id", task_id), ("unit_id", unit_id), ("run_id", run_id))
+            ) or review_completed.get("decision") != report.get("decision"):
+                raise ValueError("disposition requires a completed matching Reviewer archive")
+            hashes = report.get("runtime_facts", {}).get("observed_read_hashes")
+            if not isinstance(hashes, dict) or not hashes:
+                raise ValueError("disposition requires observed source evidence")
+            for relative, expected_sha in hashes.items():
+                source = (repo_root / relative).resolve()
+                if (
+                    not source.is_relative_to(repo_root)
+                    or hashlib.sha256(source.read_bytes()).hexdigest() != expected_sha
+                ):
+                    raise ValueError("Reviewer source evidence changed before Primary disposition")
+            disposition = load_disposition().adjudicate(
+                report, hashlib.sha256(report_path.read_bytes()).hexdigest(), payload
+            )
+            if (
+                args.decision in {"accept", "rework"}
+                and args.decision != disposition["primary_decision"]
+            ):
+                raise ValueError("Primary decision conflicts with adjudicated blockers")
+        elif args.decision == "rework":
+            for report_path in (task_root / "reviews").glob("*/handoff.json"):
+                report = load_object(report_path)
+                if report.get("identity", {}).get("run_id") == run_id and report.get(
+                    "decision"
+                ) in {"rework", "escalate"}:
+                    raise ValueError("Reviewer-based rework requires --disposition from Primary")
         if (
             args.decision == "accept"
             and handoff.get("next_action_required") == "local_review"
@@ -133,11 +199,14 @@ def main() -> int:
             "decision": args.decision,
             "summary": summary,
             "local_review_id": (
-                (local_review.get("identity") or {}).get("review_id")
+                disposition["identity"]["review_id"]
+                if disposition is not None
+                else (local_review.get("identity") or {}).get("review_id")
                 if local_review is not None
                 else None
             ),
             "reviewed_at": RUN_STATE.utc_now(),
+            "review_disposition": disposition,
         }
         RUN_STATE.write_json_once(run_root / "review.json", review)
         reviews.append(review)

@@ -119,6 +119,13 @@ def role_model_lease(client: Any, config: dict[str, Any]) -> Iterator[None]:
     backend = config.get("model_load_backend", "native")
     if backend not in ("native", "cli"):
         raise ModelResidencyError("model_switch_config", "model_load_backend must be native or cli")
+    acknowledgement = config.get("model_load_ack_policy", "strict")
+    if acknowledgement not in ("strict", "api_verified"):
+        raise ModelResidencyError(
+            "model_switch_config", "model_load_ack_policy must be strict or api_verified"
+        )
+    if hasattr(client, "last_model_residency"):
+        client.last_model_residency = None
     cli = _cli_path(base_url, config) if backend == "cli" else None
     roles = [config.get(f"{role}_model") for role in ("explorer", "coder", "reviewer")]
     if "coordinator_model" in config:
@@ -185,7 +192,16 @@ def role_model_lease(client: Any, config: dict[str, Any]) -> Iterator[None]:
             if not target:
                 stage = "load_" + backend
                 if cli is not None:
-                    _cli_load(cli, client, timeout)
+                    try:
+                        _cli_load(cli, client, timeout)
+                    except subprocess.TimeoutExpired:
+                        if acknowledgement != "api_verified":
+                            raise
+                        client.last_model_residency = {
+                            "cli_timeout_seconds": timeout,
+                            "api_readiness_verified": False,
+                        }
+                        # Continue only to the unchanged mandatory native checks.
                 else:
                     body: dict[str, Any] = {"model": client.model}
                     if client.context_length is not None:
@@ -226,6 +242,15 @@ def role_model_lease(client: Any, config: dict[str, Any]) -> Iterator[None]:
                 raise ModelResidencyError(
                     "model_context_too_small",
                     f"loaded {client.model} context {length} is below configured {client.context_length}",
+                )
+            observation = getattr(client, "last_model_residency", None)
+            if observation is not None:
+                observation.update(
+                    api_readiness_verified=True,
+                    model=client.model,
+                    context_length=length,
+                    parallel=instance_config.get("parallel"),
+                    elapsed_seconds=round(time.monotonic() - started, 3),
                 )
         except ModelResidencyError as exc:
             elapsed = round(time.monotonic() - started, 3)

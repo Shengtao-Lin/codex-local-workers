@@ -212,6 +212,25 @@ def validate_feature_plan(plan: dict) -> dict:
                 raise ValueError(f"contract {contract_id} already owned by {owned[contract_id]}")
             owned[contract_id] = unit_id
             level = max(level, RISK[floors[contract_id]])
+            contract = next(item for item in contracts if item["id"] == contract_id)
+            if "implementation_ref" in contract:
+                spec = importlib.util.spec_from_file_location(
+                    "coordinator_citation_binding", Path(__file__).with_name("citation-binding.py")
+                )
+                assert spec and spec.loader
+                binding = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(binding)
+                binding.validate_binding(
+                    contract["implementation_ref"],
+                    readable=authority["read_roots"],
+                    forbidden=authority["forbidden"],
+                    tests=[
+                        target.split("::", 1)[0]
+                        for target in unit.get("packet_contract", {}).get(
+                            "required_focused_tests", []
+                        )
+                    ],
+                )
         effective[unit_id] = next(name for name, rank in RISK.items() if rank == level)
     missing = sorted(floors.keys() - owned.keys())
     if missing:
@@ -279,6 +298,11 @@ def validate_unit_packet(plan: dict, candidate: dict) -> dict:
     for item in behaviors:
         if item.get("text") != contracts[item["id"]]["text"]:
             raise ValueError(f"packet changed Primary contract text: {item['id']}")
+        expected = contracts[item["id"]]
+        if ("implementation_ref" in item) != ("implementation_ref" in expected) or item.get(
+            "implementation_ref"
+        ) != expected.get("implementation_ref"):
+            raise ValueError(f"packet changed Primary implementation_ref: {item['id']}")
     packet = copy.deepcopy(candidate)
     for item in packet["required_behavior"]:
         item["risk_floor"] = contracts[item["id"]]["risk_floor"]
@@ -398,6 +422,15 @@ def materialize_bounded_packet(plan: dict, proposal: dict) -> dict:
                 "id": contract_id,
                 "text": registry[contract_id]["text"],
                 "risk_floor": registry[contract_id]["risk_floor"],
+                **(
+                    {
+                        "implementation_ref": copy.deepcopy(
+                            registry[contract_id]["implementation_ref"]
+                        )
+                    }
+                    if "implementation_ref" in registry[contract_id]
+                    else {}
+                ),
             }
             for contract_id in unit["owned_contract_ids"]
         ],

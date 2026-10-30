@@ -1,0 +1,6 @@
+{
+  "clarification": "Three intendedPASS outputs were invalid:reports1and3 rejected the impossible class binding;report2 failed the24-item evidence limit with25 citations before binding validation.",
+  "unchanged": "Original HOLD/NOT_RUN and budgets retained. Existing class binding remains impossible even if the25th citation is removed.",
+  "other_failure": "Evidence-count overflow is a real bounded protocol error;do not hide it or expand the cap.",
+  "proof": "../strata-binding-preflight-20261030-1/actual-binding-replay.json"
+}

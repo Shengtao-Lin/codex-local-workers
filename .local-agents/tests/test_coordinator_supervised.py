@@ -9,9 +9,9 @@ from pathlib import Path
 
 import pytest
 
-import test_coordinator_contract as fixtures
-
-pytest_plugins = [fixtures.__name__]
+# Bind the exact shared fixtures locally. Registering a collected test module as
+# a plugin loses fixture visibility when that module was collected first.
+from test_coordinator_contract import packet_pair as packet_pair, plan as plan
 
 
 SPEC = importlib.util.spec_from_file_location(

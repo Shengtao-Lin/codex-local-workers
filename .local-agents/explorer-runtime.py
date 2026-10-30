@@ -706,9 +706,55 @@ class ExplorerRuntime:
             raise ExplorerPreflightBlocked("invalid_task_id", "task_id is not a safe identifier")
         self.config = config
         self.client = client
+        self.require_test_evidence = bool(
+            re.search(r"\btests?\b", self.task, flags=re.IGNORECASE)
+        )
+        if "explorer_require_test_evidence" in config:
+            if type(config["explorer_require_test_evidence"]) is not bool:
+                raise ExplorerPreflightBlocked(
+                    "invalid_config", "explorer_require_test_evidence must be a boolean"
+                )
+            self.require_test_evidence = config["explorer_require_test_evidence"]
         self.mode = config.get("explorer_mode", "investigate")
         if not isinstance(self.mode, str) or self.mode not in {"investigate", "locate"}:
             raise ExplorerPreflightBlocked("invalid_config", "unknown explorer_mode")
+        self.answer_protocol = config.get("explorer_answer_protocol", False)
+        if type(self.answer_protocol) is not bool:
+            raise ExplorerPreflightBlocked(
+                "invalid_config", "explorer_answer_protocol must be a boolean"
+            )
+        if self.answer_protocol:
+            # One bounded question, typed conclusion, no model-authored execution history.
+            self.mode = "locate"
+        self.required_source_anchors = config.get("explorer_required_source_anchors", [])
+        if (
+            not isinstance(self.required_source_anchors, list)
+            or len(self.required_source_anchors) > 6
+            or any(
+                not isinstance(item, dict)
+                or set(item) != {"path", "text"}
+                or not isinstance(item.get("path"), str)
+                or not item["path"].strip()
+                or not isinstance(item.get("text"), str)
+                or not item["text"].strip()
+                or len(item["text"]) > 500
+                or "\n" in item["text"]
+                or "\r" in item["text"]
+                for item in self.required_source_anchors
+            )
+            or (self.required_source_anchors and self.mode != "locate")
+        ):
+            raise ExplorerPreflightBlocked(
+                "invalid_config",
+                "explorer_required_source_anchors requires <=6 path/text literal anchors in locate mode",
+            )
+        try:
+            self.required_source_anchors = [
+                {"path": normalize_relative_path(item["path"]), "text": item["text"]}
+                for item in self.required_source_anchors
+            ]
+        except ExplorerError as exc:
+            raise ExplorerPreflightBlocked("invalid_config", str(exc)) from exc
         self.output_limit_recovery = config.get("explorer_output_limit_recovery", False)
         if not isinstance(self.output_limit_recovery, bool):
             raise ExplorerPreflightBlocked(
@@ -728,8 +774,11 @@ class ExplorerRuntime:
                 "mode": self.mode,
                 "task": self.task,
                 "required_citation_paths": config.get("explorer_required_citation_paths", []),
+                "required_source_anchors": self.required_source_anchors,
                 "required_trace_symbol": config.get("explorer_require_trace_symbol"),
                 "required_regex_search": bool(config.get("explorer_require_regex_search", False)),
+                "require_test_evidence": self.require_test_evidence,
+                **({"answer_transport": "typed-1"} if self.answer_protocol else {}),
             },
             sort_keys=True,
             ensure_ascii=False,
@@ -845,8 +894,28 @@ class ExplorerRuntime:
         return False
 
     def system_prompt(self) -> str:
+        if self.answer_protocol:
+            return """You investigate one bounded read-only repository question, identified as Q1.
+Use LIST_FILES, SEARCH (literal by default), TRACE and READ_FILE to find the controlling
+implementation, requested caller and relevant test assertions. Never edit, run tests,
+shell or another agent. Navigation and SEARCH matches are not read-source evidence.
+Return one JSON action per turn. FINISH_SUCCESS has only question_id (Q1), source_refs,
+answer_state and unresolved_scope. source_refs contains 1 to 6 actually displayed ranges
+with path, start_line, end_line and kind (implementation, test, caller or definition),
+at most 80 total lines. Select each requested location, not unrelated imports.
+answer_state is located, absent_in_cited_ranges or unresolved. An absence conclusion
+must be supported by the cited scope, not extrapolated to other files. For absence in
+one whole file, read and cite its complete current contents; a partial read is not enough.
+unresolved_scope is outside_cited_ranges_unknown or additional_requested_evidence_unresolved.
+Use the latter when the question still needs evidence. These choices are your conclusions,
+not automatic validation. The runtime quotes source and records actual evidence provenance;
+do not write a narrative of searches, reads, checks or tests. Source citations do not prove
+tests passed. FINISH_FAILED remains available for no useful evidence, with summary, reason,
+uncertainties. Do not repeat identical reads/searches. Correct line ranges beyond EOF
+without rereading; unread or changed evidence is rejected. No known answer is supplied."""
         if self.mode == "locate":
-            return """You are a bounded read-only repository locator, not an implementation verifier.
+            return (
+                """You are a bounded read-only repository locator, not an implementation verifier.
 Use LIST_FILES, SEARCH (literal by default), TRACE or READ_FILE to locate the
 implementation and tests relevant to the single question. Never edit, run tests,
 shell or another agent. Read source before citing it. Stop when locations are
@@ -862,7 +931,28 @@ Example shape (replace with actual observed locations):
 The runtime will quote the current source verbatim; do not supply findings,
 claims, quotes or a semantic verdict. For genuinely missing evidence use
 FINISH_FAILED with summary, reason and uncertainties. Never repeat identical
-reads/searches to avoid finishing. Repository hints are navigation, not proof."""
+reads/searches to avoid finishing. Repository hints are navigation, not proof.
+Before finishing, check every requested location in the question against your
+selected source_refs. Reading a file alone does not answer a request: select
+the relevant assertion or caller as well as the implementation. Distinct unit
+and integration tests may need separate ranges in the same file. Do not replace
+one requested location with another or invent evidence to fill a gap. State any
+unresolved location explicitly in uncertainties; it remains unresolved.
+Use actual displayed line numbers, never the requested READ_FILE end beyond EOF."""
+                + (
+                    "\nTrusted required citation paths: "
+                    + json.dumps(self.config.get("explorer_required_citation_paths", []))
+                    + "\nEvery listed path must occur in your final source_refs, even if already read. "
+                    "Path coverage alone does not establish that every requested location was found."
+                )
+                + (
+                    "\nTrusted required source anchors: "
+                    + json.dumps(self.required_source_anchors)
+                    + "\nEach must occur literally in a cited current READ_FILE range, not only in an uncited read. These are location obligations, not semantic proof."
+                    if self.required_source_anchors
+                    else ""
+                )
+            )
         return """You are a bounded read-only repository explorer. Investigate the user's question
 using actual repository evidence. Output exactly one flat JSON action per turn.
 Available read-only tools/actions:
@@ -1161,6 +1251,26 @@ finding or concluding the current question is answered."""
                 has_source_and_test = has_source_and_test and any(
                     not path.startswith("tests/") for path in self.read_files
                 )
+                source_only_ready = (
+                    self.config.get("explorer_require_test_evidence") is False
+                    and bool(self.observed_line_numbers)
+                    and all(
+                        self.observed_line_numbers.get(normalize_relative_path(path))
+                        for path in self.config.get("explorer_required_citation_paths", [])
+                    )
+                    and (
+                        not self.config.get("explorer_require_trace_symbol")
+                        or self.config["explorer_require_trace_symbol"]
+                        in self.trace_evidence_symbols
+                    )
+                    and (
+                        not self.config.get("explorer_require_regex_search", False)
+                        or any(
+                            item.get("action") == "SEARCH" and item.get("mode") == "regex"
+                            for item in self.action_trace
+                        )
+                    )
+                )
                 duplicate_action = (
                     self.duplicate_action_report_recovery
                     and self.mode == "locate"
@@ -1175,14 +1285,14 @@ finding or concluding the current question is answered."""
                 )
                 if (
                     (repeated_output or duplicate_action)
-                    and has_source_and_test
+                    and (has_source_and_test or source_only_ready)
                     and not self.finish_repair_used
                     and self.protocol_errors < self.max_protocol_errors
                 ):
                     self.finish_repair_pending = True
                     self.finish_repair_used = True
                     observation["next_step"] = (
-                        "An unproductive action repeated after source and test reads. "
+                        "An unproductive action repeated after required evidence reads. "
                         "Next turn is report-only: use FINISH_SUCCESS with observed "
                         "source/test line citations and explicit uncertainty."
                     )
@@ -1207,13 +1317,20 @@ finding or concluding the current question is answered."""
                     and not self.finish_repair_used
                     and (
                         self.mode == "locate"
+                        or isinstance(exc, ExplorerSourceReferenceError)
                         or "line citations" in str(exc)
                         or "relevant_tests must include observed test paths" in str(exc)
                         or str(exc).startswith("citations.")
                     )
                 ):
-                    needs_read = self.mode == "locate" and (
-                        isinstance(exc, ExplorerSourceReferenceError) and bool(exc.read_paths)
+                    missing_required_reads = [
+                        normalize_relative_path(p)
+                        for p in self.config.get("explorer_required_citation_paths", [])
+                        if normalize_relative_path(p) not in self.read_files
+                    ]
+                    needs_read = bool(missing_required_reads) or (
+                        isinstance(exc, ExplorerSourceReferenceError)
+                        and bool(exc.read_paths)
                     )
                     if needs_read:
                         observation["next_step"] = (
@@ -1221,7 +1338,9 @@ finding or concluding the current question is answered."""
                             "then retry FINISH_SUCCESS with observed line ranges. "
                             "A SEARCH hit alone is not a cited read."
                         )
-                        observation["next_step"] += " Required reads: " + ", ".join(exc.read_paths)
+                        observation["next_step"] += " Required reads: " + ", ".join(
+                            getattr(exc, "read_paths", ()) or missing_required_reads
+                        )
                     else:
                         self.finish_repair_pending = True
                         self.finish_repair_used = True
@@ -1801,6 +1920,8 @@ finding or concluding the current question is answered."""
         return f"{path} line {lines[0][0]}"
 
     def finish_success(self, args: dict[str, Any]) -> dict[str, Any]:
+        if self.answer_protocol:
+            return self.finish_answer(args)
         if self.mode == "locate":
             return self.finish_localization(args)
         relevant_files = args.get("relevant_files")
@@ -1833,7 +1954,7 @@ finding or concluding the current question is answered."""
             or "/tests/" in f"/{path}"
             or path.startswith("tests/")
         }
-        if re.search(r"\btests?\b", self.task, flags=re.IGNORECASE) and observed_tests:
+        if self.require_test_evidence and observed_tests:
             normalized_tests = {
                 normalize_relative_path(path.split("::", 1)[0]) for path in relevant_tests
             }
@@ -1855,8 +1976,10 @@ finding or concluding the current question is answered."""
             line = citation.get("line")
             claim = require_string(citation.get("claim"), "citations.claim")
             if type(line) is not int or line not in self.observed_line_numbers.get(path, set()):
-                raise ExplorerError(
-                    f"citation is not an observed READ_FILE line: {path} line {line}"
+                raise ExplorerSourceReferenceError(
+                    f"citation is not an observed READ_FILE line: {path} line {line}",
+                    "unobserved_line",
+                    (path,),
                 )
             findings.append(f"{path} line {line}: {claim}")
         required_citations = self.config.get("explorer_required_citation_paths", [])
@@ -1894,9 +2017,8 @@ finding or concluding the current question is answered."""
             uncertainties=string_list(args.get("uncertainties", []), "uncertainties"),
         )
 
-    @staticmethod
-    def localization_tool() -> dict[str, Any]:
-        return {
+    def localization_tool(self) -> dict[str, Any]:
+        tool = {
             "type": "function",
             "function": {
                 "name": "FINISH_SUCCESS",
@@ -1929,6 +2051,72 @@ finding or concluding the current question is answered."""
                 },
             },
         }
+        if self.answer_protocol:
+            parameters = tool["function"]["parameters"]
+            parameters["properties"].pop("uncertainties")
+            parameters["properties"].update(
+                {
+                    "question_id": {"type": "string", "enum": ["Q1"]},
+                    "answer_state": {
+                        "type": "string",
+                        "enum": ["located", "absent_in_cited_ranges", "unresolved"],
+                    },
+                    "unresolved_scope": {
+                        "type": "string",
+                        "enum": [
+                            "outside_cited_ranges_unknown",
+                            "additional_requested_evidence_unresolved",
+                        ],
+                    },
+                }
+            )
+            parameters["required"] = [
+                "question_id",
+                "source_refs",
+                "answer_state",
+                "unresolved_scope",
+            ]
+        return tool
+
+    def finish_answer(self, args: dict[str, Any]) -> dict[str, Any]:
+        if set(args) != {"question_id", "source_refs", "answer_state", "unresolved_scope"}:
+            raise ExplorerError(
+                "typed answer requires only question_id, source_refs, answer_state and unresolved_scope"
+            )
+        if args["question_id"] != "Q1":
+            raise ExplorerError("typed answer must address question Q1")
+        if not isinstance(args["answer_state"], str) or args["answer_state"] not in {
+            "located",
+            "absent_in_cited_ranges",
+            "unresolved",
+        }:
+            raise ExplorerError("typed answer has invalid answer_state")
+        if not isinstance(args["unresolved_scope"], str) or args["unresolved_scope"] not in {
+            "outside_cited_ranges_unknown",
+            "additional_requested_evidence_unresolved",
+        }:
+            raise ExplorerError("typed answer has invalid unresolved_scope")
+        if (
+            args["answer_state"] == "unresolved"
+            and args["unresolved_scope"] != "additional_requested_evidence_unresolved"
+        ):
+            raise ExplorerError("unresolved answer must retain requested evidence as unresolved")
+        report = self.finish_localization({"source_refs": args["source_refs"], "uncertainties": []})
+        report["model_answer"] = {
+            key: args[key] for key in ("question_id", "answer_state", "unresolved_scope")
+        }
+        report["uncertainties"] = [
+            "Evidence still requested by the question remains unresolved."
+            if args["unresolved_scope"] == "additional_requested_evidence_unresolved"
+            else "No conclusion is made outside the cited READ_FILE ranges; other files/ranges remain unknown."
+        ]
+        report["execution_provenance"] = {
+            "issued_by": "runtime",
+            "source_observation_method": "READ_FILE",
+            "read_files": sorted(self.read_files),
+            "semantic_conclusion": "model_claim_requires_independent_evaluation",
+        }
+        return report
 
     def finish_localization(self, args: dict[str, Any]) -> dict[str, Any]:
         if set(args) != {"source_refs", "uncertainties"}:
@@ -2020,6 +2208,27 @@ finding or concluding the current question is answered."""
                 raise ExplorerError(
                     "source_refs need a read test assertion line (assert or pytest.raises)"
                 )
+        for anchor in self.required_source_anchors:
+            relative, path = self.resolve(anchor["path"])
+            if any(
+                ref["path"] == relative and anchor["text"] in ref["quote"] for ref in materialized
+            ):
+                continue
+            lines = path.read_text(encoding="utf-8-sig").splitlines()
+            matches = [number for number, line in enumerate(lines, 1) if anchor["text"] in line]
+            displayed = self.displayed_line_numbers.get(relative, set())
+            needs_read = not any(number in displayed for number in matches)
+            raise ExplorerSourceReferenceError(
+                f"source_refs missing required source anchor: {relative}: {anchor['text']!r}. "
+                + (
+                    f"Navigation lines: {matches[:5]}. "
+                    if matches
+                    else "Anchor not found in current file. "
+                )
+                + "Cite its actual read range; no semantic verification is inferred.",
+                "missing_required_anchor",
+                (relative,) if needs_read else (),
+            )
         report = self.report(
             "success",
             relevant_files=[
@@ -2122,6 +2331,9 @@ def compact_explorer_report(report: dict[str, Any]) -> dict[str, Any]:
         },
     }
     if report.get("explorer_mode") == "locate":
+        if "model_answer" in report:
+            compact["model_answer"] = report["model_answer"]
+            compact["execution_provenance"] = report["execution_provenance"]
         compact["semantic_verdict"] = "not_evaluated"
         compact["source_refs"] = [
             {key: value for key, value in ref.items() if key != "quote"}

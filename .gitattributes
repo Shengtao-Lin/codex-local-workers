@@ -1,0 +1,4 @@
+# Frozen product hashes describe exact bytes, including line endings.
+releases/strata-task34/** -text whitespace=cr-at-eol
+# Replay fixtures also carry hashes/provenance for their original bytes.
+benchmarks/fixtures/** -text whitespace=cr-at-eol

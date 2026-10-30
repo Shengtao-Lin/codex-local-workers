@@ -104,11 +104,13 @@ class TaskPolicyTests(unittest.TestCase):
             "primary_lightweight_review",
         )
 
-    def test_reviewer_findings_route_to_bounded_rework(self) -> None:
+    def test_reviewer_findings_require_primary_adjudication(self) -> None:
         item = attempt("rework")
         item["worker"] = "reviewer"
         state = {"recent_attempts": [item]}
-        self.assertEqual(POLICY.evaluate_task_state(state)["decision"], "bounded_coder_rework")
+        self.assertEqual(
+            POLICY.evaluate_task_state(state)["decision"], "primary_adjudicate_review_findings"
+        )
 
     def test_runtime_policy_violation_triggers_takeover(self) -> None:
         state = {"recent_attempts": [attempt("policy_violation")]}

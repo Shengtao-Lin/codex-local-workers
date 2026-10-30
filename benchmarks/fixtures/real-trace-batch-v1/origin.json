@@ -1,0 +1,17 @@
+{
+  "source_repository": "F:\\ChatGPT\\agent-evaluation-harness",
+  "source_head": "90063282d7b5856b43f62fbe1baf52fb5b4605b3",
+  "source_was_dirty": true,
+  "source_map_sha256": {
+    "src/evaluation_harness/trace_sources/mlflow.py": "fdb15b68ddffdff4fe6c6e7e030231e275eae55b08c7e5f28c5cbdfa218ea1b9",
+    "src/evaluation_harness/trace_sources/base.py": "d465dd8dd7fae2383a19050e746208e39e85c071b934e6ccb2202482499bb1fc",
+    "src/evaluation_harness/trace_sources/__init__.py": "0c82050e9aec5f180dedd227280b06c3903a99a5a6d269f9366b1c7ea82b95fc",
+    "src/evaluation_harness/__init__.py": "a432f894df9f1d5fda225ac982d7d937f40aa4cf04c10062c9f742d8dd9e68e1",
+    "tests/test_mlflow_trace_source.py": "821c1d8e0c761dae149bb9c4dd6621676ad85f5058caf6aac2f24b4a988ae223",
+    "pyproject.toml": "cc61f388699dc1fd3bf8441f2bbe180daf364fb612e45f9947a38a08bb17289c"
+  },
+  "baseline": "Unaltered correct legacy; additive get_many absent. Not an issue/bug claim.",
+  "acceptance_test_sha256": "392f29510b31d677340a5dcbd9e585e7afa820db152ed8b069ec3ffec6f068ee",
+  "frozen_brief": "F:\\ChatGPT\\local-worker-kit\\benchmarks\\work\\system-convergence\\real-trace-pilot-20261011-3\\isolated\\.agent\\brief.json",
+  "read_only_real_client_boundary": "Actual get/to_thread/convert invoked through a fake MLflow client; no external MLflow/PostgreSQL."
+}

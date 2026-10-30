@@ -1,0 +1,15 @@
+{
+  "attributes": {
+    "agent.runtime.version": "0.1.0",
+    "agent.id": "support-agent",
+    "agent.version": "1.0.0",
+    "agent.framework": "native",
+    "agent.thread.id": "thread-1",
+    "agent.message.content": [
+      "{\"id\":\"m1\",\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Hello\"}]}",
+      "{\"id\":\"m2\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Hi there\"}]}"
+    ]
+  },
+  "status": "OK",
+  "span_ids": ["abc123"]
+}

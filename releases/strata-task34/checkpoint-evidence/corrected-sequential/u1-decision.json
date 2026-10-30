@@ -1,0 +1,46 @@
+{
+  "decision": "ACCEPT_SCOPED_CORRECTED_CONTRACT_DIAGNOSTIC",
+  "worker": {
+    "model_requests": 7,
+    "tool_actions": 11,
+    "evidence_actions": 7,
+    "edits": 3,
+    "initial_checks": 1,
+    "post_edit_checks": 3,
+    "format_preparations": 3,
+    "protocol_recoveries": 0,
+    "edit_recoveries": 0,
+    "reserved_output_tokens": 86016
+  },
+  "reviewer": {
+    "status": "pass_to_primary",
+    "used": {
+      "model_requests": 7,
+      "tool_actions": 12,
+      "evidence_actions": 10,
+      "edits": 0,
+      "initial_checks": 0,
+      "post_edit_checks": 0,
+      "format_preparations": 0,
+      "protocol_recoveries": 1,
+      "edit_recoveries": 0,
+      "reserved_output_tokens": 86016
+    },
+    "recovery": "One missing compatible-definitions implementation-body citation corrected within same fresh review."
+  },
+  "independent": "574 passed,72 integration deselected;actual NativeAgent advertisements/stale lookup/replacement dispatch passed.",
+  "actual_new_tests": 11,
+  "reviewer_metadata_error": "Report says12;PrimarycorrectedfromJUnitandAST to11.",
+  "assistance": "Corrected Primary contract before new run;no live repair hints/previous Worker output/source takeover;diagnostic exposed,not blind.",
+  "old_batch": "OriginalU1HOLD/U2NOT_RUNunchanged",
+  "primary_acceptance_binding": {
+    "review_task_id": "review-9d1722c1f47b23bb0c52",
+    "review_run_id": "fresh",
+    "workflow_result": ".agent/tasks/tool-unregister-corrected-1/workflow/runs/first/result.json",
+    "workflow_result_sha256": "0a110a8edb4233a7e28b54de88d3bce0c62f5a7dd55f11ee21b00cab55e1b98a",
+    "review_binding_sha256": "d1bfcc2c298f820d0d24ad997a568923497be9449964c6b756312468410a2278",
+    "report": ".agent/reviews/e37aa982a8743784/.agent/tasks/review-9d1722c1f47b23bb0c52/runs/fresh/readonly-report.json",
+    "report_sha256": "c753675af119a924a7ffb8ed218bcb6fbcfbc6621621687b323d3fa32d92c255",
+    "review_reused": false
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "fixture_ready": true,
+  "active_version": 3,
+  "feature_id": "real-adapter-datetime-trial-3",
+  "original_files": 21,
+  "reference_tests_passed": 10,
+  "original_tests": 3,
+  "primary_added_tests": 7,
+  "mutants": {
+    "naive": [
+      "test_naive_string_utc",
+      "test_real_adapter_roundtrip"
+    ],
+    "swallow": [
+      "test_invalid_string",
+      "test_real_adapter_roundtrip"
+    ],
+    "combined": [
+      "test_invalid_string",
+      "test_naive_string_utc",
+      "test_real_adapter_roundtrip"
+    ]
+  },
+  "all_mutants_detected": true,
+  "source_project_modified": false,
+  "local_model_calls": 0,
+  "real_project_deployment": false,
+  "current_status": "Prepared and deterministically preflighted. E/C/R and optional supervised Coordinator trial not yet run.",
+  "selection": "Restore the existing private _datetime contract in the combined candidate; actual original adapter, sample models, registry, original adapter tests and trace fixtures retained. Reject broader source/caller/schema edits.",
+  "environment_limitations": "Existing kit Python3.12/pytest9.1.1 is not sibling pytest<9 env; missing pytest-asyncio produces warning; no async tests needed. Pyright unavailable/not run. No packages installed.",
+  "candidate": "F:\\ChatGPT\\local-worker-kit\\benchmarks\\work\\capability-fit\\real-adapter-datetime-trial-3\\combined",
+  "contract": "F:\\ChatGPT\\local-worker-kit\\benchmarks\\work\\capability-fit\\real-adapter-datetime-trial-3\\task-contract-v3.json",
+  "local_preflight": "F:\\ChatGPT\\local-worker-kit\\benchmarks\\work\\capability-fit\\real-adapter-datetime-trial-3\\preflight.json",
+  "historical_preparation_failures": "v1 missing registry and wrong added-test formatting; v2 missing errors dependency. Retained without overwriting; zero model-quality failures."
+}

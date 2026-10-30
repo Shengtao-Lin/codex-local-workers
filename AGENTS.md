@@ -83,6 +83,16 @@ an early Explorer call is still logged but may not appear in task-level usage.
 
 ## Local Coder
 
+When trusted configuration explicitly selects `bounded_execution_profile: "bounded-v1"`,
+use the installed `local-bounded-unit.py` entry with an explicit packet/config/report
+instead of the legacy action-loop command below. The optional
+`bounded_compatibility_profile: "flat-v1"` selects flat Coder wire output and the
+direct Reviewer report transport; see `.local-agents/host-proposal.md`.
+The host drives formatting, validation and completion in that mode. Existing
+classification, writable scope, protected tests and Primary acceptance duties remain.
+Qualification is limited to recorded task families; configuration is not permission
+to expand a contract, lower risk or declare an untested family qualified.
+
 Coder is a bounded implementation worker driven directly through LM Studio. It
 does not run inside a general Codex agent loop and has no shell, Git, delegation,
 or unrestricted file-writing action.
@@ -163,7 +173,13 @@ failed validation, new source evidence is still allowed, but four consecutive
 reads/searches without new evidence stop with the last repair focus for a
 narrower rework packet. Two identical focused-test failures without
 an intervening edit stop early for Primary to compare the assertion with the
-intended contract; an outdated test is not assumed. Three matching failures
+intended contract; an outdated test is not assumed. After failed validation,
+two identical find/replace `SAFE_REPLACE` attempts on the same unchanged draft
+also stop as `repeated_noop_after_failed_validation`. No edit or extra validation
+runs for those attempts, and no local repair is consumed. Primary compares the
+archived failure, actual diff and intended contract before choosing source rework,
+contract revision or a reviewed test correction. A real edit resets this no-op
+counter; one no-op retains a bounded recovery opportunity. Three matching failures
 across edits also stop the call. Every validation attempt
 has an immutable `validation-attempt-N.json`, including attempts later
 invalidated by edits. After `SAFE_REPLACE` misses a target, oversized further
@@ -301,6 +317,15 @@ Record the resulting `accept`, `rework`, `replan`, or `takeover` decision with
 `.local-agents/record-review.py`. It writes an immutable per-run `review.json`
 and updates the policy-facing task summary; never edit an existing review to
 change history.
+
+Reviewer `rework` is a recommendation, never authorization to invoke Coder.
+Before recording Reviewer-based rework, Primary supplies `--disposition` with
+the exact canonical Reviewer handoff hash and identity, evidence, and a decision
+for every finding. Confirmed defects and explicitly required test gaps may
+justify a bounded repair; contract conflicts and unresolved evidence go to
+Primary replan. Optional coverage suggestions do not invent new requirements.
+See `.local-agents/review-disposition.md` for the input format. Disposition
+does not bypass validation, independent-review acceptance gates or risk floors.
 
 ## Rework policy
 

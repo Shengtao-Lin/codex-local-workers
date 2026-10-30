@@ -42,6 +42,12 @@ def _load_model_residency() -> Any:
 
 
 MODEL_RESIDENCY = _load_model_residency()
+_single_spec = importlib.util.spec_from_file_location(
+    "local_worker_single_function", SCRIPT_DIR / "single-function-context.py"
+)
+assert _single_spec is not None and _single_spec.loader is not None
+SINGLE_FUNCTION = importlib.util.module_from_spec(_single_spec)
+_single_spec.loader.exec_module(SINGLE_FUNCTION)
 EXCLUDED_PARTS = {
     ".agent",
     ".local-agents",
@@ -53,6 +59,14 @@ EXCLUDED_PARTS = {
     "__pycache__",
 }
 RESERVED_WRITE_PATHS = (".agent", ".local-agents", "AGENTS.md")
+SINGLE_LINE_SCHEMA = {
+    "type": "string",
+    "pattern": "^[^\\r\\n]*$",
+    # JSON Schema patterns are searches; '$' alone can match before a final LF.
+    # Explicit exclusion makes even trailing CR/LF invalid without banning a
+    # literal backslash+n in a legitimate source line.
+    "not": {"pattern": "[\\r\\n]"},
+}
 CODER_ACTION_SCHEMA = {
     "type": "object",
     "properties": {
@@ -73,12 +87,137 @@ CODER_ACTION_SCHEMA = {
         },
         "arguments": {
             "type": "object",
+            # Canonical transport shape, not read/write/contract authority.
+            # Retain extensibility and the legacy parser; the runtime still
+            # checks action-specific required fields and current evidence.
+            "properties": {
+                "path": {"type": "string"},
+                "start_line": {"type": "integer", "minimum": 1},
+                "end_line": {"type": "integer", "minimum": 1},
+                "line": {"type": "integer", "minimum": 1},
+                "expected_sha256": {"type": "string"},
+                "find": {"type": "string"},
+                "replace": {"type": "string"},
+                "replacement": SINGLE_LINE_SCHEMA,
+                "content": {"type": "string"},
+                "query": {"type": "string"},
+                "mode": {"type": "string", "enum": ["literal", "regex"]},
+                "phase": {"type": "string", "enum": ["check", "final"]},
+            },
             "additionalProperties": True,
         },
     },
     "required": ["action", "arguments"],
     "additionalProperties": False,
 }
+
+
+def typed_coder_action_schema(
+    base: dict[str, Any], *, contract_check_required: bool = False
+) -> dict[str, Any]:
+    """Experimental action-tagged transport schema; never an execution gate."""
+    string = {"type": "string"}
+    strings = {"type": "array", "items": string}
+    integer = {"type": "integer", "minimum": 1}
+    obj = {"type": "object", "additionalProperties": True}
+    if type(contract_check_required) is not bool:
+        raise WorkerError("contract_check_required transport flag must be a boolean")
+    shapes = {
+        "READ_FILE": ({"path": string, "start_line": integer, "end_line": integer}, ["path"]),
+        "SEARCH": (
+            {
+                "query": string,
+                "path": string,
+                "glob": string,
+                "mode": {"type": "string", "enum": ["literal", "regex"]},
+                "case_sensitive": {"type": "boolean"},
+                "max_results": integer,
+            },
+            ["query"],
+        ),
+        "SAFE_CREATE": ({"path": string, "content": string}, ["path", "content"]),
+        "SAFE_REPLACE": (
+            {"path": string, "expected_sha256": string, "find": string, "replace": string},
+            ["path", "expected_sha256", "find", "replace"],
+        ),
+        "SAFE_REPLACE_LINE": (
+            {
+                "path": string,
+                "expected_sha256": string,
+                "line": integer,
+                "replacement": SINGLE_LINE_SCHEMA,
+            },
+            ["path", "expected_sha256", "line", "replacement"],
+        ),
+        "VALIDATE": (
+            {"phase": {"type": "string", "enum": ["check", "final"]}, "contract_check": obj},
+            ["contract_check"] if contract_check_required else [],
+        ),
+        "FINISH_SUCCESS": ({"summary": strings, "remaining_uncertainty": strings}, ["summary"]),
+        "FINISH_FAILED": (
+            {"summary": strings, "reason": string, "remaining_uncertainty": strings},
+            ["summary", "reason"],
+        ),
+        "FINISH_BLOCKED": (
+            {
+                "summary": strings,
+                "reason_code": string,
+                "reason": string,
+                "requested_scope": obj,
+                "evidence_refs": strings,
+                "proposed_next_step": string,
+                "remaining_uncertainty": strings,
+            },
+            ["reason_code", "reason"],
+        ),
+        "REQUEST_CONTRACT_REVISION": (
+            {
+                "issue_type": {
+                    "type": "string",
+                    "enum": [
+                        "contract_conflict",
+                        "stale_test_suspected",
+                        "scope_gap",
+                        "missing_context",
+                    ],
+                },
+                "reason": string,
+                "contract_ids": strings,
+                "source_evidence": {"type": "array", "items": obj},
+                "validation_evidence_refs": strings,
+                "requested_scope": obj,
+                "proposed_next_step": string,
+            },
+            ["issue_type", "reason", "proposed_next_step"],
+        ),
+        "PLAN_IMPLEMENTATION": (
+            {"contracts": {"type": "array", "items": obj}, "steps": strings},
+            ["contracts", "steps"],
+        ),
+    }
+    branches = []
+    for action in base["properties"]["action"]["enum"]:
+        if action not in shapes:
+            raise WorkerError(f"unknown typed Coder action: {action}")
+        fields, required = shapes[action]
+        branches.append(
+            {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": [action]},
+                    "arguments": {
+                        "type": "object",
+                        "properties": fields,
+                        "required": required,
+                        "additionalProperties": False,
+                    },
+                },
+                "required": ["action", "arguments"],
+                "additionalProperties": False,
+            }
+        )
+    # Preserve state-specific action allowlists, including terminal/repair gates.
+    return json.loads(json.dumps({"anyOf": branches}))
 
 
 def repair_only_action_schema(base: dict[str, Any], required_action: str) -> dict[str, Any]:
@@ -117,6 +256,19 @@ def validation_only_action_schema(base: dict[str, Any]) -> dict[str, Any]:
         "FINISH_BLOCKED",
         "REQUEST_CONTRACT_REVISION",
     ]
+    return schema
+
+
+def block_edit_action_schema(base: dict[str, Any]) -> dict[str, Any]:
+    """Remove only the single-line capability, preserving the current state gate."""
+    schema = json.loads(json.dumps(base))
+    actions = schema["properties"]["action"]["enum"]
+    schema["properties"]["action"]["enum"] = [
+        action for action in actions if action != "SAFE_REPLACE_LINE"
+    ]
+    fields = schema["properties"]["arguments"].get("properties", {})
+    for field in ("line", "replacement"):
+        fields.pop(field, None)
     return schema
 
 
@@ -282,7 +434,17 @@ class LMStudioClient:
         native_tools: list[dict[str, Any]] | None = None,
         context_length: int | None = None,
         context_safety_margin: int = 1024,
+        typed_action_arguments: bool = False,
+        contract_check_required: bool = False,
     ) -> None:
+        if type(typed_action_arguments) is not bool:
+            raise WorkerError("coder_typed_action_arguments must be a boolean")
+        if typed_action_arguments and (not structured_output or native_tools is not None):
+            raise WorkerError("typed Coder arguments require structured JSON transport")
+        self.typed_action_arguments = typed_action_arguments
+        if type(contract_check_required) is not bool:
+            raise WorkerError("contract_check_required transport flag must be a boolean")
+        self.contract_check_required = contract_check_required
         self.base_url = base_url.rstrip("/")
         self.url = self.base_url + "/chat/completions"
         self.model = model
@@ -301,6 +463,7 @@ class LMStudioClient:
         self.context_length = context_length
         self.context_safety_margin = max(0, context_safety_margin)
         self.last_request_stats: dict[str, Any] = {}
+        self.reasoning_effort: str | None = None
 
     @staticmethod
     def _prompt_sections(messages: list[dict[str, str]]) -> list[dict[str, Any]]:
@@ -430,6 +593,8 @@ class LMStudioClient:
             ) from exc
 
     def complete(self, messages: list[dict[str, str]]) -> str:
+        # Ephemeral correlation data, never diagnostic source/model-text logging.
+        self.last_native_call = None
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
@@ -440,6 +605,10 @@ class LMStudioClient:
             "repeat_penalty": self.repeat_penalty,
             "max_tokens": self.max_tokens,
         }
+        if self.reasoning_effort is not None:
+            if self.reasoning_effort not in {"low", "medium", "high", "xhigh"}:
+                raise WorkerError("Unsupported explicit reasoning effort")
+            payload["reasoning_effort"] = self.reasoning_effort
         if self.native_tools is not None:
             payload["tools"] = self.native_tools
             payload["tool_choice"] = self.native_tool_choice
@@ -450,7 +619,11 @@ class LMStudioClient:
                 "json_schema": {
                     "name": self.schema_name,
                     "strict": True,
-                    "schema": self.action_schema,
+                    "schema": typed_coder_action_schema(
+                        self.action_schema, contract_check_required=self.contract_check_required
+                    )
+                    if self.typed_action_arguments
+                    else self.action_schema,
                 },
             }
         body = json.dumps(payload).encode("utf-8")
@@ -472,6 +645,9 @@ class LMStudioClient:
             "context_safety_margin": self.context_safety_margin,
             "largest_prompt_sections": self._prompt_sections(messages)[:3],
         }
+        residency = getattr(self, "last_model_residency", None)
+        if residency is not None:
+            self.last_request_stats["model_load_observation"] = dict(residency)
         if self.context_length:
             available_input_tokens = max(
                 0, self.context_length - self.max_tokens - self.context_safety_margin
@@ -554,6 +730,26 @@ class LMStudioClient:
             raise WorkerError("LM Studio returned an unexpected response shape") from exc
         finish_reason = payload["choices"][0].get("finish_reason")
         self.last_request_stats["finish_reason"] = finish_reason
+        if isinstance(message, dict):
+            # Diagnose truncation without retaining source, reasoning or action text.
+            response_parts = {}
+            for field in ("content", "reasoning", "reasoning_content"):
+                value = message.get(field)
+                if isinstance(value, str):
+                    response_parts[field] = {"chars": len(value)}
+            calls = message.get("tool_calls")
+            if isinstance(calls, list):
+                response_parts["tool_calls"] = {
+                    "count": len(calls),
+                    "argument_chars": sum(
+                        len(call.get("function", {}).get("arguments", ""))
+                        for call in calls
+                        if isinstance(call, dict)
+                        and isinstance(call.get("function"), dict)
+                        and isinstance(call["function"].get("arguments"), str)
+                    ),
+                }
+            self.last_request_stats["response_parts"] = response_parts
         usage = payload.get("usage")
         if isinstance(usage, dict):
             self.last_request_stats["response_usage"] = {
@@ -588,6 +784,17 @@ class LMStudioClient:
             if not isinstance(name, str):
                 raise WorkerError("LM Studio native tool name is missing")
             self.last_request_stats["native_tool_call"] = name
+            call_id = tool_calls[0].get("id")
+            if not isinstance(call_id, str) or not call_id.strip() or len(call_id) > 128:
+                call_id = "call_" + uuid.uuid4().hex
+            self.last_native_call = {
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": json.dumps(arguments, ensure_ascii=False),
+                },
+            }
             content = json.dumps({"action": name, "arguments": arguments}, ensure_ascii=False)
         else:
             content = message.get("content") if isinstance(message, dict) else None
@@ -734,6 +941,35 @@ def resolve_inherited_packet(repo_root: Path, child: dict[str, Any]) -> dict[str
     if not completed_path.is_file():
         raise WorkerError("parent run is incomplete or missing completed.json")
     parent = load_json(parent_path)
+    review_paths = list((repo_root / ".agent/tasks" / task_id / "reviews").glob("*/handoff.json"))
+    reviewer_blocked = any(
+        (report := load_json(path)).get("identity", {}).get("run_id") == parent_run_id
+        and report.get("decision") in {"rework", "escalate"}
+        for path in review_paths
+    )
+    if reviewer_blocked:
+        primary_path = parent_path.with_name("review.json")
+        if not primary_path.is_file():
+            raise WorkerError("Reviewer-based inherited rework requires Primary disposition")
+        primary = load_json(primary_path)
+        disposition = primary.get("review_disposition") or {}
+        identity = disposition.get("identity") or {}
+        if (
+            primary.get("decision") != "rework"
+            or disposition.get("primary_decision") != "rework"
+            or identity.get("task_id") != task_id
+            or identity.get("unit_id") != unit_id
+            or identity.get("run_id") != parent_run_id
+        ):
+            raise WorkerError("Reviewer-based inherited rework is not confirmed by Primary")
+        review_id = require_identifier(identity.get("review_id"), "review_id")
+        report_path = repo_root / ".agent/tasks" / task_id / "reviews" / review_id / "handoff.json"
+        if disposition.get("report_sha256") != RUN_STATE.sha256_bytes(report_path.read_bytes()):
+            raise WorkerError("Primary disposition references changed Reviewer evidence")
+        confirmed = disposition.get("confirmed_rework_finding_ids", [])
+        cited = [entry.get("finding_id") for entry in feedback if isinstance(entry, dict)]
+        if not cited or any(finding_id not in confirmed for finding_id in cited):
+            raise WorkerError("inherited feedback must cite Primary-confirmed finding ids")
     if parent.get("task_id") != task_id:
         raise WorkerError("parent packet task_id does not match child")
     if parent.get("unit_id", parent.get("task_id")) != unit_id:
@@ -837,10 +1073,21 @@ def scope_roots_overlap(left: str, right: str) -> bool:
     return path_is_within(left, right) or path_is_within(right, left)
 
 
-def normalize_requirements(value: Any, name: str, prefix: str) -> list[dict[str, str]]:
+def citation_binding() -> Any:
+    spec = importlib.util.spec_from_file_location(
+        "local_worker_citation_binding", SCRIPT_DIR / "citation-binding.py"
+    )
+    if spec is None or spec.loader is None:
+        raise WorkerError("could not load citation-binding.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def normalize_requirements(value: Any, name: str, prefix: str) -> list[dict[str, Any]]:
     if not isinstance(value, list) or not value:
         raise WorkerError(f"{name} must be a non-empty array")
-    normalized: list[dict[str, str]] = []
+    normalized: list[dict[str, Any]] = []
     for index, item in enumerate(value, 1):
         if isinstance(item, str) and item.strip():
             normalized.append({"id": f"{prefix}-{index}", "text": item.strip()})
@@ -853,6 +1100,8 @@ def normalize_requirements(value: Any, name: str, prefix: str) -> list[dict[str,
                 normalized_item["risk_floor"] = normalize_risk_level(
                     item["risk_floor"], f"{name}[{index}].risk_floor"
                 )
+            if name == "required_behavior" and "implementation_ref" in item:
+                normalized_item["implementation_ref"] = item["implementation_ref"]
             normalized.append(normalized_item)
         else:
             raise WorkerError(f"{name}[{index}] must be a string or id/text object")
@@ -1030,6 +1279,19 @@ def validate_packet(packet: dict[str, Any]) -> dict[str, Any]:
         packet.get("owned_contract_ids", [item["id"] for item in packet["required_behavior"]]),
         "owned_contract_ids",
     )
+    for behavior in packet["required_behavior"]:
+        if "implementation_ref" in behavior:
+            if behavior["id"] not in packet["owned_contract_ids"]:
+                raise WorkerError("implementation_ref must belong to an owned behavior")
+            try:
+                behavior["implementation_ref"] = citation_binding().validate_binding(
+                    behavior["implementation_ref"],
+                    readable=scope["read"],
+                    forbidden=scope["forbidden"],
+                    tests=sorted(focused_paths | set(packet["supplemental_tests"])),
+                )
+            except ValueError as exc:
+                raise WorkerError(str(exc)) from exc
     unknown_contracts = sorted(set(packet["owned_contract_ids"]) - available_contract_ids)
     if unknown_contracts:
         raise WorkerError(
@@ -1064,7 +1326,12 @@ def validate_packet(packet: dict[str, Any]) -> dict[str, Any]:
     )
     if not isinstance(contract_check_required, bool):
         raise WorkerError("contract_check_required must be a boolean")
-    packet["contract_check_required"] = contract_check_required
+    # The automatic handoff always requires ordering acknowledgement. An
+    # explicit false from a reusable packet must not let Coder reach a terminal
+    # state that the identical handoff contract will mechanically reject.
+    packet["contract_check_required"] = contract_check_required or bool(
+        packet["required_order"] or packet["forbidden_orderings"]
+    )
     packet["validation_profile"] = require_string(
         packet.get("validation_profile", "python-focused"), "validation_profile"
     )
@@ -1133,7 +1400,44 @@ class WorkerRuntime:
         self.repo_root = repo_root.resolve()
         self.source_packet = json.loads(json.dumps(packet))
         self.packet = validate_packet(json.loads(json.dumps(packet)))
+        if getattr(client, "typed_action_arguments", False):
+            # Bind the wire requirement to the normalized trusted packet, never
+            # a model assertion, and retain it through every state allowlist.
+            client.contract_check_required = self.packet["contract_check_required"]
         self.config = config
+        self.single_function = SINGLE_FUNCTION.configure(
+            config.get("coder_single_function"), self.packet
+        )
+        self.single_function_patch_repair = config.get("coder_single_function_patch_repair", False)
+        if type(self.single_function_patch_repair) is not bool:
+            raise WorkerError("coder_single_function_patch_repair must be a boolean")
+        if self.single_function_patch_repair and (
+            self.single_function is None
+            or not self.packet["contract_check_required"]
+            or not getattr(client, "structured_output", False)
+            or getattr(client, "native_tools", None) is not None
+        ):
+            raise WorkerError(
+                "patch repair requires single-function mode, contract check and plain structured JSON"
+            )
+        self.block_edits_only = config.get("coder_block_edits_only", False)
+        if type(self.block_edits_only) is not bool:
+            raise WorkerError("coder_block_edits_only must be a boolean")
+        if self.block_edits_only and getattr(client, "native_tools", None) is not None:
+            raise WorkerError("coder_block_edits_only currently requires JSON action transport")
+        self.require_implementation_plan = config.get("coder_require_implementation_plan", False)
+        if type(self.require_implementation_plan) is not bool:
+            raise WorkerError("coder_require_implementation_plan must be a boolean")
+        self.implementation_plan: dict[str, Any] | None = None
+        self.diverse_failure_examples = config.get("coder_diverse_failure_examples", False)
+        if type(self.diverse_failure_examples) is not bool:
+            raise WorkerError("coder_diverse_failure_examples must be a boolean")
+        self.post_edit_source_echo = config.get("coder_post_edit_source_echo", False)
+        if type(self.post_edit_source_echo) is not bool:
+            raise WorkerError("coder_post_edit_source_echo must be a boolean")
+        self.reset_failed_repair_context = config.get("coder_reset_failed_repair_context", False)
+        if type(self.reset_failed_repair_context) is not bool:
+            raise WorkerError("coder_reset_failed_repair_context must be a boolean")
         self.context_retention = config.get("coder_context_retention", "recent")
         if not isinstance(self.context_retention, str) or self.context_retention not in {
             "recent",
@@ -1222,6 +1526,7 @@ class WorkerRuntime:
                 "timeouts/output/model turns must be positive, repair_turn_reserve must be nonnegative, and hard_max_model_turns must be at least max_model_turns",
             )
         self.protocol_errors = 0
+        self.native_text_truncation_nudge_used = False
         self.observable_scenario_shape_repair_used = False
         self.protocol_normalizations = 0
         self.protocol_error_details: list[dict[str, Any]] = []
@@ -1261,7 +1566,9 @@ class WorkerRuntime:
         self.duplicate_read_streak = 0
         self.duplicate_read_count = 0
         self.noop_repair_attempts = 0
+        self.failed_validation_noop_count = 0
         self.multiline_shape_repair_revisions: set[tuple[str, int]] = set()
+        self.multiline_shape_transport_pending = False
         self.noop_validation_nudge_revisions: set[int] = set()
         self.noop_validation_pending = False
         self.repair_supervision_states: set[tuple[int, int]] = set()
@@ -1272,6 +1579,7 @@ class WorkerRuntime:
         self.prevalidation_no_evidence_streak = 0
         self.failed_validation_no_evidence_streak = 0
         self.observed_evidence_lines: set[tuple[str, str, int]] = set()
+        self.presented_repair_lines: set[tuple[str, str, int]] = set()
         self.symbol_search_count = 0
         self.replace_mismatch_paths: set[str] = set()
         self.initial_hashes: dict[str, str | None] = {}
@@ -1453,6 +1761,8 @@ class WorkerRuntime:
             return "malformed_model_json"
         if "file changed since it was read" in message:
             return "stale_read_hash"
+        if "safe_replace_line requires the current line to be observed" in message:
+            return "unobserved_line_edit"
         if "repair budget is exhausted" in message:
             return "repair_budget_exhausted"
         if isinstance(exc, SafeEditError):
@@ -1619,7 +1929,7 @@ class WorkerRuntime:
         python_path = self.python_path()
         if not python_path.is_file():
             raise PreflightBlocked("python_missing", f"project Python was not found: {python_path}")
-        pytest_check = self._run_command([str(python_path), "-c", "import pytest"])
+        pytest_check = self._run_command([str(python_path), "-B", "-c", "import pytest"])
         if pytest_check["status"] != "passed":
             raise PreflightBlocked(
                 "pytest_missing",
@@ -1633,7 +1943,7 @@ class WorkerRuntime:
         }
 
     def system_prompt(self) -> str:
-        return """You are a bounded local implementation worker. The current packet is authoritative.
+        prompt = """You are a bounded local implementation worker. The current packet is authoritative.
 You may request exactly one action per turn. Output one JSON object with exactly
 two top-level fields: action (string) and arguments (object), matching the action schema:
 {"action":"READ_FILE","arguments":{"path":"src/example.py","start_line":1}}
@@ -1646,7 +1956,8 @@ Available actions and their arguments:
   in this call may be read and replaced later in the same call; creation does not
   authorize modifying a pre-existing file or a later call.
 - SAFE_REPLACE_LINE: path, expected_sha256, line, replacement. The line must
-  have been observed by READ_FILE or SEARCH at the current file hash. Use a
+  have been observed by READ_FILE, SEARCH, or a complete runtime-prefetched
+  source line at the current file hash. Use a
   single replacement line without a newline when exact block matching fails.
   replacement "" blanks only that line; it does not shift or copy adjacent lines.
   To delete a statement, SAFE_REPLACE its exact text with replace "". Never
@@ -1736,6 +2047,24 @@ evidence. If a configured check fails, use its exact rule, path, and line first;
 make the smallest local correction before broad rereads or another VALIDATE.
 For an unused assignment, preserve any needed call or validation side effect
 while removing only the unused binding. Previous attempts are context, not authority."""
+        if getattr(self, "require_implementation_plan", False):
+            prompt += (
+                "\nExperimental pre-edit self-check is enabled. After reading current writable "
+                "source and a focused protected test and observing baseline VALIDATE, emit "
+                "PLAN_IMPLEMENTATION before your first edit. Arguments: contracts (one object "
+                "per owned_contract_ids entry, with id and approach), steps (1 to 8 short strings). "
+                "Explain how your proposed algorithm preserves EACH invariant, especially boundary "
+                "and error behavior; compare it against actual tests, not just a familiar pattern. "
+                "This is an untrusted plan, not evidence of success or permission to change scope. "
+                "It cannot change the packet or replace validation/review. Submit once, then edit "
+                "and validate normally; later failures still require actual repairs.\n"
+            )
+        if getattr(self, "block_edits_only", False):
+            # Remove the obsolete capability description, not add another nudge.
+            start = prompt.index("- SAFE_REPLACE_LINE:")
+            end = prompt.index("- VALIDATE:", start)
+            prompt = prompt[:start] + prompt[end:]
+        return prompt
 
     def run(self) -> dict[str, Any]:
         self.deadline = time.monotonic() + self.invocation_timeout
@@ -1764,11 +2093,40 @@ while removing only the unused binding. Previous attempts are context, not autho
             turn_limit = self.max_turns
             _turn = 0
             while _turn < turn_limit:
+                if self._is_repair_edit() and self.repairs >= self.max_repairs:
+                    self.archive.event(
+                        "repair_budget_runtime_finalized",
+                        {
+                            "repair_count": self.repairs,
+                            "max_repairs": self.max_repairs,
+                            "validation_count": self.validation_count,
+                            "edit_revision": self.edit_revision,
+                        },
+                    )
+                    return self._complete_run(
+                        self.report(
+                            "failed",
+                            [
+                                "Current validation still failed after the bounded local repair budget."
+                            ],
+                            "local repair budget is exhausted",
+                            [
+                                "Primary should inspect the archived failing evidence and choose focused rework or takeover."
+                            ],
+                        )
+                    )
                 _turn += 1
                 self._remaining_seconds("model request")
                 original_timeout = getattr(self.client, "timeout", None)
                 original_action_schema = getattr(self.client, "action_schema", None)
                 original_schema_name = getattr(self.client, "schema_name", None)
+                original_typed_arguments = getattr(self.client, "typed_action_arguments", False)
+                plan_required_turn = (
+                    self.require_implementation_plan
+                    and self.implementation_plan is None
+                    and getattr(self.client, "structured_output", False)
+                    and isinstance(original_action_schema, dict)
+                )
                 supervised_repair = self._required_repair_focus()
                 repair_only_turn = (
                     supervised_repair is not None
@@ -1789,7 +2147,19 @@ while removing only the unused binding. Previous attempts are context, not autho
                     and getattr(self.client, "structured_output", False)
                     and isinstance(original_action_schema, dict)
                 )
-                if validation_only_turn:
+                if plan_required_turn:
+                    self.client.action_schema = json.loads(json.dumps(original_action_schema))
+                    self.client.action_schema["properties"]["action"]["enum"] = [
+                        "READ_FILE",
+                        "SEARCH",
+                        "VALIDATE",
+                        "PLAN_IMPLEMENTATION",
+                        "FINISH_FAILED",
+                        "FINISH_BLOCKED",
+                        "REQUEST_CONTRACT_REVISION",
+                    ]
+                    self.client.schema_name = "local_coder_pre_edit_plan"
+                elif validation_only_turn:
                     self.client.action_schema = validation_only_action_schema(
                         original_action_schema
                     )
@@ -1811,13 +2181,54 @@ while removing only the unused binding. Previous attempts are context, not autho
                     self.client.action_schema = post_edit_progress_schema(original_action_schema)
                     self.client.schema_name = "local_coder_post_edit_progress"
                     self.archive.event("post_edit_progress_gate", {"turn": _turn})
+                multiline_shape_turn = (
+                    self.multiline_shape_transport_pending
+                    and getattr(self.client, "structured_output", False)
+                    and isinstance(original_action_schema, dict)
+                )
+                # Compose with the current state allowlist, never replace a
+                # validation/repair gate with a broader list. This is a one-shot
+                # transport correction, not an automatic edit or hash grant.
+                self.multiline_shape_transport_pending = False
+                if multiline_shape_turn:
+                    narrowed = json.loads(json.dumps(self.client.action_schema))
+                    allowed = narrowed["properties"]["action"]["enum"]
+                    narrowed["properties"]["action"]["enum"] = [
+                        name for name in allowed if name != "SAFE_REPLACE_LINE"
+                    ]
+                    self.client.action_schema = narrowed
+                    self.client.schema_name = "local_coder_multiline_block_repair"
+                    self.archive.event("multiline_block_transport_nudge", {"turn": _turn})
+                if self.block_edits_only and isinstance(original_action_schema, dict):
+                    # Apply last: repair/post-edit helpers can otherwise restore LINE.
+                    self.client.action_schema = block_edit_action_schema(self.client.action_schema)
+                patch_only_turn = (
+                    self.single_function_patch_repair
+                    and supervised_repair is not None
+                    and not self.noop_validation_pending
+                )
+                if patch_only_turn:
+                    # Patch fields have their own schema; normal action typing is
+                    # restored before the fresh contract-check/VALIDATE request.
+                    self.client.typed_action_arguments = False
+                    self.client.action_schema = SINGLE_FUNCTION.PATCH_SCHEMA
+                    self.client.schema_name = "local_coder_single_function_patch"
+                    self.archive.event(
+                        "single_function_patch_phase",
+                        {"turn": _turn, "edit_revision": self.edit_revision},
+                    )
                 if isinstance(original_timeout, (int, float)):
                     self.client.timeout = max(
                         1, min(original_timeout, int(self._remaining_seconds("model request")))
                     )
                 try:
                     self.archive.mark_model_started()
-                    raw = self.client.complete(self._trim_messages(messages))
+                    request_messages = (
+                        SINGLE_FUNCTION.patch_messages(self, messages)
+                        if patch_only_turn
+                        else self._trim_messages(messages)
+                    )
+                    raw = self.client.complete(request_messages)
                     request_stats = getattr(self.client, "last_request_stats", None)
                     if isinstance(request_stats, dict) and request_stats:
                         self.archive.event("model_request", dict(request_stats))
@@ -1847,19 +2258,93 @@ while removing only the unused binding. Previous attempts are context, not autho
                         self._remaining_seconds("model request")
                     except InvocationInterrupted as interrupted:
                         return self._complete_run(self._interrupted_report(interrupted))
+                    stats = request_stats if isinstance(request_stats, dict) else {}
+                    parts = stats.get("response_parts", {})
+                    parts = parts if isinstance(parts, dict) else {}
+                    calls = parts.get("tool_calls", {})
+                    content = parts.get("content", {})
+                    tools = getattr(self.client, "native_tools", None)
+                    names = [
+                        tool["function"]["name"]
+                        for tool in (tools if isinstance(tools, list) else [])
+                        if isinstance(tool, dict)
+                        and isinstance(tool.get("function"), dict)
+                        and isinstance(tool["function"].get("name"), str)
+                    ]
+                    if (
+                        self.config.get("coder_native_text_truncation_nudge", False) is True
+                        and not self.native_text_truncation_nudge_used
+                        and not self._validated_terminal_state()
+                        and getattr(self.client, "native_tool_choice", None) == "required"
+                        and names
+                        and stats.get("rejection_reason") == "output_token_limit"
+                        and stats.get("provider_finish_reason") == "length"
+                        and str(exc).startswith("LM Studio truncated the response")
+                        and isinstance(calls, dict)
+                        and type(calls.get("count")) is int
+                        and calls["count"] == 0
+                        and isinstance(content, dict)
+                        and type(content.get("chars")) is int
+                        and content["chars"] > 0
+                    ):
+                        self.native_text_truncation_nudge_used = True
+                        self.protocol_errors += 1
+                        self.protocol_error_details.append(
+                            {"error_code": "native_text_truncated", "error": str(exc)}
+                        )
+                        self.archive.event(
+                            "native_text_truncation_nudge",
+                            {
+                                "turn": _turn,
+                                "no_action_executed": True,
+                                "protocol_errors": self.protocol_errors,
+                            },
+                        )
+                        if self.protocol_errors < self.max_protocol_errors:
+                            messages.append(
+                                {
+                                    "role": "user",
+                                    "content": "NATIVE_TEXT_TRUNCATION_REPAIR\n"
+                                    + json.dumps(
+                                        {
+                                            "status": "error",
+                                            "no_action_executed": True,
+                                            "available_native_functions": names,
+                                            "instruction": "The previous generation hit its output limit without a native call. No partial output or edit was executed. Use exactly one currently advertised native function with bounded arguments; do not emit prose, Markdown or a textual action envelope. Current packet, scope, hashes, validation and remaining budgets are unchanged. If uncertain, use an allowed failure/block/revision action, never claim success without current validation.",
+                                        }
+                                    ),
+                                }
+                            )
+                            continue
                     return self._complete_run(
                         self.report("failed", ["Model transport failed."], str(exc), [])
                     )
                 finally:
+                    if patch_only_turn:
+                        self.client.typed_action_arguments = original_typed_arguments
                     if isinstance(original_timeout, (int, float)):
                         self.client.timeout = original_timeout
-                    if validation_only_turn or repair_only_turn or post_edit_progress_turn:
+                    if (
+                        plan_required_turn
+                        or validation_only_turn
+                        or repair_only_turn
+                        or post_edit_progress_turn
+                        or multiline_shape_turn
+                        or patch_only_turn
+                        or (self.block_edits_only and isinstance(original_action_schema, dict))
+                    ):
                         self.client.action_schema = original_action_schema
                         self.client.schema_name = original_schema_name
                 messages.append({"role": "assistant", "content": raw})
                 action: dict[str, Any] | None = None
                 try:
-                    action = parse_action(raw)
+                    if patch_only_turn:
+                        try:
+                            action = SINGLE_FUNCTION.patch_action(raw)
+                        except ValueError as exc:
+                            raise WorkerError(str(exc)) from exc
+                    else:
+                        action = parse_action(raw)
                     warnings = action.pop("_warnings")
                     self.protocol_normalizations += len(warnings)
                     required_repair = self._required_repair_focus()
@@ -1923,11 +2408,19 @@ while removing only the unused binding. Previous attempts are context, not autho
                             "error": "post_edit_progress_required",
                             "required_next_actions": [
                                 "SAFE_REPLACE",
-                                "SAFE_REPLACE_LINE",
+                                *([] if self.block_edits_only else ["SAFE_REPLACE_LINE"]),
                                 "VALIDATE",
                                 "FINISH_BLOCKED",
                             ],
-                            "next_step": "The current edit has not been validated. Edit another target with SAFE_REPLACE or SAFE_REPLACE_LINE, or VALIDATE now; do not read or search again.",
+                            "next_step": (
+                                "The current edit has not been validated. Edit another target with "
+                                + (
+                                    "SAFE_REPLACE"
+                                    if self.block_edits_only
+                                    else "SAFE_REPLACE or SAFE_REPLACE_LINE"
+                                )
+                                + ", or VALIDATE now; do not read or search again."
+                            ),
                         }
                         finished = None
                         self.archive.event("post_edit_progress_rejected", {"turn": _turn})
@@ -2047,6 +2540,22 @@ while removing only the unused binding. Previous attempts are context, not autho
                             )
                     else:
                         observation, finished = self.execute(action)
+                    if (
+                        patch_only_turn
+                        and action["action"] == "SAFE_REPLACE"
+                        and observation.get("status") == "ok"
+                    ):
+                        # Reuse the existing execution gate, not an inferred VALIDATE.
+                        # _record_edit has invalidated every prior acknowledgement.
+                        self.noop_validation_pending = True
+                        observation["required_next_action"] = "VALIDATE"
+                        observation["next_step"] = (
+                            "Inspect the current edited function against its contract, then VALIDATE with a fresh contract_check; no previous confirmation remains valid."
+                        )
+                        self.archive.event(
+                            "single_function_patch_confirmation_required",
+                            {"edit_revision": self.edit_revision},
+                        )
                     if action["action"] == "VALIDATE" and self.first_validation_turn is None:
                         self.first_validation_turn = _turn
                         extended_limit = min(
@@ -2153,7 +2662,8 @@ while removing only the unused binding. Previous attempts are context, not autho
                             self.post_edit_progress_nudges.add(self.edit_revision)
                             observation["post_edit_progress_nudge"] = (
                                 "This edit version has enough investigation. Next SAFE_REPLACE "
-                                "or SAFE_REPLACE_LINE another authorized target, or VALIDATE."
+                                + ("" if self.block_edits_only else "or SAFE_REPLACE_LINE ")
+                                + "another authorized target, or VALIDATE."
                             )
                             self.archive.event("post_edit_progress_nudge", {"turn": _turn})
                     if (
@@ -2302,6 +2812,7 @@ while removing only the unused binding. Previous attempts are context, not autho
                     )
                     if multiline_shape_repair:
                         self.multiline_shape_repair_revisions.add(edit_shape_key)
+                        self.multiline_shape_transport_pending = True
                         self.archive.event(
                             "multiline_edit_shape_repair",
                             {"turn": _turn, "path": edit_shape_key[0]},
@@ -2314,6 +2825,26 @@ while removing only the unused binding. Previous attempts are context, not autho
                         and self.validation is None
                         and self.edit_revision not in self.noop_validation_nudge_revisions
                     )
+                    if self._repeated_failed_validation_noop(action, exc):
+                        self.archive.event(
+                            "failed_validation_noop_stop",
+                            {"turn": _turn, "edit_revision": self.edit_revision},
+                        )
+                        return self._complete_run(
+                            self.report(
+                                "failed",
+                                [
+                                    "Two no-op replacements followed failed validation on the same draft."
+                                ],
+                                "repeated_noop_after_failed_validation",
+                                [
+                                    "Primary must compare the immutable failing validation and actual diff "
+                                    "with the intended contract, then choose source rework, contract revision "
+                                    "or a Primary-reviewed test correction. Do not assume the test is stale; "
+                                    "no edit or additional validation ran for either no-op."
+                                ],
+                            )
+                        )
                     if noop_validation_nudge:
                         self.noop_validation_nudge_revisions.add(self.edit_revision)
                         self.noop_validation_pending = True
@@ -2348,6 +2879,41 @@ while removing only the unused binding. Previous attempts are context, not autho
                     }
                     if details:
                         observation["details"] = details
+                    if (
+                        action is not None
+                        and action["action"] == "SAFE_REPLACE_LINE"
+                        and error_code
+                        in {
+                            "stale_read_hash",
+                            "unobserved_line_edit",
+                        }
+                    ):
+                        target = action["arguments"]
+                        try:
+                            relative, resolved = self._assert_read_allowed(target.get("path"))
+                            line = target.get("line", target.get("line_number"))
+                            if isinstance(line, str) and line.isdecimal():
+                                line = int(line)
+                            total = len(resolved.read_text(encoding="utf-8-sig").splitlines())
+                            if (
+                                relative in self.packet["scope"]["modify"]
+                                and type(line) is int
+                                and 1 <= line <= total
+                            ):
+                                observation["edit_repair"] = {
+                                    "suggested_action": {
+                                        "action": "READ_FILE",
+                                        "arguments": {
+                                            "path": relative,
+                                            "start_line": max(1, line - 3),
+                                            "end_line": min(total, line + 3),
+                                        },
+                                    },
+                                    "instruction": "No edit ran. Read this current range, use its returned hash and real line number, then make a non-no-op edit or VALIDATE the existing changed draft. Old coordinates/hashes are not authority.",
+                                    "navigation_only": True,
+                                }
+                        except (WorkerError, SafeEditError, OSError, UnicodeError, TypeError):
+                            pass
                     if noop_validation_nudge:
                         observation["required_next_action"] = "VALIDATE"
                         observation["next_step"] = (
@@ -2427,7 +2993,9 @@ while removing only the unused binding. Previous attempts are context, not autho
                             },
                             "max_find_chars_after_mismatch": self.max_replace_chars_after_mismatch,
                             "alternate_action": (
-                                "SAFE_REPLACE_LINE with current sha256, an already observed line "
+                                "SAFE_REPLACE with current sha256 and a shorter exact current find block"
+                                if self.block_edits_only
+                                else "SAFE_REPLACE_LINE with current sha256, an already observed line "
                                 "number, and one replacement line without a newline"
                             ),
                         }
@@ -2475,6 +3043,25 @@ while removing only the unused binding. Previous attempts are context, not autho
                         )
                 if finished is not None:
                     return self._complete_run(finished)
+                if self.require_implementation_plan and self.implementation_plan is None:
+                    observation["plan_required"] = {
+                        "instruction": "Read current source and a focused test, observe baseline VALIDATE, then submit this untrusted plan before editing. Fill approaches from actual source/tests; this is not semantic verification.",
+                        "example_action": {
+                            "action": "PLAN_IMPLEMENTATION",
+                            "arguments": {
+                                "contracts": [
+                                    {
+                                        "id": contract_id,
+                                        "approach": "REPLACE WITH INVARIANT-SPECIFIC APPROACH",
+                                    }
+                                    for contract_id in self.packet["owned_contract_ids"]
+                                ],
+                                "steps": [
+                                    "REPLACE WITH BOUNDED IMPLEMENTATION AND VALIDATION STEPS"
+                                ],
+                            },
+                        },
+                    }
                 if (observation.get("validation") or {}).get("no_progress_stop"):
                     unchanged = (
                         observation["validation"]["no_progress_stop"]
@@ -2550,6 +3137,7 @@ while removing only the unused binding. Previous attempts are context, not autho
                     )
                     if restored is not None:
                         repair_payload["restored_prior_read"] = restored
+                    self._register_presented_repair_evidence(repair_payload)
                     messages = messages[:2] + [
                         {
                             "role": "user",
@@ -2577,6 +3165,15 @@ while removing only the unused binding. Previous attempts are context, not autho
                         repair_payload = self._compact_repair_payload(focus)
                         if repair_payload["source_excerpts"]:
                             prior_message_count = len(messages)
+                            self._register_presented_repair_evidence(repair_payload)
+                            if (
+                                focus.get("check_id") == "pyright"
+                                or self.reset_failed_repair_context
+                            ):
+                                # Formatting can invalidate every prior source hash. Keep
+                                # the contract, but present only the current repair draft.
+                                messages = messages[:2]
+                                self.context_trimmed = True
                             messages.append(
                                 {
                                     "role": "user",
@@ -2594,10 +3191,8 @@ while removing only the unused binding. Previous attempts are context, not autho
                                 },
                             )
                             continue
-                encoded = json.dumps(observation, ensure_ascii=False)
-                messages.append(
-                    {"role": "user", "content": "OBSERVATION\n" + encoded[: self.max_output]}
-                )
+                encoded = self._encode_observation(observation)
+                messages.append({"role": "user", "content": "OBSERVATION\n" + encoded})
             return self._complete_run(
                 self.report("failed", ["The model turn budget was exhausted."], "turn limit", [])
             )
@@ -2643,6 +3238,8 @@ while removing only the unused binding. Previous attempts are context, not autho
             self.close()
 
     def _trim_messages(self, messages: list[dict[str, str]]) -> list[dict[str, str]]:
+        if self.single_function is not None:
+            return SINGLE_FUNCTION.messages(self, messages)
         if self.repair_focus_retention == "latest":
             focuses = [
                 index
@@ -2710,6 +3307,7 @@ while removing only the unused binding. Previous attempts are context, not autho
         name = envelope["action"]
         args = envelope["arguments"]
         handlers = {
+            "PLAN_IMPLEMENTATION": self.plan_implementation,
             "READ_FILE": self.read_file,
             "SEARCH": self.search,
             "SAFE_CREATE": self.safe_create,
@@ -3006,8 +3604,57 @@ while removing only the unused binding. Previous attempts are context, not autho
         }
 
     def _begin_edit(self) -> None:
+        if self.require_implementation_plan and self.implementation_plan is None:
+            raise WorkerError("PLAN_IMPLEMENTATION is required before the first edit")
         if self._is_repair_edit() and self.repairs >= self.max_repairs:
             raise WorkerError("local repair budget is exhausted; finish with failure")
+
+    def plan_implementation(self, args: dict[str, Any]) -> dict[str, Any]:
+        if not self.require_implementation_plan:
+            raise WorkerError("PLAN_IMPLEMENTATION is not enabled for this invocation")
+        if self.implementation_plan is not None or self.edit_revision:
+            raise WorkerError("PLAN_IMPLEMENTATION may be submitted only once before editing")
+        if self.validation_count == 0:
+            raise WorkerError("PLAN_IMPLEMENTATION requires an observed baseline VALIDATE")
+        current_reads = set()
+        for (path, digest), coverage in self.read_coverage.items():
+            if coverage and self.editor.read_bytes(path)[1] == digest:
+                current_reads.add(path)
+        if (
+            self.packet["scope"]["modify"]
+            and not current_reads.intersection(self.packet["scope"]["modify"])
+        ) or not any(
+            path.split("::", 1)[0] in current_reads for path in self.packet["focused_tests"]
+        ):
+            raise WorkerError("PLAN_IMPLEMENTATION requires current source and focused test reads")
+        contracts = args.get("contracts")
+        owned = set(self.packet["owned_contract_ids"])
+        if not isinstance(contracts, list) or len(contracts) != len(owned):
+            raise WorkerError("PLAN_IMPLEMENTATION requires every owned contract exactly once")
+        normalized = []
+        seen = set()
+        for item in contracts:
+            if not isinstance(item, dict):
+                raise WorkerError("PLAN_IMPLEMENTATION contracts must be objects")
+            contract_id = require_string(item.get("id"), "plan contract id")
+            if contract_id not in owned or contract_id in seen:
+                raise WorkerError("PLAN_IMPLEMENTATION has unknown or duplicate contract ids")
+            approach = require_string(item.get("approach"), "plan approach")
+            if len(approach) > 1200:
+                raise WorkerError("PLAN_IMPLEMENTATION approach exceeds 1200 characters")
+            seen.add(contract_id)
+            normalized.append({"id": contract_id, "approach": approach})
+        steps = require_string_list(args.get("steps"), "plan steps")
+        if not 1 <= len(steps) <= 8 or any(len(step) > 500 for step in steps):
+            raise WorkerError("PLAN_IMPLEMENTATION needs 1 to 8 steps of at most 500 characters")
+        plan = {"contracts": normalized, "steps": steps, "untrusted": True}
+        RUN_STATE.write_json_once(self.archive.run_root / "implementation-plan.json", plan)
+        self.implementation_plan = plan
+        self.archive.event("implementation_plan_recorded", {"contract_ids": sorted(seen)})
+        return {
+            "status": "recorded_unverified",
+            "next_step": "Implement the in-scope unit and VALIDATE; your plan is not verification.",
+        }
 
     def _is_repair_edit(self) -> bool:
         # A child call gets its own bounded budget, not a new initial implementation.
@@ -3022,6 +3669,7 @@ while removing only the unused binding. Previous attempts are context, not autho
             self.repairs += 1
         self.pending_failed_validation = False
         self.edit_revision += 1
+        self.failed_validation_noop_count = 0
         self.failed_validation_no_evidence_streak = 0
         self.validation = None
         self.last_contract_check = None
@@ -3067,9 +3715,52 @@ while removing only the unused binding. Previous attempts are context, not autho
         ]
         if placeholders:
             observation["unfinished_implementation_warnings"] = placeholders[:4]
+        if self.post_edit_source_echo:
+            try:
+                relative, _ = self._assert_read_allowed(result["path"])
+                raw, digest = self.editor.read_bytes(relative)
+                if digest == result["sha256"]:
+                    current = raw.decode("utf-8-sig").splitlines()
+                    before = (self.preimages.get(relative) or b"").decode("utf-8-sig").splitlines()
+                    ranges = []
+                    for tag, _, _, start, end in difflib.SequenceMatcher(
+                        None, before, current
+                    ).get_opcodes():
+                        if tag == "equal" or (ranges and start < ranges[-1][1]):
+                            continue
+                        ranges.append(
+                            (
+                                max(0, start - 3),
+                                min(len(current), max(end, start + 1) + 3, start + 20),
+                            )
+                        )
+                        if len(ranges) == 2:
+                            break
+                    excerpts = [
+                        {
+                            "path": relative,
+                            "sha256": digest,
+                            "start_line": start + 1,
+                            "end_line": end,
+                            "content": "\n".join(
+                                f"{n + 1}: {current[n]}" for n in range(start, end)
+                            )[:4000],
+                        }
+                        for start, end in ranges
+                        if start < end
+                    ]
+                    echo = {
+                        "source_excerpts": excerpts,
+                        "instruction": "Actual current post-edit source, not a model prediction. Only fully displayed lines qualify for a later line edit at this hash; validation remains required.",
+                    }
+                    observation["post_edit_source_read"] = echo
+            except (WorkerError, SafeEditError, OSError, UnicodeError):
+                pass  # A drifted/unreadable postimage never becomes edit authority.
         return observation
 
     def safe_create(self, args: dict[str, Any]) -> dict[str, Any]:
+        if self.single_function is not None:
+            raise WorkerError("SAFE_CREATE is unavailable in single-function mode")
         self._begin_edit()
         content = args.get("content")
         if not isinstance(content, str):
@@ -3081,7 +3772,30 @@ while removing only the unused binding. Previous attempts are context, not autho
             )
         )
 
+    def _repeated_failed_validation_noop(
+        self, action: dict[str, Any] | None, error: Exception
+    ) -> bool:
+        if (
+            action is None
+            or action.get("action") != "SAFE_REPLACE"
+            or not str(error).startswith("SAFE_REPLACE find and replace are identical")
+            or not self.pending_failed_validation
+            or self.validation is None
+            or self.validation.status != "failed"
+        ):
+            return False
+        self.failed_validation_noop_count += 1
+        return self.failed_validation_noop_count >= 2
+
     def safe_replace(self, args: dict[str, Any]) -> dict[str, Any]:
+        if self.single_function is not None:
+            try:
+                raw, _ = self.editor.read_bytes(self.single_function["path"])
+                SINGLE_FUNCTION.guard(
+                    self.single_function, raw.decode("utf-8-sig").replace("\r\n", "\n"), args
+                )
+            except (ValueError, SyntaxError) as exc:
+                raise WorkerError(str(exc)) from exc
         self._begin_edit()
         path = require_string(args.get("path"), "path")
         find = args.get("find")
@@ -3114,6 +3828,13 @@ while removing only the unused binding. Previous attempts are context, not autho
         )
 
     def safe_replace_line(self, args: dict[str, Any]) -> dict[str, Any]:
+        if self.single_function is not None:
+            raise WorkerError("SAFE_REPLACE_LINE is unavailable in single-function mode")
+        if self.block_edits_only:
+            raise WorkerError(
+                "SAFE_REPLACE_LINE is unavailable in block-only mode; use SAFE_REPLACE "
+                "with the current hash and an exact observed find/replace block"
+            )
         self._begin_edit()
         path = require_string(args.get("path"), "path")
         relative, _resolved = self.editor.resolve(path)
@@ -3122,13 +3843,26 @@ while removing only the unused binding. Previous attempts are context, not autho
         if isinstance(line, str) and line.isdecimal():
             line = int(line)
         if type(line) is not int or line < 1:
-            raise WorkerError("SAFE_REPLACE_LINE line must be a positive integer")
+            error = WorkerError("SAFE_REPLACE_LINE line must be a positive integer")
+            error.details = {
+                "field_shape": {
+                    "action": "SAFE_REPLACE_LINE",
+                    "required_fields": ["path", "expected_sha256", "line", "replacement"],
+                    "line": "positive integer from currently observed source, not source text or a range",
+                    "replacement": "one string line, without newline characters",
+                    "block_alternative": "For multiple lines use SAFE_REPLACE with path, expected_sha256, exact current find and replace strings. No edit ran; do not invent coordinates or source.",
+                    "navigation_only": True,
+                }
+            }
+            raise error
         if (
             line not in self.read_coverage.get((relative, digest), set())
             and (relative, digest, line) not in self.observed_evidence_lines
+            and (relative, digest, line) not in self.presented_repair_lines
         ):
             raise WorkerError(
-                "SAFE_REPLACE_LINE requires the current line to be observed by READ_FILE or SEARCH"
+                "SAFE_REPLACE_LINE requires the current line to be observed by READ_FILE, "
+                "SEARCH, or a complete runtime-prefetched source read"
             )
         replacement = args.get("replacement")
         if not isinstance(replacement, str):
@@ -3322,8 +4056,10 @@ while removing only the unused binding. Previous attempts are context, not autho
         }
 
     @staticmethod
-    def _junit_failures(root: ET.Element) -> list[dict[str, Any]]:
+    def _junit_failures(root: ET.Element, *, diverse: bool = False) -> list[dict[str, Any]]:
         failures: list[dict[str, Any]] = []
+        representatives: list[dict[str, Any]] = []
+        seen_families: set[tuple[str, str]] = set()
         for case in root.iter("testcase"):
             failure = case.find("failure")
             if failure is None:
@@ -3356,9 +4092,40 @@ while removing only the unused binding. Previous attempts are context, not autho
             )
             if displayed_bindings:
                 failures[-1]["displayed_bindings"] = displayed_bindings
-            if len(failures) >= 8:
+            # A wrapper's final raise is not necessarily the failing operation.
+            # Preserve bounded, displayed earlier exceptions without inferring a
+            # root cause, granting read coverage or changing the edit allowlist.
+            segments = re.split(
+                r"(?m)^The above exception was the direct cause of the following exception:\s*$"
+                r"|^During handling of the above exception, another exception occurred:\s*$",
+                failure.text or "",
+            )
+            if len(segments) > 1:
+                chain = []
+                for segment in segments[:-1][:3]:
+                    lines = segment.splitlines()
+                    earlier_location = next(
+                        (line.strip() for line in reversed(lines) if re.search(r"\.py:\d+", line)),
+                        "",
+                    )
+                    rendered = [line for line in lines if line.startswith((">", "E "))]
+                    chain.append(
+                        {
+                            "location": earlier_location[:250],
+                            "displayed_failure": "\n".join(rendered)[:1000],
+                        }
+                    )
+                failures[-1]["preceding_exceptions"] = chain
+            if diverse:
+                family = (case.get("classname", ""), case.get("name", "").split("[", 1)[0])
+                if family not in seen_families and len(representatives) < 8:
+                    seen_families.add(family)
+                    representatives.append(failures.pop())
+                elif len(failures) > 8:
+                    failures.pop()
+            elif len(failures) >= 8:
                 break
-        return failures
+        return (representatives + failures)[:8] if diverse else failures
 
     @staticmethod
     def _junit_passed_test_ids(root: ET.Element) -> list[str]:
@@ -3684,6 +4451,8 @@ while removing only the unused binding. Previous attempts are context, not autho
                         "displayed_bindings": failure["displayed_bindings"],
                     }
                 )
+            if failure.get("preceding_exceptions"):
+                item["preceding_exceptions"] = failure["preceding_exceptions"]
         focus = []
         for item in groups.values():
             item["semantic_invariants"] = self._repair_semantic_invariants()
@@ -3699,6 +4468,13 @@ while removing only the unused binding. Previous attempts are context, not autho
                 else "Use this failure's path, line, and assertion for a minimal edit, then VALIDATE; "
                 "do not reread unrelated files."
             )
+            if item.get("preceding_exceptions"):
+                item["exception_chain_note"] = (
+                    "The final location may only wrap an earlier exception. Compare the "
+                    "displayed preceding exceptions with the contract before editing; do not "
+                    "remove required error mapping or change protected assertions. This "
+                    "traceback is diagnostic evidence, not source read/edit authority."
+                )
             focused_paths = {target.split("::", 1)[0] for target in self.packet["focused_tests"]}
             writable_candidates = list(self.packet["scope"]["modify"])
             repair_candidates = sorted(
@@ -4038,10 +4814,36 @@ while removing only the unused binding. Previous attempts are context, not autho
         repair_focus = (
             self._validation_repair_focus(validation) if validation.status == "failed" else []
         )
+        baseline = self.edit_revision == 0 and self.packet.get("parent_run_id") is None
+        if baseline:
+            repair_focus = [
+                {
+                    **{key: value for key, value in item.items() if key != "required_next_action"},
+                    "instruction": (
+                        "This is an initial baseline diagnostic, not a post-edit repair. "
+                        "Read the relevant current implementation and protected tests as needed, "
+                        "then implement the full contract and validate. Do not repeat unchanged validation."
+                    ),
+                }
+                for item in repair_focus
+            ]
+        static_sources = [
+            item["current_source"] for item in repair_focus if "current_source" in item
+        ]
+        repair_focus = [
+            {key: value for key, value in item.items() if key != "current_source"}
+            for item in repair_focus
+        ]
         observation = {
             "status": validation.status,
+            "stage": "baseline" if baseline else "implementation",
             "phase": self.validation_phase,
             "repair_focus": repair_focus,
+            **(
+                {"post_edit_source_read": {"source_excerpts": static_sources}}
+                if static_sources
+                else {}
+            ),
             "failure_delta": self.validation_failure_delta,
             "edit_revision": self.edit_revision,
             "validation_attempt_ref": self.validation_refs[-1] if self.validation_refs else None,
@@ -4128,10 +4930,98 @@ while removing only the unused binding. Previous attempts are context, not autho
         focus.extend(self._failed_test_repair_focus(focused))
         hint = self._configured_check_repair_hint(validation.configured_checks or [])
         if hint is not None:
+            if hint.get("check_id") == "ruff-check" and hint.get("path"):
+                hint = self._localize_ruff_repair_hint(hint, validation)
+            if hint.get("check_id") == "pyright" and hint.get("path"):
+                try:
+                    diagnostic_path = Path(hint["path"])
+                    relative = (
+                        diagnostic_path.relative_to(self.repo_root).as_posix()
+                        if diagnostic_path.is_absolute()
+                        else diagnostic_path.as_posix()
+                    )
+                    relative, _ = self._assert_read_allowed(relative)
+                except (ValueError, WorkerError, SafeEditError, OSError):
+                    hint.pop("path", None)
+                    hint["instruction"] = (
+                        "The type diagnostic points outside readable scope. Request a "
+                        "Primary contract/scope revision; do not edit that path."
+                    )
+                else:
+                    hint["path"] = relative
+                    if relative in self.packet["scope"]["modify"]:
+                        hint.update(
+                            required_path=relative,
+                            candidate_edit_paths=[relative],
+                            required_next_action="SAFE_REPLACE",
+                        )
             focus.append(hint)
         return focus[:4]
 
+    def _localize_ruff_repair_hint(
+        self, hint: dict[str, Any], validation: ValidationResult
+    ) -> dict[str, Any]:
+        """Diagnostic coordinates are navigation until current source and scope agree."""
+        hint = dict(hint)
+        try:
+            diagnostic_path = Path(hint["path"])
+            relative = (
+                diagnostic_path.relative_to(self.repo_root).as_posix()
+                if diagnostic_path.is_absolute()
+                else diagnostic_path.as_posix()
+            )
+            relative, _ = self._assert_read_allowed(relative)
+            raw, digest = self.editor.read_bytes(relative)
+            lines = raw.decode("utf-8-sig").splitlines()
+        except (ValueError, WorkerError, SafeEditError, OSError, UnicodeError):
+            hint.pop("path", None)
+            hint["location_status"] = "unreadable_or_outside_scope"
+            return hint
+        hint["path"] = relative
+        facts = validation.focused_tests.get("input_facts")
+        snapshot = facts.get(relative) if isinstance(facts, dict) else None
+        if (
+            not isinstance(snapshot, dict)
+            or validation.focused_tests.get("inputs_unchanged") is not True
+        ):
+            hint["location_status"] = "unverified_validation_inputs"
+            return hint
+        if snapshot.get("sha256") != digest:
+            hint["location_status"] = "stale_validation_source"
+            return hint
+        line = hint.get("line")
+        if type(line) is not int or not 1 <= line <= len(lines):
+            hint["location_status"] = "line_outside_current_source"
+            return hint
+        start, end = max(1, line - 3), min(len(lines), line + 3)
+        content = "\n".join(f"{n}: {lines[n - 1]}" for n in range(start, end + 1))
+        if len(content) > 4000:
+            hint["location_status"] = "source_excerpt_too_large"
+            return hint
+        hint["location_status"] = "current_validation_source"
+        hint["current_source"] = {
+            "path": relative,
+            "sha256": digest,
+            "start_line": start,
+            "end_line": end,
+            "content": content,
+        }
+        if relative in self.packet["scope"]["modify"]:
+            hint.update(
+                required_path=relative,
+                candidate_edit_paths=[relative],
+                required_next_action="SAFE_REPLACE",
+            )
+        return hint
+
     def _required_repair_focus(self) -> dict[str, Any] | None:
+        if self.require_implementation_plan and self.implementation_plan is None:
+            return None
+        # A failing fresh baseline describes work to implement. It must not
+        # trigger the post-edit one-shot edit-only gate before investigation.
+        # Inherited rework is still a repair even at local edit_revision == 0.
+        if not self._is_repair_edit():
+            return None
         if not self.pending_failed_validation or self.validation is None:
             return None
         return next(
@@ -4185,6 +5075,51 @@ while removing only the unused binding. Previous attempts are context, not autho
             "instruction": "Previously observed unchanged source; use it for the required edit.",
         }
 
+    def _encode_observation(self, observation: dict[str, Any]) -> str:
+        encoded = json.dumps(observation, ensure_ascii=False)
+        echo = observation.get("post_edit_source_read")
+        if echo is not None:
+            if len(encoded) <= self.max_output:
+                self._register_presented_repair_evidence(echo)
+            else:
+                # Never authorize lines cut off by the actual tool-result cap.
+                observation.pop("post_edit_source_read")
+                encoded = json.dumps(observation, ensure_ascii=False)
+        return encoded[: self.max_output]
+
+    def _register_presented_repair_evidence(self, payload: dict[str, Any]) -> None:
+        """A prefetched source read is evidence only for fully displayed current lines."""
+        for excerpt in payload.get("source_excerpts", []):
+            try:
+                relative, _ = self._assert_read_allowed(excerpt["path"])
+                raw, digest = self.editor.read_bytes(relative)
+                if digest != excerpt.get("sha256"):
+                    continue
+                lines = raw.decode("utf-8-sig").splitlines()
+            except (KeyError, WorkerError, SafeEditError, OSError, UnicodeError):
+                continue
+            visible = set()
+            for text in excerpt.get("content", "").splitlines():
+                match = re.fullmatch(r"(\d+): (.*)", text)
+                if match is None:
+                    continue
+                number = int(match.group(1))
+                if 1 <= number <= len(lines) and match.group(2) == lines[number - 1]:
+                    visible.add(number)
+            if visible:
+                self.observed_hashes[relative] = digest
+                # Prefetch authorizes its exact displayed lines, but does not spend
+                # the model's first explicit READ_FILE or its no-evidence budget.
+                self.presented_repair_lines.update((relative, digest, n) for n in visible)
+                self.archive.event(
+                    "repair_source_read_presented",
+                    {
+                        "path": relative,
+                        "sha256": digest,
+                        "visible_lines": sorted(visible),
+                    },
+                )
+
     def _compact_repair_payload(self, focus: dict[str, Any]) -> dict[str, Any]:
         if focus.get("required_next_action") == "SAFE_CREATE":
             return {
@@ -4211,6 +5146,11 @@ while removing only the unused binding. Previous attempts are context, not autho
                 lines = raw.decode("utf-8-sig").splitlines()
             except (WorkerError, SafeEditError, OSError, UnicodeError):
                 continue
+            if focus.get("check_id") == "ruff-check" and focus.get("current_source"):
+                source = focus["current_source"]
+                if digest == source.get("sha256") and candidate == source.get("path"):
+                    excerpts.append(dict(source))
+                continue
             anchor = anchors.get(candidate)
             anchor_line = next(
                 (
@@ -4220,8 +5160,13 @@ while removing only the unused binding. Previous attempts are context, not autho
                 ),
                 1,
             )
-            start = max(1, anchor_line - 2)
-            end = min(len(lines), anchor_line + 39)
+            localized = (
+                focus.get("check_id") in {"pyright", "ruff-check"}
+                and type(focus.get("line")) is int
+            )
+            target_line = focus["line"] if localized else anchor_line
+            start = max(1, target_line - (10 if localized else 2))
+            end = min(len(lines), target_line + (29 if localized else 39))
             excerpts.append(
                 {
                     "path": candidate,
@@ -4311,7 +5256,7 @@ while removing only the unused binding. Previous attempts are context, not autho
                 )
         return {
             "required_next_action": focus.get("required_next_action"),
-            "repair_focus": focus,
+            "repair_focus": {key: value for key, value in focus.items() if key != "current_source"},
             "required_behavior": self.packet.get("required_behavior", []),
             "semantic_invariants": focus.get(
                 "semantic_invariants", self._repair_semantic_invariants()
@@ -4322,10 +5267,20 @@ while removing only the unused binding. Previous attempts are context, not autho
             "previous_noop_repair_attempts": self.noop_repair_attempts,
             "prohibited_attempts": [
                 "Do not copy an excerpt unchanged into both find and replace.",
-                "find and replace must differ and implement the required behavior.",
+                (
+                    "find and replace must differ and correct the reported static rule without changing required behavior."
+                    if focus.get("check_id") == "ruff-check" and focus.get("current_source")
+                    else "find and replace must differ and implement the required behavior."
+                ),
             ],
             "instruction": (
-                "Choose one source excerpt, then emit SAFE_REPLACE using that excerpt's sha256 "
+                "Correct the reported Ruff rule at the displayed current source with one narrow "
+                "SAFE_REPLACE using its hash and an exact find/replace that actually differ. "
+                "Preserve already-passing behavior and protected tests; do not suppress the rule "
+                "or change lint configuration. A static correction need not change runtime behavior. "
+                "Then VALIDATE with the original contract_check. Do not READ or SEARCH first."
+                if focus.get("check_id") == "ruff-check" and focus.get("current_source")
+                else "Choose one source excerpt, then emit SAFE_REPLACE using that excerpt's sha256 "
                 "and an exact narrow find/replace that changes behavior required by the contract. "
                 "Before emitting, compare find and replace and confirm they are different. "
                 "For an undefined symbol, use symbol_evidence to add/move a verified runtime "
@@ -4347,6 +5302,41 @@ while removing only the unused binding. Previous attempts are context, not autho
             if check.get("status") != "failed":
                 continue
             output = str(check.get("output") or "")
+            if check.get("id") == "pyright":
+                locations = list(re.finditer(r"(?m)^[ \t]*(.+\.py):(\d+):(\d+) - error: ", output))
+                diagnostics = []
+                for index, location in enumerate(locations):
+                    end = (
+                        locations[index + 1].start() if index + 1 < len(locations) else len(output)
+                    )
+                    message = output[location.end() : end]
+                    rule = re.search(r"\((report\w+)\)", message)
+                    if rule is not None:
+                        diagnostics.append(
+                            {
+                                "check_id": "pyright",
+                                "rule": rule.group(1),
+                                "path": location.group(1).strip().replace("\\", "/"),
+                                "line": int(location.group(2)),
+                                "column": int(location.group(3)),
+                                "message": message[: rule.start()].strip()[:1000],
+                            }
+                        )
+                if diagnostics:
+                    # Prefer the causal call/type error over cascading unknown types.
+                    selected = next(
+                        (item for item in diagnostics if item["rule"] == "reportArgumentType"),
+                        diagnostics[0],
+                    )
+                    return {
+                        **selected,
+                        "instruction": (
+                            "Repair this exact type error with a narrow source edit, preserving "
+                            "already-passing behavior. For an optional value, establish a real "
+                            "non-None invariant before its use; do not merely rename it, remove "
+                            "type checking, add a suppression, or invent a default. Then VALIDATE."
+                        ),
+                    }
             match = re.search(r"(?m)^F841\b[^\n]*\n\s*-->\s*([^\n:]+):(\d+):(\d+)", output)
             if match:
                 return {
@@ -4380,6 +5370,37 @@ while removing only the unused binding. Previous attempts are context, not autho
                         "do not reread unrelated files."
                     ),
                 }
+            if check.get("id") == "ruff-check":
+                clean = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", output)
+                match = re.search(
+                    r"(?m)^([A-Z]+\d+|invalid-syntax):? ([^\n]+)\n[ \t]*-->[ \t]*"
+                    r"(.+?):([1-9]\d*):([1-9]\d*)(?:[ \t]*\r?$)",
+                    clean,
+                )
+                if match:
+                    return {
+                        "check_id": "ruff-check",
+                        "rule": match.group(1),
+                        "message": match.group(2).strip()[:1000],
+                        "path": match.group(3).replace("\\", "/"),
+                        "line": int(match.group(4)),
+                        "column": int(match.group(5)),
+                        "instruction": "Correct this reported static rule with a narrow source edit, preserving already-passing behavior and the configured lint rules. Then VALIDATE.",
+                    }
+                match = re.search(
+                    r"(?m)^(.+?):([1-9]\d*):([1-9]\d*): ([A-Z]+\d+|invalid-syntax):? ([^\r\n]+)",
+                    clean,
+                )
+                if match:
+                    return {
+                        "check_id": "ruff-check",
+                        "rule": match.group(4),
+                        "message": match.group(5)[:1000],
+                        "path": match.group(1).replace("\\", "/"),
+                        "line": int(match.group(2)),
+                        "column": int(match.group(3)),
+                        "instruction": "Correct this reported static rule with a narrow source edit, preserving already-passing behavior and the configured lint rules. Then VALIDATE.",
+                    }
             return {
                 "check_id": check.get("id"),
                 "instruction": (
@@ -4388,6 +5409,17 @@ while removing only the unused binding. Previous attempts are context, not autho
                 ),
             }
         return None
+
+    @staticmethod
+    def _trusted_ruff_format_command(argv: list[str], python_path: Path) -> bool:
+        """Recognize only the configured interpreter and optional no-bytecode flag."""
+        return argv[:4] == [str(python_path), "-m", "ruff", "format"] or argv[:5] == [
+            str(python_path),
+            "-B",
+            "-m",
+            "ruff",
+            "format",
+        ]
 
     def _autoformat_eligible(
         self,
@@ -4400,7 +5432,7 @@ while removing only the unused binding. Previous attempts are context, not autho
             self.autoformat_used
             or self.config.get("autoformat_on_ruff_failure", True) is False
             or check_id != "ruff-format"
-            or check_argv[:4] != [str(python_path), "-m", "ruff", "format"]
+            or not self._trusted_ruff_format_command(check_argv, python_path)
             or "--check" not in check_argv
             or "would be reformatted" not in check_result.get("output", "")
         ):
@@ -4438,7 +5470,7 @@ while removing only the unused binding. Previous attempts are context, not autho
             if not isinstance(argv, list) or not all(isinstance(arg, str) for arg in argv):
                 continue
             expanded = [arg.replace("{python}", str(python_path)) for arg in argv]
-            if expanded[:4] == [str(python_path), "-m", "ruff", "format"] and "--check" in expanded:
+            if self._trusted_ruff_format_command(expanded, python_path) and "--check" in expanded:
                 return True
         return False
 
@@ -4447,9 +5479,18 @@ while removing only the unused binding. Previous attempts are context, not autho
         for path in paths:
             self.editor.resolve(path)
         self._assert_mutation_allowed()
+        single_before = {}
+        if self.single_function is not None:
+            if paths != [self.single_function["path"]]:
+                raise PolicyViolation("single-function formatter path mismatch")
+            for path in paths:
+                raw, digest = self.editor.read_bytes(path)
+                if digest != self.changed[path]["sha256"]:
+                    raise PolicyViolation("source changed before single-function formatter")
+                single_before[path] = ast.dump(ast.parse(raw.decode("utf-8-sig")))
         self.autoformat_used = True
         before = self._validation_facts()
-        result = self._run_command([str(python_path), "-m", "ruff", "format", *paths])
+        result = self._run_command([str(python_path), "-B", "-m", "ruff", "format", *paths])
         after = self._validation_facts()
         unexpected = [path for path in before if path not in paths and before[path] != after[path]]
         changed = [path for path in paths if before[path] != after[path]]
@@ -4478,6 +5519,13 @@ while removing only the unused binding. Previous attempts are context, not autho
         if changed:
             self.edit_revision += 1
             self.validated_input_facts = None
+        if self.single_function is not None:
+            if result.get("status") != "passed" or result.get("exit_code") != 0:
+                raise WorkerError("single-function formatter failed; validation remains invalid")
+            for path in paths:
+                raw, _ = self.editor.read_bytes(path)
+                if ast.dump(ast.parse(raw.decode("utf-8-sig"))) != single_before[path]:
+                    raise PolicyViolation("single-function formatter changed source semantics")
         return bool(changed)
 
     def validate(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -4644,7 +5692,14 @@ while removing only the unused binding. Previous attempts are context, not autho
         junit: dict[str, Any] = {"path": str(junit_path), "available": False}
         try:
             root = ET.parse(junit_path).getroot()
-            test_result["diagnostic"]["failures"] = self._junit_failures(root)
+            test_result["diagnostic"]["failures"] = self._junit_failures(
+                root, diverse=self.diverse_failure_examples
+            )
+            if self.diverse_failure_examples:
+                test_result["diagnostic"]["failure_example_selection"] = (
+                    "One observed example per test function, then remaining parameters; "
+                    "bounded to eight examples. Complete failures remain in immutable JUnit."
+                )
             test_result["diagnostic"]["passed_test_ids"] = self._junit_passed_test_ids(root)
             if root.tag == "testsuite" or root.attrib.get("tests") is not None:
                 suites = [root]
@@ -4796,6 +5851,20 @@ while removing only the unused binding. Previous attempts are context, not autho
             if status == "passed" and (self.edit_revision > 0 or self.packet.get("parent_run_id"))
             else "check"
         )
+        if self.single_function is not None and status == "passed" and self.edit_revision > 0:
+            # A diagnostic check may become terminal only with an actual edit,
+            # current executed checks and the model's existing strict acknowledgement.
+            # Never manufacture true for an unknown ordering assertion.
+            try:
+                self._assert_submission_contract()
+            except WorkerError as exc:
+                self.archive.event("single_function_terminal_withheld", {"reason": str(exc)})
+            else:
+                effective_phase = "final"
+                self.archive.event(
+                    "single_function_terminal_promoted",
+                    {"edit_revision": self.edit_revision, "requested_phase": phase},
+                )
         snapshot = self._archive_validation_attempt(validation, phase=effective_phase)
         failures = test_result["diagnostic"].get("failures", [])
         if status == "failed" and failures and test_result["status"] == "failed":
@@ -4834,6 +5903,7 @@ while removing only the unused binding. Previous attempts are context, not autho
                 "snapshot": snapshot,
                 "same_test_failure_streak": self.same_test_failure_streak,
                 "unchanged_test_failure_streak": self.unchanged_test_failure_streak,
+                "failed_validation_noop_count": self.failed_validation_noop_count,
                 "tests": junit.get("tests"),
                 "executed": junit.get("executed"),
                 "configured_checks": [
@@ -5054,6 +6124,7 @@ while removing only the unused binding. Previous attempts are context, not autho
                 "failed_validation_no_evidence_streak": self.failed_validation_no_evidence_streak,
                 "same_test_failure_streak": self.same_test_failure_streak,
                 "unchanged_test_failure_streak": self.unchanged_test_failure_streak,
+                "failed_validation_noop_count": self.failed_validation_noop_count,
             },
             "runtime_evidence": {
                 "validation_status": self.validation.status if self.validation else None,
@@ -5164,6 +6235,11 @@ def compact_handoff(report: dict[str, Any]) -> dict[str, Any]:
         "remaining_uncertainty": clipped_strings(report.get("remaining_uncertainty", [])),
         "primary_review_checklist": report.get("primary_review_checklist", {}),
     }
+    # Preserve explicitly supplied protocol metadata across the default CLI
+    # projection. Never infer a protocol or a worker assessment from status.
+    for key in ("execution_protocol", "worker_assessment"):
+        if key in report:
+            compact[key] = report[key]
     if report.get("status") not in {"ready_for_review", "blocked"}:
         compact["recent_protocol_errors"] = [
             {"error": str(item.get("error", ""))[:500]}
@@ -5198,6 +6274,9 @@ def main() -> int:
     try:
         packet = resolve_inherited_packet(repo_root, load_json(Path(args.packet).resolve()))
         config = load_json(Path(args.config).resolve())
+        host_enabled = config.get("host_proposal_enabled", False)
+        if type(host_enabled) is not bool:
+            raise WorkerError("host_proposal_enabled must be boolean")
         client = LMStudioClient(
             require_string(config.get("lmstudio_base_url"), "lmstudio_base_url"),
             require_string(config.get("coder_model"), "coder_model"),
@@ -5215,8 +6294,17 @@ def main() -> int:
                 else None
             ),
             context_safety_margin=int(config.get("model_context_safety_margin", 1024)),
+            typed_action_arguments=config.get("coder_typed_action_arguments", False),
         )
-        runtime = WorkerRuntime(repo_root, packet, config, client)
+        runtime_class = WorkerRuntime
+        if host_enabled:
+            spec = importlib.util.spec_from_file_location(
+                "local_host_proposal", SCRIPT_DIR / "host-proposal.py"
+            )
+            adapter = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(adapter)
+            runtime_class = adapter.make_runtime_class(sys.modules[__name__])
+        runtime = runtime_class(repo_root, packet, config, client)
         with MODEL_RESIDENCY.role_model_lease(client, config):
             runtime.preflight()
             report = runtime.run()
@@ -5287,6 +6375,7 @@ def main() -> int:
         return 1
     return {
         "ready_for_review": 0,
+        "validation_passed_pending_review": 0,
         "blocked": 3,
         "policy_violation": 4,
         "interrupted": 130,

@@ -1,0 +1,45 @@
+{
+  "decision": "HOLD_PRIMARY_CONTRACT_BINDING",
+  "registered_cells": 2,
+  "u1": {
+    "worker": {
+      "model_requests": 9,
+      "tool_actions": 14,
+      "evidence_actions": 10,
+      "edits": 3,
+      "initial_checks": 1,
+      "post_edit_checks": 3,
+      "format_preparations": 3,
+      "protocol_recoveries": 0,
+      "edit_recoveries": 0,
+      "reserved_output_tokens": 110592
+    },
+    "checks": "Passed complete configured checks,571 project regression tests;not independently accepted.",
+    "review_status": "budget_exhausted",
+    "review_used": {
+      "model_requests": 6,
+      "tool_actions": 10,
+      "evidence_actions": 7,
+      "edits": 0,
+      "initial_checks": 0,
+      "post_edit_checks": 0,
+      "format_preparations": 0,
+      "protocol_recoveries": 2,
+      "edit_recoveries": 0,
+      "reserved_output_tokens": 73728
+    },
+    "review_reason": "Read-only protocol_recoveries exhausted",
+    "full_chain_accepted": false
+  },
+  "u2": {
+    "status": "NOT_RUN",
+    "reason": "U1 not accepted;registered dependency gate unchanged."
+  },
+  "root_cause": {
+    "confirmed_primary_input": "compatible.implementation_ref.symbol=ToolRegistry (class);existing statement_lines explicitly excludes ClassDef. No citation can satisfy it.",
+    "confirmed_preflight_gap": "prepare accepted that existing unsupported class reference,so deterministic configuration failure consumed live review resources.",
+    "earliest_deviation": "Primary authored an unsupported binding before prepare;not Coder implementation failure.",
+    "not_proven": "No claim that all remaining implementation or review semantics are correct. Last intendedPASS is an invalid report,not canonical PASS."
+  },
+  "repair_boundary": "Reject existing class refs during preparation;do not support class PASS or relax checks. Preserve this result/ledger and do not redraw this review."
+}

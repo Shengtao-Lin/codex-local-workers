@@ -1,0 +1,10 @@
+# Fixture maintenance only. Live validation used original/pyproject.toml unchanged.
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "RUF"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["evaluation_harness"]

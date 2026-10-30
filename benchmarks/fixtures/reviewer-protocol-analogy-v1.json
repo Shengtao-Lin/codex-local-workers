@@ -1,0 +1,11 @@
+{
+  "purpose": "Generic CPython protocol reasoning example, not the task solution, changed source, hidden test or target-specific counterexample.",
+  "code": "from collections.abc import Sized\nclass DisabledLength:\n    __len__ = None\nclass EnabledLength:\n    def __len__(self):\n        return 3\nresults = {\n    'disabled_has_attribute': hasattr(DisabledLength(), '__len__'),\n    'disabled_sized_protocol': isinstance(DisabledLength(), Sized),\n    'enabled_has_attribute': hasattr(EnabledLength(), '__len__'),\n    'enabled_sized_protocol': isinstance(EnabledLength(), Sized),\n}\n",
+  "observed": {
+    "disabled_has_attribute": true,
+    "disabled_sized_protocol": false,
+    "enabled_has_attribute": true,
+    "enabled_sized_protocol": true
+  },
+  "reasoning": "Attribute presence and protocol participation are distinct predicates. A dependency may reject an explicit opt-out marker even when an attribute exists. When application code uses a different predicate from a read dependency, compare acceptance and rejection branches; do not infer equivalence from related names. This analogy is not evidence of a defect in the current task. Determine the current contract, actual input domain, source branches and causal consequence before making a finding. Preserve correct unchanged behavior and cite task-readable source."
+}

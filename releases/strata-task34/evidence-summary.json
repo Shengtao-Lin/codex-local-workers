@@ -1,0 +1,26 @@
+{
+  "build": "0.3.0-task.34-binding-preflight-candidate",
+  "status": "SCOPED_SUPERVISED_CODING_TRIAL_READY",
+  "general_release": "HOLD",
+  "full_sequential_answer_gate": "HOLD",
+  "runtime_manifest_sha256": "0263e8d3e49949ede83a849b55c9dd29a465c9bcb4e38b91173b7f7628c6ab6f",
+  "host_controls": 629,
+  "new_controls_included": 9,
+  "installed_files": 118,
+  "coding_unit": {
+    "exposure": "Corrected Primary contract diagnosis;not blind",
+    "coder_requests": 7,
+    "coder_edits": 3,
+    "reviewer_requests": 7,
+    "reviewer_protocol_recoveries": 1,
+    "independent_project_passed": 574,
+    "integration_deselected": 72,
+    "native_integration": "passed",
+    "primary_source_takeover": false
+  },
+  "same_install": "Implementation+read-only task executed,duplicates refused,old canonical data unchanged. Raw read-only report HOLD,Primary clarification separate.",
+  "current_model": "iq3_s",
+  "production_default": false,
+  "cloud_savings": "unknown",
+  "machine_specific_examples": true
+}

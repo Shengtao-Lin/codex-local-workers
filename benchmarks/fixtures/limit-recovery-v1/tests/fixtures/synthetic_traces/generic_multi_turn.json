@@ -1,0 +1,15 @@
+{
+  "messages": [
+    {"id": "m1", "role": "system", "content": "Be concise."},
+    {"id": "m2", "role": "user", "content": "Where is order A-100?"},
+    {"id": "m3", "role": "assistant", "content": "It has shipped."},
+    {"id": "m4", "role": "user", "content": "When will it arrive?"},
+    {"id": "m5", "role": "assistant", "content": "Tomorrow."}
+  ],
+  "metadata": {
+    "framework": "fictional",
+    "session_id": "session-1",
+    "status": "OK",
+    "event_time": "2026-01-02T12:00:00Z"
+  }
+}

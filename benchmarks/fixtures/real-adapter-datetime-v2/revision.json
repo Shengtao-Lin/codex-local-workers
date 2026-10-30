@@ -1,0 +1,5 @@
+{
+  "driver_sha256": "b4397f177652e3fa58b50bb70c4ca7a58f6774dc58b1f1ad2d5af6633b99a5af",
+  "previous_failed_preparation": "real-adapter-datetime-trial-1",
+  "changes": "Copy real package registry dependency; supplemental tests formatted with original project config; format generated private-helper mutants only"
+}

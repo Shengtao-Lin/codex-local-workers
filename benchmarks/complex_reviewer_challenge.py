@@ -75,7 +75,15 @@ def grading_status(report, variant, structural_outcome):
     }
 
 
-def run(source_root, variant, runtime_root=KIT, family="rollback", ordering=False):
+def run(
+    source_root,
+    variant,
+    runtime_root=KIT,
+    family="rollback",
+    ordering=False,
+    *,
+    prepass_challenge=False,
+):
     runtime_root = runtime_root.resolve()
     runtime_root.relative_to(KIT)
     source_root = source_root.resolve()
@@ -153,6 +161,8 @@ def run(source_root, variant, runtime_root=KIT, family="rollback", ordering=Fals
     )
     config["python"] = sys.executable
     config["single_model_residency"] = True
+    if prepass_challenge:
+        config["reviewer_prepass_challenge"] = True
     config_path = root / ".agent/config.json"
     write(config_path, config)
     reference = json.loads(
@@ -355,6 +365,7 @@ def run(source_root, variant, runtime_root=KIT, family="rollback", ordering=Fals
         "variant": variant,
         "family": family,
         "ordering_obligations_retained": ordering,
+        "prepass_challenge": prepass_challenge,
         "runtime_root": str(runtime_root),
         "synthetic_archive": True,
         "coder_invoked": False,

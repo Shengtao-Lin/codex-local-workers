@@ -29,6 +29,160 @@ class FakeClient:
 
 
 class JUnitDisplayedBindingTests(unittest.TestCase):
+    def test_explicit_false_cannot_disable_ordering_acknowledgement(self):
+        for field in ("required_order", "forbidden_orderings"):
+            with self.subTest(field=field):
+                value = packet_v2()
+                value["contract_check_required"] = False
+                value[field] = ["explicit lifecycle constraint"]
+                self.assertTrue(RUNTIME.validate_packet(value)["contract_check_required"])
+        value = packet_v2()
+        value["contract_check_required"] = False
+        self.assertFalse(RUNTIME.validate_packet(value)["contract_check_required"])
+        value["required_order"] = ["constraint"]
+        value["contract_check_required"] = "false"
+        with self.assertRaisesRegex(RUNTIME.WorkerError, "must be a boolean"):
+            RUNTIME.validate_packet(value)
+
+    def test_chained_failure_preserves_displayed_assertion_without_replacing_wrapper_location(self):
+        root = ET.Element("testsuite")
+        case = ET.SubElement(root, "testcase", name="wrapped")
+        ET.SubElement(case, "failure", message="ToolExecutionError: failed").text = (
+            ">       assert current_thread != original_thread\n"
+            "E       assert 123 != 123\n"
+            "tests/test_factory.py:50: AssertionError\n\n"
+            "The above exception was the direct cause of the following exception:\n\n"
+            ">       raise ToolExecutionError from exc\n"
+            "E       ToolExecutionError: failed\n"
+            "src/registry.py:120: ToolExecutionError\n"
+        )
+        failure = RUNTIME.WorkerRuntime._junit_failures(root)[0]
+        self.assertEqual(failure["location"], "src/registry.py:120: ToolExecutionError")
+        self.assertEqual(
+            failure["preceding_exceptions"],
+            [
+                {
+                    "location": "tests/test_factory.py:50: AssertionError",
+                    "displayed_failure": ">       assert current_thread != original_thread\nE       assert 123 != 123",
+                }
+            ],
+        )
+        self.assertNotIn("path", failure)
+        self.assertNotIn("expected_sha256", failure)
+
+    def test_exception_chain_bounded_and_unchained_failure_unchanged(self):
+        root = ET.Element("testsuite")
+        case = ET.SubElement(root, "testcase", name="wrapped")
+        failure = ET.SubElement(case, "failure", message="Error")
+        marker = "\nDuring handling of the above exception, another exception occurred:\n"
+        failure.text = marker.join(
+            "E " + "x" * 1500 + f"\nsrc/part.py:{index}: Error" for index in range(1, 7)
+        )
+        parsed = RUNTIME.WorkerRuntime._junit_failures(root)[0]
+        self.assertEqual(len(parsed["preceding_exceptions"]), 3)
+        self.assertTrue(
+            all(len(item["displayed_failure"]) <= 1000 for item in parsed["preceding_exceptions"])
+        )
+        failure.text = "src/part.py:1: Error"
+        parsed = RUNTIME.WorkerRuntime._junit_failures(root)[0]
+        self.assertNotIn("preceding_exceptions", parsed)
+
+    def test_action_tagged_arguments_preserve_narrowed_allowlists_and_exact_required_fields(self):
+        base = RUNTIME.repair_only_action_schema(RUNTIME.CODER_ACTION_SCHEMA, "SAFE_REPLACE")
+        before = json.loads(json.dumps(base))
+        typed = RUNTIME.typed_coder_action_schema(base)
+        self.assertEqual(base, before)
+        branches = {branch["properties"]["action"]["enum"][0]: branch for branch in typed["anyOf"]}
+        self.assertEqual(
+            set(branches),
+            {"SAFE_REPLACE", "SAFE_REPLACE_LINE", "FINISH_BLOCKED", "REQUEST_CONTRACT_REVISION"},
+        )
+        line_args = branches["SAFE_REPLACE_LINE"]["properties"]["arguments"]
+        self.assertEqual(
+            set(line_args["required"]), {"path", "expected_sha256", "line", "replacement"}
+        )
+        self.assertFalse(line_args["additionalProperties"])
+        self.assertNotIn("line_number", line_args["properties"])
+        self.assertEqual(
+            branches["SAFE_REPLACE"]["properties"]["arguments"]["properties"]["replace"],
+            {"type": "string"},
+        )
+        for invalid in ("true", 1, None):
+            with self.assertRaisesRegex(RUNTIME.WorkerError, "must be a boolean"):
+                RUNTIME.LMStudioClient("http://example/v1", "model", typed_action_arguments=invalid)
+        with self.assertRaisesRegex(RUNTIME.WorkerError, "structured JSON"):
+            RUNTIME.LMStudioClient(
+                "http://example/v1", "model", typed_action_arguments=True, structured_output=False
+            )
+        self.assertFalse(
+            RUNTIME.LMStudioClient("http://example/v1", "model").typed_action_arguments
+        )
+
+    def test_canonical_action_fields_are_typed_without_changing_runtime_authority(self):
+        import re
+
+        arguments = RUNTIME.CODER_ACTION_SCHEMA["properties"]["arguments"]
+        self.assertTrue(arguments["additionalProperties"])
+        fields = arguments["properties"]
+        for name in ("line", "start_line", "end_line"):
+            self.assertEqual(fields[name], {"type": "integer", "minimum": 1})
+        pattern = fields["replacement"]["pattern"]
+        self.assertIsNotNone(re.fullmatch(pattern, ""))
+        self.assertIsNotNone(re.fullmatch(pattern, "value = 2"))
+        self.assertIsNone(re.fullmatch(pattern, "value = 2\nnext = 3"))
+        self.assertIsNone(re.fullmatch(pattern, "value = 2\r"))
+        # Multiline block edits are deliberately NOT constrained to one line.
+        self.assertEqual(fields["replace"], {"type": "string"})
+        self.assertNotIn("required", arguments)
+        # Transport hints must survive every existing state-specific narrowing.
+        for schema in (
+            RUNTIME.repair_only_action_schema(RUNTIME.CODER_ACTION_SCHEMA, "SAFE_REPLACE"),
+            RUNTIME.post_edit_progress_schema(RUNTIME.CODER_ACTION_SCHEMA),
+            RUNTIME.validation_only_action_schema(RUNTIME.CODER_ACTION_SCHEMA),
+        ):
+            self.assertEqual(schema["properties"]["arguments"], arguments)
+        # Legacy parsing remains available independently of the canonical schema.
+        legacy = RUNTIME.parse_action('{"action":"SAFE_REPLACE_LINE","line":"12"}')
+        self.assertEqual(legacy["arguments"]["line"], "12")
+
+    def test_typed_failure_requires_the_runtime_required_summary_and_reason(self):
+        schema = RUNTIME.typed_coder_action_schema(RUNTIME.CODER_ACTION_SCHEMA)
+        branch = next(
+            item
+            for item in schema["anyOf"]
+            if item["properties"]["action"]["enum"] == ["FINISH_FAILED"]
+        )
+        self.assertEqual(branch["properties"]["arguments"]["required"], ["summary", "reason"])
+
+    def test_diverse_failure_examples_keep_later_functions_without_inventing_evidence(self):
+        root = ET.Element("testsuite")
+        for index in range(15):
+            case = ET.SubElement(
+                root, "testcase", classname="tests.first", name=f"test_many[{index}]"
+            )
+            ET.SubElement(
+                case, "failure", message=f"actual failure {index}"
+            ).text = f"tests/first.py:{index + 1}: AssertionError"
+        for label in ("callback", "labelled_order", "position_cost"):
+            case = ET.SubElement(root, "testcase", classname="tests.second", name="test_" + label)
+            ET.SubElement(
+                case, "failure", message="actual " + label
+            ).text = "tests/second.py:12: AssertionError"
+        default = RUNTIME.WorkerRuntime._junit_failures(root)
+        self.assertTrue(all(item["test"].startswith("tests.first::") for item in default))
+        diverse = RUNTIME.WorkerRuntime._junit_failures(root, diverse=True)
+        self.assertEqual(len(diverse), 8)
+        self.assertEqual(
+            [item["message"] for item in diverse[:4]],
+            [
+                "actual failure 0",
+                "actual callback",
+                "actual labelled_order",
+                "actual position_cost",
+            ],
+        )
+        self.assertTrue(all(item["message"].startswith("actual") for item in diverse))
+
     def test_bounded_actual_header_bindings_preserved_without_evaluation(self):
         root = ET.fromstring(
             '<testsuite><testcase name="invalid[True]"><failure message="Failed: DID NOT RAISE ValueError">width = True\nother = &quot;literal&quot;\n\nsource = must_not_be_captured\ntests/test_x.py:4: Failed</failure></testcase></testsuite>'
@@ -131,6 +285,404 @@ def packet_v2() -> dict:
 
 
 class WorkerRuntimeTests(unittest.TestCase):
+    def test_native_truncation_recovery_never_extends_terminal_or_existing_budgets(self):
+        for terminal, protocol_limit, turn_limit, choice, count, errors in (
+            (True, 4, 8, "required", 0, 0),
+            (False, 1, 8, "required", 0, 1),
+            (False, 4, 1, "required", 0, 1),
+            (False, 4, 8, "auto", 0, 0),
+            (False, 4, 8, "required", False, 0),
+        ):
+            with (
+                self.subTest(
+                    terminal=terminal,
+                    protocol_limit=protocol_limit,
+                    turn_limit=turn_limit,
+                    choice=choice,
+                    count=count,
+                ),
+                TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                self.make_tree(root)
+                client = FakeClient([])
+                client.native_tools = [{"function": {"name": "FINISH_FAILED"}}]
+                client.native_tool_choice = choice
+
+                def truncated(messages):
+                    client.messages_seen.append(list(messages))
+                    client.last_request_stats = {
+                        "rejection_reason": "output_token_limit",
+                        "provider_finish_reason": "length",
+                        "response_parts": {
+                            "content": {"chars": 20000},
+                            "tool_calls": {"count": count},
+                        },
+                    }
+                    raise RUNTIME.WorkerError(
+                        "LM Studio truncated the response at its output-token limit; no partial action was executed"
+                    )
+
+                client.complete = truncated
+                value = packet_v2()
+                value["limits"]["max_model_turns"] = turn_limit
+                runtime = RUNTIME.WorkerRuntime(
+                    root, value, {"coder_native_text_truncation_nudge": True}, client
+                )
+                runtime.max_protocol_errors = protocol_limit
+                with patch.object(runtime, "_validated_terminal_state", return_value=terminal):
+                    report = runtime.run()
+                self.assertEqual(report["status"], "failed")
+                self.assertEqual(len(client.messages_seen), 1)
+                self.assertEqual(runtime.protocol_errors, errors)
+                self.assertEqual(runtime.edit_revision, 0)
+                self.assertEqual(runtime.validation_count, 0)
+
+    def test_native_text_truncation_nudge_is_one_shot_and_never_executes_partial_output(self):
+        for enabled, count, repeats, expected_calls in (
+            (False, 0, False, 1),
+            (True, 0, False, 2),
+            (True, 1, False, 1),
+            (True, 0, True, 2),
+        ):
+            with (
+                self.subTest(enabled=enabled, count=count, repeats=repeats),
+                TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                self.make_tree(root)
+
+                class TruncatedClient(FakeClient):
+                    def __init__(self):
+                        super().__init__([])
+                        self.native_tools = [{"function": {"name": "FINISH_FAILED"}}]
+                        self.native_tool_choice = "required"
+
+                    def complete(self, messages):
+                        self.messages_seen.append(list(messages))
+                        self.last_request_stats = {
+                            "rejection_reason": "output_token_limit",
+                            "provider_finish_reason": "length",
+                            "response_parts": {
+                                "content": {"chars": 20000},
+                                "tool_calls": {"count": count},
+                            },
+                        }
+                        if len(self.messages_seen) == 1 or repeats:
+                            raise RUNTIME.WorkerError(
+                                "LM Studio truncated the response at its output-token limit; no partial action was executed"
+                            )
+                        return json.dumps(
+                            {
+                                "action": "FINISH_FAILED",
+                                "arguments": {
+                                    "summary": ["Stopped safely"],
+                                    "reason": "Cannot complete",
+                                    "remaining_uncertainty": [],
+                                },
+                            }
+                        )
+
+                client = TruncatedClient()
+                runtime = RUNTIME.WorkerRuntime(
+                    root, packet_v2(), {"coder_native_text_truncation_nudge": enabled}, client
+                )
+                before = (root / "src/example.py").read_bytes()
+                result = runtime.run()
+                self.assertEqual(result["status"], "failed")
+                self.assertEqual(len(client.messages_seen), expected_calls)
+                self.assertEqual((root / "src/example.py").read_bytes(), before)
+                if enabled and count == 0:
+                    self.assertEqual(runtime.protocol_errors, 1)
+                    self.assertIn(
+                        "NATIVE_TEXT_TRUNCATION_REPAIR", json.dumps(client.messages_seen[1])
+                    )
+                else:
+                    self.assertEqual(runtime.protocol_errors, 0)
+
+    def test_exhausted_repair_budget_finalizes_before_an_impossible_model_action(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            client = FakeClient([])
+            runtime = RUNTIME.WorkerRuntime(root, packet_v2(), {"python": sys.executable}, client)
+            runtime.edit_revision = 1
+            runtime.pending_failed_validation = True
+            runtime.repairs = runtime.max_repairs
+            report = runtime.run()
+            self.assertEqual(report["status"], "failed")
+            self.assertEqual(report["failure_reason"], "local repair budget is exhausted")
+            self.assertEqual(client.messages_seen, [])
+            self.assertEqual(runtime.protocol_errors, 0)
+            events = (root / report["evidence_refs"]["events"]).read_text(encoding="utf-8")
+            self.assertIn("repair_budget_runtime_finalized", events)
+
+    def test_last_budgeted_edit_may_still_validate_before_finalization(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            runtime = RUNTIME.WorkerRuntime(
+                root, packet_v2(), {"python": sys.executable}, AdaptiveSuccessClient()
+            )
+            runtime.repairs = runtime.max_repairs
+            runtime.pending_failed_validation = False
+
+            def fake_command(argv):
+                for item in argv:
+                    if item.startswith("--junitxml="):
+                        Path(item.split("=", 1)[1]).write_text(
+                            '<testsuites><testsuite tests="1" failures="0" errors="0" skipped="0" /></testsuites>',
+                            encoding="utf-8",
+                        )
+                return {"status": "passed", "exit_code": 0, "output": "ok", "argv": argv}
+
+            with patch.object(runtime, "_run_command", side_effect=fake_command):
+                report = runtime.run()
+            self.assertEqual(report["status"], "ready_for_review")
+
+    def test_post_edit_echo_qualifies_only_current_fully_delivered_source(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            runtime = RUNTIME.WorkerRuntime(
+                root,
+                packet_v2(),
+                {
+                    "coder_post_edit_source_echo": True,
+                },
+                FakeClient([]),
+            )
+            runtime.write_lock.acquire()
+            runtime._prepare_run_archive()
+            try:
+                read = runtime.read_file({"path": "src/example.py"})
+                edited = runtime.safe_replace(
+                    {
+                        "path": "src/example.py",
+                        "expected_sha256": read["sha256"],
+                        "find": "VALUE = 1",
+                        "replace": "VALUE = 3",
+                    }
+                )
+                current = edited["sha256"]
+                self.assertNotIn(("src/example.py", current, 1), runtime.presented_repair_lines)
+                delivered = runtime._encode_observation(edited)
+                self.assertIn("1: VALUE = 3", delivered)
+                self.assertIn(("src/example.py", current, 1), runtime.presented_repair_lines)
+                next_edit = runtime.safe_replace_line(
+                    {
+                        "path": "src/example.py",
+                        "expected_sha256": current,
+                        "line": 1,
+                        "replacement": "VALUE = 2",
+                    }
+                )
+                runtime.max_output = 50
+                runtime._encode_observation(next_edit)
+                self.assertNotIn("post_edit_source_read", next_edit)
+                self.assertNotIn(
+                    ("src/example.py", next_edit["sha256"], 1), runtime.presented_repair_lines
+                )
+                with self.assertRaisesRegex(RUNTIME.WorkerError, "observed"):
+                    runtime.safe_replace_line(
+                        {
+                            "path": "src/example.py",
+                            "expected_sha256": next_edit["sha256"],
+                            "line": 1,
+                            "replacement": "VALUE = 4",
+                        }
+                    )
+                self.assertEqual((root / "src/example.py").read_text(), "VALUE = 2\n")
+            finally:
+                runtime.close()
+
+    def test_stale_line_edit_gets_bounded_read_navigation_not_automatic_authority(self):
+        class LineClient(FakeClient):
+            def __init__(self):
+                super().__init__([])
+                self.step = 0
+                self.old_hash = ""
+
+            def complete(self, messages):
+                self.messages_seen.append(list(messages))
+                self.step += 1
+                observation = json.loads(messages[-1]["content"].split("\n", 1)[1])
+                if self.step == 1:
+                    action = {"action": "READ_FILE", "arguments": {"path": "src/example.py"}}
+                elif self.step == 2:
+                    self.old_hash = observation["sha256"]
+                    action = {
+                        "action": "SAFE_REPLACE",
+                        "arguments": {
+                            "path": "src/example.py",
+                            "expected_sha256": self.old_hash,
+                            "find": "VALUE = 1",
+                            "replace": "VALUE = 3",
+                        },
+                    }
+                elif self.step == 3:
+                    action = {
+                        "action": "SAFE_REPLACE_LINE",
+                        "arguments": {
+                            "path": "src/example.py",
+                            "expected_sha256": self.old_hash,
+                            "line": 1,
+                            "replacement": "VALUE = 2",
+                        },
+                    }
+                elif self.step == 4:
+                    action = observation["edit_repair"]["suggested_action"]
+                elif self.step == 5:
+                    action = {
+                        "action": "SAFE_REPLACE_LINE",
+                        "arguments": {
+                            "path": "src/example.py",
+                            "expected_sha256": observation["sha256"],
+                            "line": 1,
+                            "replacement": "VALUE = 2",
+                        },
+                    }
+                elif self.step == 6:
+                    action = {"action": "VALIDATE", "arguments": {}}
+                else:
+                    action = {"action": "FINISH_SUCCESS", "arguments": {"summary": ["Done."]}}
+                return json.dumps(action)
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            client = LineClient()
+            runtime = RUNTIME.WorkerRuntime(root, packet_v2(), {"python": sys.executable}, client)
+            report = runtime.run()
+            self.assertEqual(report["status"], "ready_for_review")
+            repair = json.loads(client.messages_seen[3][-1]["content"].split("\n", 1)[1])
+            self.assertEqual(repair["error_code"], "stale_read_hash")
+            self.assertTrue(repair["edit_repair"]["navigation_only"])
+            self.assertNotIn("sha256", repair["edit_repair"])
+            self.assertEqual(runtime.edit_revision, 2)
+            self.assertEqual(runtime.protocol_errors, 1)
+            self.assertEqual((root / "src/example.py").read_text(), "VALUE = 2\n")
+
+    def test_pre_edit_plan_transport_schema_and_runtime_are_composable(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            digest = RUNTIME.SAFE_EDIT.sha256_bytes((root / "src/example.py").read_bytes())
+            actions = [
+                {"action": "READ_FILE", "arguments": {"path": "src/example.py"}},
+                {"action": "READ_FILE", "arguments": {"path": "tests/test_example.py"}},
+                {"action": "VALIDATE", "arguments": {}},
+                {
+                    "action": "PLAN_IMPLEMENTATION",
+                    "arguments": {
+                        "contracts": [{"id": "behavior-value", "approach": "Change VALUE only."}],
+                        "steps": ["Edit VALUE and validate."],
+                    },
+                },
+                {
+                    "action": "SAFE_REPLACE",
+                    "arguments": {
+                        "path": "src/example.py",
+                        "expected_sha256": digest,
+                        "find": "VALUE = 1",
+                        "replace": "VALUE = 2",
+                    },
+                },
+                {"action": "VALIDATE", "arguments": {}},
+                {"action": "FINISH_SUCCESS", "arguments": {"summary": ["Done."]}},
+            ]
+
+            class SchemaClient(FakeClient):
+                structured_output = True
+                schema_name = "original"
+
+                def __init__(self):
+                    super().__init__(actions)
+                    self.action_schema = json.loads(json.dumps(RUNTIME.CODER_ACTION_SCHEMA))
+                    self.schemas = []
+
+                def complete(self, messages):
+                    self.schemas.append(json.loads(json.dumps(self.action_schema)))
+                    return super().complete(messages)
+
+            client = SchemaClient()
+            runtime = RUNTIME.WorkerRuntime(
+                root,
+                packet_v2(),
+                {
+                    "coder_require_implementation_plan": True,
+                    "python": sys.executable,
+                },
+                client,
+            )
+            report = runtime.run()
+            self.assertEqual(report["status"], "ready_for_review")
+            for schema in client.schemas[:4]:
+                self.assertIn("PLAN_IMPLEMENTATION", schema["properties"]["action"]["enum"])
+                self.assertNotIn("SAFE_REPLACE", schema["properties"]["action"]["enum"])
+            self.assertIn("SAFE_REPLACE", client.schemas[4]["properties"]["action"]["enum"])
+            self.assertEqual(client.action_schema, RUNTIME.CODER_ACTION_SCHEMA)
+            self.assertEqual(client.schema_name, "original")
+            self.assertEqual((root / "src/example.py").read_text(), "VALUE = 2\n")
+
+    def test_optional_pre_edit_plan_is_untrusted_bounded_and_does_not_validate(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            runtime = RUNTIME.WorkerRuntime(
+                root, packet_v2(), {"coder_require_implementation_plan": True}, FakeClient([])
+            )
+            runtime.write_lock.acquire()
+            runtime._prepare_run_archive()
+            plan = {
+                "contracts": [{"id": "behavior-value", "approach": "Change only VALUE."}],
+                "steps": ["Read current source and test, edit VALUE, validate."],
+            }
+            try:
+                with self.assertRaisesRegex(RUNTIME.WorkerError, "required before"):
+                    runtime._begin_edit()
+                with self.assertRaisesRegex(RUNTIME.WorkerError, "baseline"):
+                    runtime.plan_implementation(plan)
+                runtime.validation_count = 1
+                with self.assertRaisesRegex(RUNTIME.WorkerError, "source and focused"):
+                    runtime.plan_implementation(plan)
+                runtime.read_file({"path": "src/example.py"})
+                runtime.read_file({"path": "tests/test_example.py"})
+                for bad in (
+                    {"contracts": [], "steps": ["edit"]},
+                    {"contracts": [{"id": "unknown", "approach": "edit"}], "steps": ["edit"]},
+                    {"contracts": [{"id": [], "approach": "edit"}], "steps": ["edit"]},
+                    {**plan, "steps": ["x"] * 9},
+                    {**plan, "steps": ["x" * 501]},
+                ):
+                    with self.assertRaises(RUNTIME.WorkerError):
+                        runtime.plan_implementation(bad)
+                result = runtime.plan_implementation(plan)
+                self.assertEqual(result["status"], "recorded_unverified")
+                runtime._begin_edit()
+                self.assertIsNone(runtime.validation)
+                self.assertEqual(runtime.edit_revision, 0)
+                self.assertTrue(runtime.implementation_plan["untrusted"])
+                self.assertEqual((root / "src/example.py").read_text(), "VALUE = 1\n")
+                with self.assertRaisesRegex(RUNTIME.WorkerError, "only once"):
+                    runtime.plan_implementation(plan)
+            finally:
+                runtime.close()
+
+    def test_pre_edit_plan_default_is_off_and_rejects_non_boolean_config(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            runtime = RUNTIME.WorkerRuntime(root, packet_v2(), {}, FakeClient([]))
+            runtime._begin_edit()
+            self.assertNotIn("Experimental pre-edit", runtime.system_prompt())
+            with self.assertRaisesRegex(RUNTIME.WorkerError, "not enabled"):
+                runtime.plan_implementation({})
+            with self.assertRaisesRegex(RUNTIME.WorkerError, "must be a boolean"):
+                RUNTIME.WorkerRuntime(
+                    root, packet_v2(), {"coder_require_implementation_plan": "true"}, FakeClient([])
+                )
+
     def test_guarded_search_and_prefetch_preserve_repository_read_root(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -448,6 +1000,18 @@ class WorkerRuntimeTests(unittest.TestCase):
             try:
                 runtime._prepare_run_archive()
                 self.assertEqual(runtime.validate({})["status"], "failed")
+                self.assertIsNone(runtime._required_repair_focus())
+                baseline = runtime._validation_observation(runtime.validation)
+                self.assertEqual(baseline["stage"], "baseline")
+                self.assertTrue(baseline["repair_focus"])
+                self.assertTrue(
+                    all("required_next_action" not in item for item in baseline["repair_focus"])
+                )
+                observation, finished = runtime.execute(
+                    {"action": "READ_FILE", "arguments": {"path": "tests/test_example.py"}}
+                )
+                self.assertIsNone(finished)
+                self.assertIn("assert VALUE == 2", observation["content"])
                 self.assertEqual(runtime.validate({})["status"], "failed")
 
                 def edit(old: int, new: int) -> dict:
@@ -465,6 +1029,9 @@ class WorkerRuntimeTests(unittest.TestCase):
                 self.assertEqual(runtime.repairs, 0)
                 self.assertFalse(runtime.pending_failed_validation)
                 self.assertEqual(runtime.validate({})["status"], "failed")
+                self.assertEqual(
+                    runtime._required_repair_focus()["required_next_action"], "SAFE_REPLACE"
+                )
                 self.assertTrue(edit(3, 4)["repair_edit"])
                 self.assertFalse(edit(4, 5)["repair_edit"])
                 self.assertEqual(runtime.repairs, 1)
@@ -490,6 +1057,26 @@ class WorkerRuntimeTests(unittest.TestCase):
             try:
                 runtime.pending_failed_validation = True
                 observed = runtime.read_file({"path": "src/example.py"})
+                runtime.validation = RUNTIME.ValidationResult(
+                    "failed",
+                    {"status": "passed"},
+                    {
+                        "status": "failed",
+                        "diagnostic": {
+                            "failures": [
+                                {
+                                    "test": "tests.test_example::test_value",
+                                    "message": "AssertionError: assert 1 == 2",
+                                    "location": "tests/test_example.py:2: AssertionError",
+                                }
+                            ]
+                        },
+                    },
+                )
+                self.assertEqual(runtime.edit_revision, 0)
+                self.assertEqual(
+                    runtime._required_repair_focus()["required_next_action"], "SAFE_REPLACE"
+                )
                 result = runtime.safe_replace(
                     {
                         "path": "src/example.py",
@@ -604,6 +1191,19 @@ class WorkerRuntimeTests(unittest.TestCase):
             self.assertFalse(runtime._validated_terminal_state())
             self.assertEqual(runtime.validation_count, 0)
 
+    def test_dependency_preflight_does_not_write_bytecode_to_read_only_interpreter_tree(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            runtime = RUNTIME.WorkerRuntime(root, packet_v2(), {}, FakeClient([]))
+            interpreter = Path(sys.executable).resolve()
+            with (
+                patch.object(runtime, "python_path", return_value=interpreter),
+                patch.object(runtime, "_run_command", return_value={"status": "passed"}) as command,
+            ):
+                runtime.preflight()
+            command.assert_called_once_with([str(interpreter), "-B", "-c", "import pytest"])
+
     def test_multiline_line_edit_hint_is_observed_version_bound_and_never_executes(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -639,6 +1239,95 @@ class WorkerRuntimeTests(unittest.TestCase):
                     runtime.safe_replace_line({**args, "line": 9})
             finally:
                 runtime.close()
+
+    def test_invalid_line_shape_hint_never_infers_a_line_or_grants_read_coverage(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            runtime = RUNTIME.WorkerRuntime(root, packet_v2(), {}, FakeClient([]))
+            runtime.write_lock.acquire()
+            try:
+                runtime._prepare_run_archive()
+                digest = RUNTIME.RUN_STATE.sha256_bytes((root / "src/example.py").read_bytes())
+                for line in (None, False, 0, -1, "1-2", "VALUE = 1"):
+                    with self.subTest(line=line), self.assertRaises(RUNTIME.WorkerError) as caught:
+                        runtime.safe_replace_line(
+                            {
+                                "path": "src/example.py",
+                                "expected_sha256": digest,
+                                "line": line,
+                                "replacement": "VALUE = 2",
+                            }
+                        )
+                    hint = caught.exception.details["field_shape"]
+                    self.assertTrue(hint["navigation_only"])
+                    self.assertNotIn("arguments", hint)
+                    self.assertEqual(runtime.read_coverage, {})
+                    self.assertEqual(runtime.edit_revision, 0)
+                    self.assertEqual((root / "src/example.py").read_text(), "VALUE = 1\n")
+                # A valid shape is still rejected without current read evidence.
+                with self.assertRaisesRegex(RUNTIME.WorkerError, "observed"):
+                    runtime.safe_replace_line(
+                        {
+                            "path": "src/example.py",
+                            "expected_sha256": digest,
+                            "line": 1,
+                            "replacement": "VALUE = 2",
+                        }
+                    )
+            finally:
+                runtime.close()
+
+    def test_multiline_hint_narrows_only_next_transport_and_ignored_hint_stays_rejected(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            digest = RUNTIME.RUN_STATE.sha256_bytes((root / "src/example.py").read_bytes())
+            invalid = {
+                "action": "SAFE_REPLACE_LINE",
+                "arguments": {
+                    "path": "src/example.py",
+                    "expected_sha256": digest,
+                    "line": 1,
+                    "replacement": "VALUE = 2\nOTHER = 3",
+                },
+            }
+            client = FakeClient(
+                [
+                    {"action": "READ_FILE", "arguments": {"path": "src/example.py"}},
+                    invalid,
+                    invalid,
+                    {
+                        "action": "FINISH_FAILED",
+                        "arguments": {
+                            "summary": ["No edit executed"],
+                            "reason": "stop",
+                            "remaining_uncertainty": [],
+                        },
+                    },
+                ]
+            )
+            client.structured_output = True
+            client.action_schema = RUNTIME.CODER_ACTION_SCHEMA
+            client.schema_name = "original"
+            schemas = []
+            complete = client.complete
+
+            def capture(messages):
+                schemas.append(json.loads(json.dumps(client.action_schema)))
+                return complete(messages)
+
+            client.complete = capture
+            runtime = RUNTIME.WorkerRuntime(root, packet_v2(), {"python": sys.executable}, client)
+            report = runtime.run()
+            self.assertNotIn("SAFE_REPLACE_LINE", schemas[2]["properties"]["action"]["enum"])
+            self.assertIn("SAFE_REPLACE", schemas[2]["properties"]["action"]["enum"])
+            self.assertIn("SAFE_REPLACE_LINE", schemas[3]["properties"]["action"]["enum"])
+            self.assertIs(client.action_schema, RUNTIME.CODER_ACTION_SCHEMA)
+            self.assertEqual(client.schema_name, "original")
+            self.assertEqual(report["protocol_error_count"], 1)
+            self.assertEqual(runtime.edit_revision, 0)
+            self.assertEqual((root / "src/example.py").read_text(), "VALUE = 1\n")
 
     def test_safe_replace_line_requires_observed_current_line(self) -> None:
         with TemporaryDirectory() as directory:
@@ -709,6 +1398,7 @@ class WorkerRuntimeTests(unittest.TestCase):
             runtime = RUNTIME.WorkerRuntime(
                 root, packet_v2(), {"python": "python.exe"}, FakeClient([])
             )
+            runtime.edit_revision = 1  # Diagnostic belongs to an implementation draft.
             validation = RUNTIME.ValidationResult(
                 "failed",
                 {"status": "passed"},
@@ -767,6 +1457,40 @@ class WorkerRuntimeTests(unittest.TestCase):
             self.assertEqual(
                 payload["test_evidence"][0]["displayed_bindings"], failures[0]["displayed_bindings"]
             )
+
+    def test_chained_exception_focus_keeps_cause_without_granting_read_authority(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            runtime = RUNTIME.WorkerRuntime(
+                root, packet_v2(), {"python": "python.exe"}, FakeClient([])
+            )
+            chain = [
+                {
+                    "location": "tests/test_example.py:5: AssertionError",
+                    "displayed_failure": "E assert 1 != 1",
+                }
+            ]
+            focused = {
+                "diagnostic": {
+                    "failures": [
+                        {
+                            "test": "wrapped",
+                            "message": "RuntimeError: failed",
+                            "location": "src/example.py:1: RuntimeError",
+                            "preceding_exceptions": chain,
+                        }
+                    ]
+                }
+            }
+            before = set(runtime.observed_evidence_lines)
+            focus = runtime._failed_test_repair_focus(focused)[0]
+            self.assertEqual(focus["preceding_exceptions"], chain)
+            self.assertEqual(focus["path"], "src/example.py")
+            self.assertIn("not source read/edit authority", focus["exception_chain_note"])
+            self.assertEqual(runtime.observed_evidence_lines, before)
+            payload = runtime._compact_repair_payload(focus)
+            self.assertEqual(payload["repair_focus"]["preceding_exceptions"], chain)
 
     def test_name_error_focus_identifies_verified_type_checking_import(self) -> None:
         with TemporaryDirectory() as directory:
@@ -990,6 +1714,7 @@ class WorkerRuntimeTests(unittest.TestCase):
 
             runtime.validation = RUNTIME.ValidationResult("failed", {"status": "passed"}, focused)
             runtime.pending_failed_validation = True
+            runtime.edit_revision = 1
             self.assertEqual(
                 runtime._required_repair_focus()["required_next_action"], "SAFE_REPLACE"
             )
@@ -1184,6 +1909,116 @@ class WorkerRuntimeTests(unittest.TestCase):
                 )
             self.assertEqual(runtime.repairs, 0)
 
+    def test_failed_validation_second_noop_returns_actionable_primary_failure(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            (root / "tests/test_example.py").write_text(
+                "import runpy\ndef test_value():\n    assert runpy.run_path('src/example.py')['VALUE'] == 2\n",
+                encoding="utf-8",
+            )
+            noop = {
+                "action": "SAFE_REPLACE",
+                "arguments": {
+                    "path": "src/example.py",
+                    "find": "VALUE = 1",
+                    "replace": "VALUE = 1",
+                },
+            }
+            client = FakeClient(
+                [
+                    {"action": "READ_FILE", "arguments": {"path": "src/example.py"}},
+                    {"action": "VALIDATE", "arguments": {}},
+                    noop,
+                    noop,
+                    {"action": "FINISH_SUCCESS", "arguments": {"summary": ["Not allowed"]}},
+                ]
+            )
+            value = packet_v2()
+            value["scope"]["readonly"] = ["tests/test_example.py"]
+            runtime = RUNTIME.WorkerRuntime(root, value, {"python": sys.executable}, client)
+            report = runtime.run()
+            self.assertEqual(report["status"], "failed")
+            self.assertEqual(report["failure_reason"], "repeated_noop_after_failed_validation")
+            self.assertEqual(report["next_action_required"], "primary_rework_or_takeover_decision")
+            self.assertEqual(report["runtime_facts"]["failed_validation_noop_count"], 2)
+            self.assertIn("Do not assume the test is stale", report["remaining_uncertainty"][0])
+            self.assertEqual(len(client.messages_seen), 4)
+            self.assertEqual(runtime.repairs, 0)
+            self.assertEqual(runtime.validation_count, 1)
+            self.assertEqual(report["changed_files"], [])
+            self.assertTrue((runtime.archive.run_root / "validation-attempt-1.json").is_file())
+            self.assertEqual((root / "src/example.py").read_text(), "VALUE = 1\n")
+
+    def test_single_failed_validation_noop_allows_real_edit_and_success(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            (root / "tests/test_example.py").write_text(
+                "import runpy\ndef test_value():\n    assert runpy.run_path('src/example.py')['VALUE'] == 2\n",
+                encoding="utf-8",
+            )
+            sha = RUNTIME.SAFE_EDIT.sha256_bytes((root / "src/example.py").read_bytes())
+            client = FakeClient(
+                [
+                    {"action": "READ_FILE", "arguments": {"path": "src/example.py"}},
+                    {"action": "VALIDATE", "arguments": {}},
+                    {
+                        "action": "SAFE_REPLACE",
+                        "arguments": {
+                            "path": "src/example.py",
+                            "find": "VALUE = 1",
+                            "replace": "VALUE = 1",
+                        },
+                    },
+                    {
+                        "action": "SAFE_REPLACE",
+                        "arguments": {
+                            "path": "src/example.py",
+                            "find": "VALUE = 1",
+                            "replace": "VALUE = 2",
+                            "expected_sha256": sha,
+                        },
+                    },
+                    {"action": "VALIDATE", "arguments": {}},
+                    {
+                        "action": "FINISH_SUCCESS",
+                        "arguments": {"summary": ["Validated"], "remaining_uncertainty": []},
+                    },
+                ]
+            )
+            runtime = RUNTIME.WorkerRuntime(root, packet_v2(), {"python": sys.executable}, client)
+            report = runtime.run()
+            self.assertEqual(report["status"], "ready_for_review")
+            self.assertEqual(runtime.failed_validation_noop_count, 0)
+            self.assertEqual(runtime.validation_count, 2)
+
+    def test_noop_stop_requires_actual_failed_validation_and_not_other_errors(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            runtime = RUNTIME.WorkerRuntime(
+                root, packet_v2(), {"python": sys.executable}, FakeClient([])
+            )
+            action = {"action": "SAFE_REPLACE"}
+            error = RUNTIME.WorkerError("SAFE_REPLACE find and replace are identical")
+            for status in (None, "passed"):
+                runtime.pending_failed_validation = True
+                runtime.validation = (
+                    None if status is None else RUNTIME.ValidationResult(status, {}, {})
+                )
+                self.assertFalse(runtime._repeated_failed_validation_noop(action, error))
+            runtime.validation = RUNTIME.ValidationResult("failed", {}, {})
+            self.assertFalse(
+                runtime._repeated_failed_validation_noop(
+                    action, RUNTIME.WorkerError("target missing")
+                )
+            )
+            self.assertFalse(runtime._repeated_failed_validation_noop({"action": "SEARCH"}, error))
+            self.assertEqual(runtime.failed_validation_noop_count, 0)
+            self.assertFalse(runtime._repeated_failed_validation_noop(action, error))
+            self.assertTrue(runtime._repeated_failed_validation_noop(action, error))
+
     def test_failed_validation_edit_shape_and_noop_reach_current_validation(self) -> None:
         class RepairReplayClient:
             def __init__(self) -> None:
@@ -1350,6 +2185,12 @@ class WorkerRuntimeTests(unittest.TestCase):
             self.assertIn("src/example.py", report["worker_claims"]["remaining_uncertainty"][0])
 
     def test_failed_validation_prefetches_editable_repair_context(self) -> None:
+        self._assert_failed_validation_repair_context(reset=False)
+
+    def test_failed_validation_context_reset_keeps_contract_and_current_evidence_only(self):
+        self._assert_failed_validation_repair_context(reset=True)
+
+    def _assert_failed_validation_repair_context(self, *, reset):
         with TemporaryDirectory() as directory:
             root = Path(directory)
             self.make_tree(root)
@@ -1366,7 +2207,12 @@ class WorkerRuntimeTests(unittest.TestCase):
                     },
                 ]
             )
-            runtime = RUNTIME.WorkerRuntime(root, packet_v2(), {"python": sys.executable}, client)
+            runtime = RUNTIME.WorkerRuntime(
+                root,
+                packet_v2(),
+                {"python": sys.executable, "coder_reset_failed_repair_context": reset},
+                client,
+            )
             validation = RUNTIME.ValidationResult(
                 "failed",
                 {"status": "passed"},
@@ -1387,6 +2233,7 @@ class WorkerRuntimeTests(unittest.TestCase):
 
             def execute(action: dict) -> tuple[dict, dict | None]:
                 if action["action"] == "VALIDATE":
+                    runtime.edit_revision = 1  # Simulate validation after a source edit.
                     runtime.validation = validation
                     runtime.pending_failed_validation = True
                     return {"status": "failed"}, None
@@ -1397,14 +2244,121 @@ class WorkerRuntimeTests(unittest.TestCase):
             repair_messages = client.messages_seen[2]
             repair_message = repair_messages[-1]["content"]
             self.assertTrue(repair_message.startswith("REPAIR_REQUIRED\n"))
-            self.assertTrue(
-                any(message["content"].startswith("OBSERVATION\n") for message in repair_messages)
+            self.assertEqual(
+                any(message["content"].startswith("OBSERVATION\n") for message in repair_messages),
+                not reset,
             )
+            self.assertEqual(repair_messages[:2], client.messages_seen[0][:2])
+            if reset:
+                self.assertEqual(len(repair_messages), 3)
+                self.assertTrue(runtime.context_trimmed)
             payload = json.loads(repair_message.split("\n", 1)[1])
             self.assertEqual(payload["source_excerpts"][0]["path"], "src/example.py")
             self.assertIn("AssertionError", payload["repair_focus"]["message"])
             events = (root / ".agent/tasks/test-1/runs/test-1-a1/events.jsonl").read_text()
             self.assertIn("repair_context_prefetched", events)
+
+    def test_pyright_repair_context_drops_stale_observations_not_contract(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            client = FakeClient(
+                [
+                    {"action": "READ_FILE", "arguments": {"path": "src/example.py"}},
+                    {"action": "VALIDATE", "arguments": {}},
+                    {
+                        "action": "FINISH_BLOCKED",
+                        "arguments": {
+                            "reason_code": "no_progress",
+                            "reason": "bounded test stop",
+                        },
+                    },
+                ]
+            )
+            runtime = RUNTIME.WorkerRuntime(root, packet_v2(), {"python": sys.executable}, client)
+            target = root / "src/example.py"
+            old_sha = RUNTIME.SAFE_EDIT.sha256_bytes(target.read_bytes())
+            original_execute = runtime.execute
+
+            def execute(action):
+                if action["action"] == "VALIDATE":
+                    target.write_text("VALUE = 2\n", encoding="utf-8")
+                    runtime.edit_revision = 1
+                    runtime.validation = RUNTIME.ValidationResult(
+                        "failed",
+                        {"status": "passed"},
+                        {"status": "passed"},
+                        configured_checks=[
+                            {
+                                "id": "pyright",
+                                "status": "failed",
+                                "output": "src/example.py:1:1 - error: mismatch (reportArgumentType)\n",
+                            }
+                        ],
+                    )
+                    runtime.pending_failed_validation = True
+                    return {"status": "failed"}, None
+                return original_execute(action)
+
+            with patch.object(runtime, "execute", side_effect=execute):
+                runtime.run()
+            messages = client.messages_seen[2]
+            self.assertEqual(len(messages), 3)
+            self.assertEqual(messages[:2], client.messages_seen[0][:2])
+            self.assertNotIn(old_sha, messages[-1]["content"])
+            payload = json.loads(messages[-1]["content"].split("\n", 1)[1])
+            self.assertEqual(
+                payload["source_excerpts"][0]["sha256"],
+                RUNTIME.SAFE_EDIT.sha256_bytes(target.read_bytes()),
+            )
+            self.assertIn("VALUE = 2", payload["source_excerpts"][0]["content"])
+
+    def test_presented_repair_source_qualifies_only_complete_current_lines(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            source = root / "src/example.py"
+            source.write_text("VALUE = 1\nSECOND = 2\n", encoding="utf-8")
+            runtime = RUNTIME.WorkerRuntime(root, packet_v2(), {}, FakeClient([]))
+            runtime.write_lock.acquire()
+            runtime._prepare_run_archive()
+            try:
+                digest = RUNTIME.SAFE_EDIT.sha256_bytes(source.read_bytes())
+                payload = {
+                    "source_excerpts": [
+                        {
+                            "path": "src/example.py",
+                            "sha256": digest,
+                            "content": "1: VALUE = 1\n2: SECOND =",  # second line truncated
+                        }
+                    ]
+                }
+                runtime._register_presented_repair_evidence(payload)
+                self.assertIn(("src/example.py", digest, 1), runtime.presented_repair_lines)
+                self.assertNotIn(("src/example.py", digest, 2), runtime.presented_repair_lines)
+                self.assertNotIn(("src/example.py", digest), runtime.read_coverage)
+                with self.assertRaisesRegex(RUNTIME.WorkerError, "observed"):
+                    runtime.safe_replace_line(
+                        {
+                            "path": "src/example.py",
+                            "expected_sha256": digest,
+                            "line": 2,
+                            "replacement": "SECOND = 3",
+                        }
+                    )
+                runtime.safe_replace_line(
+                    {
+                        "path": "src/example.py",
+                        "expected_sha256": digest,
+                        "line": 1,
+                        "replacement": "VALUE = 2",
+                    }
+                )
+                current = RUNTIME.SAFE_EDIT.sha256_bytes(source.read_bytes())
+                runtime._register_presented_repair_evidence(payload)  # stale excerpt ignored
+                self.assertNotIn(("src/example.py", current), runtime.read_coverage)
+            finally:
+                runtime.close()
 
     def test_repeated_positive_search_is_not_new_repair_evidence(self) -> None:
         with TemporaryDirectory() as directory:
@@ -1728,6 +2682,7 @@ class WorkerRuntimeTests(unittest.TestCase):
             runtime = RUNTIME.WorkerRuntime(
                 root, packet_v2(), {"python": sys.executable}, FakeClient([])
             )
+            runtime.edit_revision = 1  # Existing assertion exercises post-edit static recovery.
             check = {
                 "id": "ruff-check",
                 "status": "failed",
@@ -1749,6 +2704,43 @@ class WorkerRuntimeTests(unittest.TestCase):
             self.assertIn("one narrow edit", focus[0]["instruction"])
             encoded = json.dumps(observation)
             self.assertLess(encoded.index('"repair_focus"'), encoded.index('"configured_checks"'))
+
+    def test_pyright_focus_prefers_multiline_causal_type_error_and_normalizes_scope(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            runtime = RUNTIME.WorkerRuntime(root, packet_v2(), {}, FakeClient([]))
+            path = str(root / "src/example.py")
+            output = (
+                f'{path}:1:1 - error: Type of "value" is unknown (reportUnknownVariableType)\n'
+                f'{path}:2:5 - error: Argument of type "int | None" cannot be assigned\n'
+                '  Type "None" is not assignable to "int" (reportArgumentType)\n'
+                "2 errors, 0 warnings, 0 informations\n"
+            )
+            validation = RUNTIME.ValidationResult(
+                "failed",
+                {"status": "passed"},
+                {"status": "passed"},
+                configured_checks=[{"id": "pyright", "status": "failed", "output": output}],
+            )
+            focus = runtime._validation_repair_focus(validation)[0]
+            self.assertEqual(focus["rule"], "reportArgumentType")
+            self.assertEqual(focus["path"], "src/example.py")
+            self.assertEqual(focus["line"], 2)
+            self.assertIn("int | None", focus["message"])
+            self.assertEqual(focus["required_next_action"], "SAFE_REPLACE")
+            self.assertEqual(focus["required_path"], "src/example.py")
+            for bad_path in (str(root.parent / "outside.py"), "../outside.py"):
+                validation.configured_checks[0]["output"] = output.replace(path, bad_path)
+                focus = runtime._validation_repair_focus(validation)[0]
+                self.assertNotIn("path", focus)
+                self.assertNotIn("required_next_action", focus)
+            validation.configured_checks[0]["output"] = output.replace(
+                path, "tests/test_example.py"
+            )
+            focus = runtime._validation_repair_focus(validation)[0]
+            self.assertEqual(focus["path"], "tests/test_example.py")
+            self.assertNotIn("required_next_action", focus)
 
     def test_coder_search_is_literal_by_default_and_regex_is_explicit(self) -> None:
         with TemporaryDirectory() as directory:
@@ -2522,6 +3514,68 @@ class WorkerRuntimeTests(unittest.TestCase):
             self.assertEqual(report["status"], "failed")
             self.assertEqual(report["protocol_error_count"], 1)
 
+    def test_native_text_nudge_can_recover_only_through_normal_edit_and_validation(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+
+            class RecoveringClient(AdaptiveSuccessClient):
+                native_tool_choice = "required"
+                native_tools = [{"function": {"name": "READ_FILE"}}]
+
+                def __init__(self):
+                    super().__init__()
+                    self.calls = 0
+
+                def complete(self, messages):
+                    self.calls += 1
+                    if self.calls == 1:
+                        self.last_request_stats = {
+                            "rejection_reason": "output_token_limit",
+                            "provider_finish_reason": "length",
+                            "response_parts": {
+                                "content": {"chars": 20000},
+                                "tool_calls": {"count": 0},
+                            },
+                        }
+                        raise RUNTIME.WorkerError(
+                            "LM Studio truncated the response at its output-token limit"
+                        )
+                    self.last_request_stats = {}
+                    return super().complete(messages)
+
+            client = RecoveringClient()
+            runtime = RUNTIME.WorkerRuntime(
+                root,
+                packet(),
+                {"python": sys.executable, "coder_native_text_truncation_nudge": True},
+                client,
+            )
+
+            def fake_command(argv):
+                for item in argv:
+                    if item.startswith("--junitxml="):
+                        Path(item.split("=", 1)[1]).write_text(
+                            '<testsuites><testsuite tests="1" failures="0" errors="0" skipped="0" /></testsuites>',
+                            encoding="utf-8",
+                        )
+                return {
+                    "status": "passed",
+                    "exit_code": 0,
+                    "output": "unit-test validation stub",
+                    "argv": argv,
+                }
+
+            with patch.object(runtime, "_run_command", side_effect=fake_command):
+                report = runtime.run()
+            self.assertEqual(report["status"], "ready_for_review", report)
+            self.assertEqual(client.calls, 5)
+            self.assertEqual(runtime.protocol_errors, 1)
+            self.assertEqual(runtime.edit_revision, 1)
+            self.assertEqual(runtime.validated_revision, 1)
+            self.assertEqual(runtime.validation_count, 1)
+            self.assertEqual((root / "src/example.py").read_text(), "VALUE = 2\n")
+
     def test_authorized_edit_validation_and_success(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2975,6 +4029,11 @@ class WorkerRuntimeTests(unittest.TestCase):
         self.assertEqual(captured["body"]["tool_choice"], "auto")
         self.assertIs(captured["body"]["parallel_tool_calls"], False)
         self.assertEqual(client.last_request_stats["native_tool_call"], "READ_FILE")
+        self.assertTrue(client.last_native_call["id"].startswith("call_"))
+        self.assertEqual(client.last_native_call["function"]["name"], "READ_FILE")
+        self.assertEqual(
+            json.loads(client.last_native_call["function"]["arguments"]), {"path": "src/example.py"}
+        )
         client.native_tool_choice = "required"
         with patch.object(RUNTIME.urllib.request, "urlopen", side_effect=fake_urlopen):
             client.complete([{"role": "user", "content": "report now"}])
@@ -3151,6 +4210,35 @@ class WorkerRuntimeTests(unittest.TestCase):
                     client.last_request_stats["response_usage"]["completion_tokens"], 2048
                 )
                 self.assertNotIn("native_tool_call", client.last_request_stats)
+                self.assertIsNone(client.last_native_call)
+
+    def test_truncation_stats_partition_response_without_retaining_raw_text(self):
+        client = RUNTIME.LMStudioClient("http://localhost:1234/v1", "coder")
+        message = {
+            "content": "PRIVATE_SOURCE",
+            "reasoning": "PRIVATE_REASONING",
+            "tool_calls": [{"function": {"arguments": "PRIVATE_ACTION"}}],
+        }
+        response = io.BytesIO(
+            json.dumps(
+                {
+                    "choices": [
+                        {
+                            "message": message,
+                            "finish_reason": "length",
+                        }
+                    ]
+                }
+            ).encode()
+        )
+        with patch.object(RUNTIME.urllib.request, "urlopen", return_value=response):
+            with self.assertRaises(RUNTIME.ModelRequestError):
+                client.complete([{"role": "user", "content": "act"}])
+        stats = client.last_request_stats["response_parts"]
+        self.assertEqual(stats["content"]["chars"], len(message["content"]))
+        self.assertEqual(stats["reasoning"]["chars"], len(message["reasoning"]))
+        self.assertEqual(stats["tool_calls"]["argument_chars"], len("PRIVATE_ACTION"))
+        self.assertNotIn("PRIVATE_", json.dumps(client.last_request_stats))
 
     def test_lmstudio_client_classifies_output_token_limit(self) -> None:
         client = RUNTIME.LMStudioClient("http://localhost:1234/v1", "coder")
@@ -3599,6 +4687,8 @@ class WorkerRuntimeTests(unittest.TestCase):
             self.assertFalse(eligible([issue], profile))
             runtime.config["autoformat_on_diff_whitespace"] = True
             self.assertTrue(eligible([issue], profile))
+            no_bytecode = {**command, "argv": ["{python}", "-B", *command["argv"][1:]]}
+            self.assertTrue(eligible([issue], {"commands": [no_bytecode]}))
             self.assertFalse(eligible([], profile))
             self.assertFalse(eligible([issue], {"commands": []}))
             self.assertFalse(eligible([issue], {"commands": [{**command, "id": "custom"}]}))
@@ -3646,8 +4736,8 @@ class WorkerRuntimeTests(unittest.TestCase):
 
                 def command(argv):
                     calls.append(argv)
-                    if argv[1:4] == ["-m", "ruff", "format"] and "--check" not in argv:
-                        self.assertEqual(argv[4:], ["src/example.py"])
+                    if argv[1:5] == ["-B", "-m", "ruff", "format"] and "--check" not in argv:
+                        self.assertEqual(argv[5:], ["src/example.py"])
                         if outcome != "no-change":
                             target.write_text("VALUE = 2\n", encoding="utf-8")
                         if outcome == "unexpected-change":
@@ -3700,7 +4790,8 @@ class WorkerRuntimeTests(unittest.TestCase):
                     self.assertEqual(protected.read_bytes(), before)
                     self.assertEqual(
                         sum(
-                            a[1:4] == ["-m", "ruff", "format"] and "--check" not in a for a in calls
+                            a[1:5] == ["-B", "-m", "ruff", "format"] and "--check" not in a
+                            for a in calls
                         ),
                         1,
                     )
@@ -3864,6 +4955,66 @@ class WorkerRuntimeTests(unittest.TestCase):
                 drifted["_inheritance"]["parent_input_state"]["drifted_paths"], ["src/example.py"]
             )
             self.assertFalse(drifted["_inheritance"]["parent_input_state"]["validation_reusable"])
+
+    def test_reviewer_inherited_rework_needs_hash_bound_primary_finding(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            parent = packet_v2()
+            run = root / ".agent/tasks/test-1/runs/run-1"
+            review = root / ".agent/tasks/test-1/reviews/review-1"
+            run.mkdir(parents=True)
+            review.mkdir(parents=True)
+            (run / "packet.json").write_text(json.dumps(parent), encoding="utf-8")
+            (run / "completed.json").write_text('{"status":"ready_for_review"}', encoding="utf-8")
+            identity = {
+                "task_id": "test-1",
+                "unit_id": parent["unit_id"],
+                "run_id": "run-1",
+                "review_id": "review-1",
+            }
+            report = review / "handoff.json"
+            report.write_text(
+                json.dumps({"identity": identity, "decision": "rework"}), encoding="utf-8"
+            )
+            child = {
+                "schema_version": 2,
+                "task_id": "test-1",
+                "unit_id": parent["unit_id"],
+                "run_id": "run-2",
+                "packet_revision": parent["packet_revision"] + 1,
+                "parent_run_id": "run-1",
+                "preserve_contract": True,
+                "review_feedback": [{"finding_id": "f", "text": "Confirmed repair"}],
+            }
+            with self.assertRaisesRegex(RUNTIME.WorkerError, "requires Primary disposition"):
+                RUNTIME.resolve_inherited_packet(root, child)
+            primary = {
+                "decision": "rework",
+                "review_disposition": {
+                    "identity": identity,
+                    "primary_decision": "rework",
+                    "report_sha256": RUNTIME.RUN_STATE.sha256_bytes(report.read_bytes()),
+                    "confirmed_rework_finding_ids": ["f"],
+                },
+            }
+            (run / "review.json").write_text(json.dumps(primary), encoding="utf-8")
+            self.assertEqual(RUNTIME.resolve_inherited_packet(root, child)["run_id"], "run-2")
+            primary["review_disposition"]["primary_decision"] = "replan"
+            (run / "review.json").write_text(json.dumps(primary), encoding="utf-8")
+            with self.assertRaisesRegex(RUNTIME.WorkerError, "not confirmed"):
+                RUNTIME.resolve_inherited_packet(root, child)
+            primary["review_disposition"]["primary_decision"] = "rework"
+            primary["review_disposition"]["report_sha256"] = "stale"
+            (run / "review.json").write_text(json.dumps(primary), encoding="utf-8")
+            with self.assertRaisesRegex(RUNTIME.WorkerError, "changed Reviewer evidence"):
+                RUNTIME.resolve_inherited_packet(root, child)
+            primary["review_disposition"]["report_sha256"] = RUNTIME.RUN_STATE.sha256_bytes(
+                report.read_bytes()
+            )
+            (run / "review.json").write_text(json.dumps(primary), encoding="utf-8")
+            child["review_feedback"] = [{"finding_id": "other", "text": "Unconfirmed repair"}]
+            with self.assertRaisesRegex(RUNTIME.WorkerError, "Primary-confirmed"):
+                RUNTIME.resolve_inherited_packet(root, child)
 
     def test_contract_check_and_changed_test_quality_gate(self) -> None:
         with TemporaryDirectory() as directory:
@@ -4664,6 +5815,41 @@ class WorkerRuntimeTests(unittest.TestCase):
                 finally:
                     runtime.close()
 
+    def test_ruff_autoformat_no_bytecode_prefix_remains_fail_closed(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            runtime = RUNTIME.WorkerRuntime(root, packet_v2(), {}, FakeClient([]))
+            runtime.changed["src/example.py"] = {"operation": "modified"}
+            python = Path(sys.executable)
+            result = {"output": "1 file would be reformatted"}
+            for flags in ([], ["-B"]):
+                argv = [str(python), *flags, "-m", "ruff", "format", "--check", "src"]
+                self.assertTrue(runtime._autoformat_eligible("ruff-format", argv, result, python))
+                self.assertFalse(runtime._autoformat_eligible("custom", argv, result, python))
+                self.assertFalse(runtime._autoformat_eligible("ruff-format", argv, {}, python))
+                self.assertFalse(
+                    runtime._autoformat_eligible("ruff-format", argv[:-2], result, python)
+                )
+            for prefix in (
+                ["other-python", "-B", "-m", "ruff", "format"],
+                [str(python), "-c", "ruff format"],
+                [str(python), "-I", "-m", "ruff", "format"],
+                [str(python), "-B", "-B", "-m", "ruff", "format"],
+                [str(python), "-B", "-m", "other", "format"],
+                [str(python), "-B", "-m", "ruff", "check"],
+            ):
+                argv = [*prefix, "--check", "src"]
+                self.assertFalse(runtime._autoformat_eligible("ruff-format", argv, result, python))
+                runtime.config["autoformat_on_diff_whitespace"] = True
+                self.assertFalse(
+                    runtime._diff_whitespace_autoformat_eligible(
+                        [{"code": "introduced_trailing_whitespace", "path": "src/example.py"}],
+                        {"commands": [{"id": "ruff-format", "argv": argv}]},
+                        python,
+                    )
+                )
+
     def test_ruff_autoformat_changes_only_authorized_file_and_revalidates(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -4679,6 +5865,7 @@ class WorkerRuntimeTests(unittest.TestCase):
                                 "id": "ruff-format",
                                 "argv": [
                                     "{python}",
+                                    "-B",
                                     "-m",
                                     "ruff",
                                     "format",
@@ -4715,7 +5902,7 @@ class WorkerRuntimeTests(unittest.TestCase):
                             '<testsuites><testsuite tests="1" failures="0" errors="0" skipped="0" /></testsuites>',
                             encoding="utf-8",
                         )
-                if argv[1:4] == ["-m", "ruff", "format"]:
+                if runtime._trusted_ruff_format_command(argv, Path(sys.executable)):
                     if "--check" in argv and "'two'" in target.read_text(encoding="utf-8"):
                         return {
                             "status": "failed",
@@ -4739,7 +5926,9 @@ class WorkerRuntimeTests(unittest.TestCase):
             self.assertEqual((root / "tests" / "test_example.py").read_bytes(), test_before)
             self.assertEqual(
                 sum(
-                    "--check" not in call for call in calls if call[1:4] == ["-m", "ruff", "format"]
+                    "--check" not in call
+                    for call in calls
+                    if call[1:5] == ["-B", "-m", "ruff", "format"]
                 ),
                 1,
             )

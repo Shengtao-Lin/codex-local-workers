@@ -1,0 +1,24 @@
+{
+  "decision": "HOLD_AS_WRITTEN_COMPLETION_OVERCLAIM",
+  "worker": {
+    "model_requests": 5,
+    "tool_actions": 8,
+    "evidence_actions": 7,
+    "edits": 0,
+    "initial_checks": 0,
+    "post_edit_checks": 0,
+    "format_preparations": 0,
+    "protocol_recoveries": 0,
+    "edit_recoveries": 0,
+    "reserved_output_tokens": 61440
+  },
+  "seconds": 62.4559976,
+  "valid_core": "Current snapshots/local lookup/captured registration/independent AgentRegistry traced correctly;no fake execution.",
+  "problem_quote": "the in-flight call still runs the old handler ... still emits before/after hooks and telemetry by name string ... and returns normally",
+  "disposition": "Read as a general completion guarantee this is unsupported:handler errors/timeouts remain possible;after_tool occurs only on success. It is an overbroad normal-path extension,not an unregister implementation defect.",
+  "independent_counterexample": "u2-completion-counterexample.json:with and without removal,the failing already-started handler raises ToolExecutionError and emits only before_tool;successful control emits both hooks.",
+  "primary_final": "Corrected interpretation documented separately;assisted synthesis,not raw Worker autonomous PASS.",
+  "archive_and_source_unchanged": true,
+  "formal_reviewer": "NOT_RUN by investigate design",
+  "no_worker_retry_or_budget_refill": true
+}

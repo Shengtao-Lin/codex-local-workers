@@ -7,6 +7,7 @@ import re
 import subprocess
 import sys
 import time
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +29,17 @@ REVIEW_ACTION_SCHEMA = {
         "arguments": {"type": "object", "additionalProperties": True},
     },
     "required": ["action", "arguments"],
+    "additionalProperties": False,
+}
+
+REVIEW_SOURCE_REF_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "path": {"type": "string"},
+        "start_line": {"type": "integer", "minimum": 1},
+        "end_line": {"type": "integer", "minimum": 1},
+    },
+    "required": ["path", "start_line", "end_line"],
     "additionalProperties": False,
 }
 
@@ -121,7 +133,13 @@ REVIEW_NATIVE_TOOLS = [
                                 "type": "string",
                                 "enum": ["verified", "violated", "uncertain"],
                             },
-                            "source_ref": {"type": "object"},
+                            "source_ref": REVIEW_SOURCE_REF_SCHEMA,
+                            "source_refs": {
+                                "type": "array",
+                                "minItems": 1,
+                                "maxItems": 3,
+                                "items": REVIEW_SOURCE_REF_SCHEMA,
+                            },
                             "evidence": {"type": "string"},
                         },
                     },
@@ -132,6 +150,68 @@ REVIEW_NATIVE_TOOLS = [
         ),
     )
 ]
+
+
+def canonical_citation_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One-request presentation repair; never normalize a submitted report."""
+    result = json.loads(json.dumps(tools))
+    for tool in result:
+        function = tool.get("function", {})
+        if function.get("name") != "REPORT":
+            continue
+        item = function["parameters"]["properties"]["contract_review"]["items"]
+        item["properties"].pop("source_ref", None)
+        transport = "evidence_ids" if "evidence_ids" in item["properties"] else "source_refs"
+        item["required"] = ["obligation_id", "status", transport, "evidence"]
+        item["additionalProperties"] = False
+    return result
+
+
+def evidence_id_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Present one citation transport; source selection and verdict remain untrusted."""
+    result = canonical_citation_tools(tools)
+    for tool in result:
+        function = tool.get("function", {})
+        if function.get("name") != "REPORT":
+            continue
+        item = function["parameters"]["properties"]["contract_review"]["items"]
+        item["properties"].pop("source_refs")
+        item["properties"]["evidence_ids"] = {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 3,
+            "items": {"type": "string"},
+            "uniqueItems": True,
+        }
+        item["required"] = ["obligation_id", "status", "evidence_ids", "evidence"]
+    return result
+
+
+ASSESSMENT_DECISIONS = {
+    "consistent": "pass_to_primary",
+    "optional_test_gap": "pass_to_primary",
+    "implementation_defect": "rework",
+    "required_test_gap": "rework",
+    "contract_conflict": "escalate",
+    "insufficient_evidence": "escalate",
+}
+
+
+def assessment_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    result = json.loads(json.dumps(tools))
+    for tool in result:
+        function = tool.get("function", {})
+        if function.get("name") == "REPORT":
+            parameters = function["parameters"]
+            parameters["properties"].pop("decision")
+            parameters["properties"]["assessment"] = {
+                "type": "string",
+                "enum": list(ASSESSMENT_DECISIONS),
+            }
+            parameters["required"] = [
+                "assessment" if key == "decision" else key for key in parameters["required"]
+            ]
+    return result
 
 
 def _load(name: str, filename: str) -> Any:
@@ -173,6 +253,27 @@ class ReviewerRuntime:
         self.config = config
         self.diagnostic_logging = config.get("diagnostic_logging", True) is not False
         self.client = client
+        self.evidence_ids_enabled = config.get("reviewer_evidence_ids", False)
+        if type(self.evidence_ids_enabled) is not bool:
+            raise ReviewError("reviewer_evidence_ids must be a boolean")
+        self.evidence_catalog: dict[str, dict[str, Any]] = {}
+        if self.evidence_ids_enabled and isinstance(getattr(client, "native_tools", None), list):
+            client.native_tools = evidence_id_tools(client.native_tools)
+        self.assessment_protocol = config.get("reviewer_assessment_protocol", False)
+        if type(self.assessment_protocol) is not bool:
+            raise ReviewError("reviewer_assessment_protocol must be a boolean")
+        if self.assessment_protocol and isinstance(getattr(client, "native_tools", None), list):
+            client.native_tools = assessment_tools(client.native_tools)
+        self.native_history = config.get("reviewer_native_history", False)
+        if type(self.native_history) is not bool:
+            raise ReviewError("reviewer_native_history must be a boolean")
+        self.prepass_challenge_pending = config.get("reviewer_prepass_challenge", False)
+        if type(self.prepass_challenge_pending) is not bool:
+            raise ReviewError("reviewer_prepass_challenge must be a boolean")
+        self.finding_challenge_pending = config.get("reviewer_finding_challenge", False)
+        if type(self.finding_challenge_pending) is not bool:
+            raise ReviewError("reviewer_finding_challenge must be a boolean")
+        self.prepass_challenge_context: dict[str, Any] | None = None
         self.approved_execution: list[dict[str, Any]] = []
         self.search_count = 0
         self.deferred_report: dict[str, Any] | None = None
@@ -192,8 +293,22 @@ class ReviewerRuntime:
         if self.packet["unit_id"] != self.unit_id:
             raise ReviewError("review unit_id does not match the Coder run")
         self.handoff = load_object(self.run_root / "handoff.json")
-        if self.handoff.get("status") != "ready_for_review":
+        if self.handoff.get("status") == "validation_passed_pending_review":
+            spec = importlib.util.spec_from_file_location(
+                "reviewer_host_handoff", SCRIPT_DIR / "local-unit.py"
+            )
+            gate = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(gate)
+            if request.get("execution_protocol") != gate.HOST.PROTOCOL:
+                raise ReviewError("Host review requires its explicit protocol")
+            gate.verify_handoff(self.repo_root, self.handoff, config=config)
+        elif self.handoff.get("status") != "ready_for_review":
             raise ReviewError("only ready_for_review Coder runs can enter local review")
+        elif (
+            self.handoff.get("execution_protocol") is not None
+            or request.get("execution_protocol") is not None
+        ):
+            raise ReviewError("Unknown review execution protocol")
         self.validation = load_object(self.run_root / "validation.json")
         self.post_state = load_object(self.run_root / "post-state.json")
         self.expected_inputs = self.post_state.get("validation_inputs")
@@ -215,6 +330,8 @@ class ReviewerRuntime:
         self.same_protocol_error_streak = 0
         self.read_paths: set[str] = set()
         self.read_lines: dict[str, set[int]] = {}
+        self.observed_read_hashes: dict[str, str] = {}
+        self.displayed_diff_hunks: set[str] = set()
         self.context_recovery = config.get("reviewer_context_recovery", False)
         if type(self.context_recovery) is not bool:
             raise ReviewError("reviewer_context_recovery must be boolean")
@@ -258,8 +375,28 @@ class ReviewerRuntime:
         ]
         if changed:
             raise ReviewError("review inputs changed after the Coder run: " + ", ".join(changed))
+        self._assert_observed_sources_current()
+
+    def _assert_observed_sources_current(self) -> None:
+        for relative, observed_hash in self.observed_read_hashes.items():
+            _, resolved = self._assert_read_allowed(relative)
+            try:
+                current_hash = RUN_STATE.sha256_bytes(resolved.read_bytes())
+            except OSError as exc:
+                raise ReviewError("read source changed or disappeared: " + relative) from exc
+            if current_hash != observed_hash:
+                raise ReviewError("read source changed after observation: " + relative)
 
     def prepare(self) -> None:
+        if self.handoff.get("status") == "validation_passed_pending_review":
+            # One dispatch per host run, including failed/interrupted reviews.
+            # A new review id is not permission to replay the same unit.
+            try:
+                RUN_STATE.write_json_once(self.run_root / "host-review-dispatch.json", self.request)
+            except (OSError, ValueError) as exc:
+                raise ReviewError(
+                    "Host run already dispatched or dispatch could not be recorded"
+                ) from exc
         try:
             self.review_root.mkdir(parents=True)
         except FileExistsError as exc:
@@ -288,16 +425,49 @@ class ReviewerRuntime:
         return relative, resolved
 
     def read_file(self, args: dict[str, Any]) -> dict[str, Any]:
+        observation = self._read_file(args)
+        if not self.evidence_ids_enabled:
+            return observation
+        path = observation["path"]
+        if observation["status"] in {"ok", "context_restored"}:
+            start = observation["start_line"]
+            end = observation.get("end_line")
+            if type(end) is int:
+                for low in range(start, end + 1, 20):
+                    reference = {
+                        "path": path,
+                        "start_line": low,
+                        "end_line": min(low + 19, end),
+                        "source_hash": self.observed_read_hashes[path],
+                    }
+                    if reference not in self.evidence_catalog.values():
+                        self.evidence_catalog[f"E{len(self.evidence_catalog) + 1}"] = reference
+        observation["citation_evidence"] = [
+            {"id": evidence_id, **reference}
+            for evidence_id, reference in self.evidence_catalog.items()
+            if reference["path"] == path
+        ]
+        return observation
+
+    def _read_file(self, args: dict[str, Any]) -> dict[str, Any]:
+        self._assert_observed_sources_current()
         relative, path = self._assert_read_allowed(args.get("path"))
         if not path.is_file():
             raise ReviewError(f"file does not exist: {relative}")
         start = args.get("start_line", 1)
         end = args.get("end_line")
-        if not isinstance(start, int) or start < 1:
+        if type(start) is not int or start < 1:
             raise ReviewError("start_line must be a positive integer")
-        if end is not None and (not isinstance(end, int) or end < start):
+        if end is not None and (type(end) is not int or end < start):
             raise ReviewError("end_line must be at least start_line")
-        text = path.read_text(encoding="utf-8-sig")
+        source_bytes = path.read_bytes()
+        source_hash = RUN_STATE.sha256_bytes(source_bytes)
+        if (
+            relative in self.observed_read_hashes
+            and self.observed_read_hashes[relative] != source_hash
+        ):
+            raise ReviewError("read source changed during observation: " + relative)
+        text = source_bytes.decode("utf-8-sig")
         lines = text.splitlines()
         selected = lines[start - 1 : end]
         content = "\n".join(
@@ -309,6 +479,7 @@ class ReviewerRuntime:
         else:
             visible_count = visible.count("\n")
         self.read_paths.add(relative)
+        self.observed_read_hashes[relative] = source_hash
         seen_lines = self.read_lines.setdefault(relative, set())
         visible_lines = set(range(start, start + visible_count))
         new_lines = visible_lines - seen_lines
@@ -491,7 +662,7 @@ class ReviewerRuntime:
 
         for message in messages:
             content = message.get("content", "")
-            if message.get("role") == "user" and content.startswith("OBSERVATION\n"):
+            if message.get("role") in {"user", "tool"} and content.startswith("OBSERVATION\n"):
                 try:
                     visit(json.loads(content.split("\n", 1)[1]))
                 except ValueError:
@@ -542,7 +713,9 @@ class ReviewerRuntime:
         )
         focused = self.focused_test_paths()
         test_read = not focused or any(self.read_lines.get(path) for path in focused)
-        return source_read and test_read
+        # Do not restrict the next action to REPORT while its coverage gate
+        # still requires source or test lines that have not been displayed.
+        return source_read and test_read and not self.coverage_facts()["missing"]
 
     def search(self, args: dict[str, Any]) -> dict[str, Any]:
         query = WORKER.require_string(args.get("query"), "query")
@@ -640,7 +813,9 @@ class ReviewerRuntime:
                 )
         return {"tests": tests, "static_checks": checks}
 
-    def _run_approved(self, kind: str, action_id: str, argv: list[str]) -> dict[str, Any]:
+    def _run_approved(
+        self, kind: str, action_id: str, argv: list[str], *, junit_path: Path | None = None
+    ) -> dict[str, Any]:
         timeout = int(self.config.get("command_timeout_seconds", 180))
         try:
             completed = subprocess.run(
@@ -670,6 +845,35 @@ class ReviewerRuntime:
                 "exit_code": None,
                 "output": str(exc)[-2000:],
             }
+        if junit_path is not None:
+            junit: dict[str, Any] = {
+                "path": junit_path.relative_to(self.repo_root).as_posix(),
+                "available": False,
+            }
+            try:
+                cases = list(ET.parse(junit_path).getroot().iter("testcase"))
+                counts = {
+                    tag: sum(case.find(tag) is not None for case in cases)
+                    for tag in ("failure", "error", "skipped")
+                }
+                junit.update(
+                    available=True,
+                    tests=len(cases),
+                    executed=len(cases) - counts["skipped"],
+                    **counts,
+                )
+                if junit["executed"] <= 0 or counts["failure"] or counts["error"]:
+                    if result["status"] == "passed":
+                        result["status"] = "failed"
+                    result["output"] += (
+                        "\nRuntime rejected empty, all-skipped or failing JUnit evidence."
+                    )
+            except (OSError, ET.ParseError) as exc:
+                junit["error"] = str(exc)
+                if result["status"] == "passed":
+                    result["status"] = "failed"
+                result["output"] += "\nRuntime rejected missing or invalid JUnit evidence."
+            result["junit"] = junit
         self.approved_execution.append(result)
         self.event(
             "approved_execution",
@@ -693,8 +897,14 @@ class ReviewerRuntime:
             isinstance(item, str) for item in pytest_argv
         ):
             raise ReviewError("validation profile pytest_argv must be a string array")
+        junit_path = self.review_root / f"approved-tests-{len(self.approved_execution) + 1}.xml"
+        if junit_path.exists():
+            raise ReviewError("approved test evidence already exists; never overwrite history")
         return self._run_approved(
-            "test", test_id, [python, *pytest_argv, *self.packet["focused_tests"]]
+            "test",
+            test_id,
+            [python, *pytest_argv, *self.packet["focused_tests"], f"--junitxml={junit_path}"],
+            junit_path=junit_path,
         )
 
     def run_approved_static_check(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -769,7 +979,57 @@ constraint_id values from ordering_constraints. Required order needs read source
 evidence; forbidden order may use read source or cumulative diff. Pass only when
 all constraints are verified. If evidence is missing, choose rework or escalate.
 """
+        if self.config.get("reviewer_assessment_protocol", False):
+            start = prompt.index("REPORT arguments:")
+            prompt = (
+                prompt[:start]
+                + """REPORT arguments: assessment, findings, verified_contract_ids, unverified_claims,
+ordering_review, contract_review, verified_check_ids. Choose the nature of the issue first:
+- consistent: implementation satisfies the owned hard contract.
+- optional_test_gap: additional test would be useful but is not a hard requirement and no concrete implementation violation exists; put advice in unverified_claims, not defect findings.
+- implementation_defect: source violates a satisfiable owned requirement; give concrete source-backed defect findings.
+- required_test_gap: an explicitly required test is missing; give the specific unmet test obligation.
+- contract_conflict: requirements are incompatible, or authority/ownership conflicts need Primary to revise the contract; do not propose an implementation that silently changes an invariant.
+- insufficient_evidence: scope or observations cannot support a decision; name the unresolved evidence.
+The runtime maps your explicit assessment to pass_to_primary, rework or escalate. It does
+not infer the assessment from keywords, source or tests. No automatic Coder rework is allowed.
+Consistent/optional_test_gap require no defect findings, all owned contracts and configured
+checks verified, and current complete displayed evidence. Defect findings need id, severity,
+category, path, line, evidence, contract_id, suggested_fix. For required review_obligations,
+select actual read evidence and give independent contract-specific reasoning; status is
+verified, violated or uncertain. A contract conflict must not become a piecewise fix that
+abandons one of the simultaneous requirements. Ordering review uses real constraint_id,
+status, evidence_type, path, line and evidence; required order needs actually read source,
+forbidden order may use read source or actual cumulative diff. Pass requires all ordering
+constraints verified. Never populate a verification claim solely because a field is required.
+"""
+            )
         strength = self.config.get("reviewer_reasoning_strength")
+        prompt += (
+            "For a contract obligation spanning an anchor and distant implementation, use "
+            "source_refs: an array of 1 to 3 actually read source_ref ranges, each at most "
+            "20 lines. One range must contain the required source_anchor; other ranges "
+            "must support the semantic reasoning. Single source_ref remains supported. "
+            "The runtime materializes every quote; never invent quotes or unread ranges.\n"
+        )
+        if self.config.get("reviewer_evidence_ids", False):
+            prompt = prompt.replace(
+                "review_obligation with source_ref {path,start_line,end_line} pointing to actually\nread lines",
+                "review_obligation with evidence_ids selected from citation_evidence in READ_FILE observations",
+            )
+            begin = prompt.index("For a contract obligation spanning an anchor")
+            finish = prompt.index("\n", begin)
+            prompt = (
+                prompt[:begin]
+                + (
+                    "For contract_review select one to three runtime-issued evidence_ids from actually "
+                    "displayed READ_FILE ranges, including the required source_anchor and relevant "
+                    "implementation. Use only obligation_id, status, evidence_ids, evidence in each "
+                    "entry. IDs prove display, not correctness; choose status and explain the whole "
+                    "obligation independently. The runtime derives exact quotes for your selected IDs."
+                )
+                + prompt[finish:]
+            )
         if strength is not None:
             if not isinstance(strength, str) or strength not in {"low", "medium", "high", "xhigh"}:
                 raise ReviewError("reviewer_reasoning_strength must be low, medium, high, or xhigh")
@@ -801,9 +1061,18 @@ all constraints are verified. If evidence is missing, choose rework or escalate.
             for index, item in enumerate(self.packet["forbidden_orderings"], 1)
         ]
 
-    def review_obligations(self) -> list[dict[str, str]]:
+    def review_obligations(self) -> list[dict[str, Any]]:
         obligations = [
-            {"id": item["id"], "kind": "required_behavior", "text": item["text"]}
+            {
+                "id": item["id"],
+                "kind": "required_behavior",
+                "text": item["text"],
+                **(
+                    {"implementation_ref": item["implementation_ref"]}
+                    if "implementation_ref" in item
+                    else {}
+                ),
+            }
             for item in self.packet["required_behavior"]
             if item["id"] in self.packet["owned_contract_ids"]
         ]
@@ -876,6 +1145,21 @@ all constraints are verified. If evidence is missing, choose rework or escalate.
             "valid_constraint_ids": [item["id"] for item in self.ordering_constraints()],
             "valid_obligation_ids": valid_obligation_ids,
         }
+        if self.assessment_protocol and "assessment" in error:
+            repair["valid_assessments"] = list(ASSESSMENT_DECISIONS)
+            repair["instruction"] = (
+                "Choose one explicit issue assessment; do not submit decision as well. Preserve your independent evidence and claim."
+            )
+            return repair
+        if self.evidence_ids_enabled and "evidence_ids" in error:
+            repair["citation_evidence"] = [
+                {"id": key, **value} for key, value in self.evidence_catalog.items()
+            ]
+            repair["instruction"] = (
+                "Select 1 to 3 distinct IDs already issued by READ_FILE. Do not combine IDs "
+                "with another citation representation. Preserve your independent claim and reasoning."
+            )
+            return repair
         if error == "decision must be pass_to_primary, rework, or escalate":
             repair["valid_decisions"] = ["pass_to_primary", "rework", "escalate"]
             repair["instruction"] = (
@@ -935,22 +1219,181 @@ all constraints are verified. If evidence is missing, choose rework or escalate.
                 "Use only valid_obligation_ids, once each. For high-risk pass, cite "
                 "actual READ_FILE source evidence for every required obligation."
             )
+        elif error == "contract_review must choose source_ref or source_refs, not both":
+            repair["instruction"] = (
+                "Submit only source_refs, an array of actually read bounded ranges. "
+                "Remove source_ref entirely. Do not change the claim to fit a citation; "
+                "all original range, anchor, freshness and semantic requirements remain."
+            )
         elif "contract_review status must be" in error:
             repair["instruction"] = (
                 "Each contract_review status must be exactly verified, violated, or uncertain. "
                 "Omit optional contract_review entries for small/medium units."
             )
+        elif match := re.fullmatch(
+            r"contract_review (\S+) source_quote must contain the required source_anchor", error
+        ):
+            obligation = next(
+                (item for item in self.review_obligations() if item["id"] == match.group(1)),
+                {},
+            )
+            anchor = obligation.get("source_anchor")
+            repair["obligation_id"] = match.group(1)
+            repair["required_source_anchor"] = anchor
+            if isinstance(anchor, str) and anchor:
+                for path in self.diff_paths():
+                    try:
+                        relative, resolved = self._assert_read_allowed(path)
+                        lines = resolved.read_text(encoding="utf-8-sig").splitlines()
+                    except (OSError, UnicodeError, ReviewError, SAFE_EDIT.SafeEditError):
+                        continue
+                    line = next((n for n, text in enumerate(lines, 1) if anchor in text), None)
+                    if line is not None:
+                        expected = self.expected_inputs.get(relative, {})
+                        already_read = line in self.read_lines.get(
+                            relative, set()
+                        ) and expected.get("sha256") == RUN_STATE.sha256_bytes(
+                            resolved.read_bytes()
+                        )
+                        repair["anchor_already_read"] = already_read
+                        if not already_read:
+                            repair["suggested_action"] = {
+                                "action": "READ_FILE",
+                                "arguments": {
+                                    "path": relative,
+                                    "start_line": line,
+                                    "end_line": line,
+                                },
+                            }
+                        repair["anchor_citation"] = {
+                            "path": relative,
+                            "line": line,
+                            "exact_source_quote": lines[line - 1].strip(),
+                        }
+                        repair["anchor_source_ref"] = {
+                            "path": relative,
+                            "start_line": line,
+                            "end_line": line,
+                        }
+                        break
+            repair["instruction"] = (
+                (
+                    "This current anchor line was already read. Do not reread it; correct "
+                    "REPORT using anchor_source_ref plus actually read semantic ranges. "
+                    if repair.get("anchor_already_read")
+                    else "Read suggested_action before citing anchor_citation for this obligation. "
+                    if "suggested_action" in repair
+                    else "Locate and read the required anchor within readable scope before citing it. "
+                )
+                + "The anchor only identifies the reviewed symbol, not proof of semantics: "
+                "independently inspect its implementation, tests and callers, and explain "
+                "the evidence. Do not mark verified merely to satisfy citation shape. "
+                "Use source_refs with anchor_source_ref and up to two actually read "
+                "implementation ranges (each at most 20 lines); remove an obsolete single "
+                "source_ref when switching to source_refs. "
+                "If the anchor or semantic evidence is unavailable, escalate to Primary."
+            )
+        elif error.startswith("verified_contract_ids contradicts "):
+            repair["conflicting_contract_ids"] = error.rsplit(": ", 1)[-1].split(", ")
+            repair["instruction"] = (
+                "A whole contract cannot simultaneously be verified and have a finding or "
+                "an uncertain/violated contract_review. Reconcile the actual source evidence; "
+                "remove unsupported verification, or withdraw a disproven finding. Do not "
+                "invent certainty or change a semantic verdict just to satisfy this gate. "
+                "If the evidence remains uncertain, escalate rather than accepting."
+            )
+        elif match := re.fullmatch(
+            r"contract_review (\S+) requires bound implementation citation", error
+        ):
+            obligation = next(
+                (item for item in self.review_obligations() if item["id"] == match.group(1)), {}
+            )
+            binding = obligation.get("implementation_ref")
+            repair["obligation_id"] = match.group(1)
+            repair["required_implementation_ref"] = binding
+            if isinstance(binding, dict):
+                try:
+                    relative, source = self._assert_read_allowed(binding["path"])
+                    text = source.read_text(encoding="utf-8-sig")
+                    module = WORKER.citation_binding()
+                    lines = module.statement_lines(text, binding["symbol"])
+                    repair["eligible_evidence_ids"] = [
+                        key
+                        for key, ref in self.evidence_catalog.items()
+                        if module.covers(binding, text, [ref])
+                    ]
+                    if not repair["eligible_evidence_ids"]:
+                        first = min(lines)
+                        repair["suggested_action"] = {
+                            "action": "READ_FILE",
+                            "arguments": {
+                                "path": relative,
+                                "start_line": max(1, first - 1),
+                                "end_line": first,
+                            },
+                        }
+                except (
+                    OSError,
+                    UnicodeError,
+                    ValueError,
+                    ReviewError,
+                    SAFE_EDIT.SafeEditError,
+                ) as exc:
+                    repair["binding_unavailable"] = str(exc)
         elif "contract_review.source_ref must name a real range" in error:
             repair["read_source_bounds"] = {
                 path: {"first_line": min(numbers), "last_line": max(numbers)}
                 for path, numbers in self.read_lines.items()
                 if numbers
             }
+            displayed_ranges = {}
+            for path, numbers in self.read_lines.items():
+                ranges = []
+                for number in sorted(numbers):
+                    if not ranges or number != ranges[-1]["end_line"] + 1:
+                        ranges.append({"start_line": number, "end_line": number})
+                    else:
+                        ranges[-1]["end_line"] = number
+                if ranges:
+                    displayed_ranges[path] = ranges[:12]
+            repair["displayed_source_ranges"] = displayed_ranges
+            invalid_refs = []
+            for item in args.get("contract_review", []):
+                if not isinstance(item, dict):
+                    continue
+                refs = item.get("source_refs", [item.get("source_ref")])
+                if not isinstance(refs, list):
+                    continue
+                for ref in refs:
+                    if not isinstance(ref, dict):
+                        continue
+                    start, end = ref.get("start_line"), ref.get("end_line")
+                    if (
+                        type(start) is not int
+                        or type(end) is not int
+                        or not 1 <= start <= end
+                        or end - start >= 20
+                    ):
+                        invalid_refs.append(
+                            {
+                                "obligation_id": item.get("obligation_id"),
+                                "path": ref.get("path"),
+                                "start_line": start,
+                                "end_line": end,
+                                "maximum_lines_per_ref": 20,
+                            }
+                        )
+            repair["invalid_source_refs"] = invalid_refs[:8]
             repair["instruction"] = (
                 "Choose source_ref.start_line and end_line from actually displayed "
                 "source lines within read_source_bounds, with start_line <= end_line "
                 "and at most 20 consecutive lines. Cite the lines that support the "
-                "obligation; do not invent a wider range."
+                "obligation; do not invent a wider range. For each invalid_source_refs entry, "
+                "choose only the necessary actually displayed lines. If an obligation needs "
+                "distant evidence, use source_refs with up to three ranges of <=20 lines each "
+                "and remove source_ref; do not discard needed evidence merely to shorten it. "
+                "displayed_source_ranges preserves unread gaps; read_source_bounds alone "
+                "does not prove that every intervening line was displayed."
             )
         elif match := re.search(
             r"(?:ordering_review|contract_review|finding) source line was not read: ([^:]+):(\d+)",
@@ -1018,6 +1461,18 @@ all constraints are verified. If evidence is missing, choose rework or escalate.
                 "line supports the obligation; otherwise report rework or escalate. Do not "
                 "resubmit the previous REPORT unchanged or reread an already displayed range."
             )
+        elif error == "diff evidence path must be an actual changed path":
+            repair["actual_changed_paths"] = sorted(self.diff_paths())
+            repair["diff_evidence_shape"] = {"path": "actual changed path or null", "line": None}
+            repair["instruction"] = (
+                "For diff evidence, path must be one of actual_changed_paths, or null for "
+                "a genuine whole-cumulative-diff absence claim; line must be null. "
+                "Do not cite readable but unchanged files as changed diff evidence. "
+                "Required order still needs actual read source evidence. These path hints "
+                "grant no source-read credit and do not establish any semantic constraint. "
+                "If the actual diff does not support the claim, use source evidence after "
+                "reading it, or report uncertainty rather than fabricating verification."
+            )
         elif (
             "ordering_review.path must be a non-empty string" in error
             or "source evidence line must be a positive integer" in error
@@ -1029,6 +1484,20 @@ all constraints are verified. If evidence is missing, choose rework or escalate.
                 },
                 "diff": {"path": "actual changed path or null", "line": None},
             }
+            repair["ordering_entry_fields"] = [
+                "constraint_id",
+                "status",
+                "evidence_type",
+                "path",
+                "line",
+                "evidence",
+            ]
+            repair["ordering_shape_instruction"] = (
+                "ordering_review uses flat path and line fields in each entry, not the "
+                "nested source_ref/source_refs used by contract_review. Put path and line "
+                "beside constraint_id. Do not copy contract_review's field layout here. "
+                "This is field-shape guidance only, never a semantic verification."
+            )
             repair["read_changed_source_paths"] = [
                 path
                 for path in self.diff_paths()
@@ -1041,6 +1510,18 @@ all constraints are verified. If evidence is missing, choose rework or escalate.
                 "Required order needs source evidence. Forbidden order may instead use actual "
                 "cumulative diff evidence with line=null. Do not mark a constraint verified "
                 "merely to repair field shape; if evidence is insufficient, report escalate."
+            )
+        elif "observed approved execution failures" in error:
+            repair["observed_execution_failures"] = [
+                {key: item.get(key) for key in ("kind", "id", "status", "exit_code")}
+                for item in self.approved_execution
+                if item.get("status") != "passed"
+            ]
+            repair["instruction"] = (
+                "Choose rework for a concrete defect or escalate for unresolved infrastructure "
+                "or conflicting evidence. Explain the actual failed execution, do not claim "
+                "it passed. Repeating an execution cannot erase an observed failure in this "
+                "review; Primary must resolve it before a new review invocation."
             )
         elif "diff evidence must not claim a source line" in error:
             repair["evidence_shapes"] = {
@@ -1077,6 +1558,24 @@ all constraints are verified. If evidence is missing, choose rework or escalate.
                 "actual cumulative diff evidence with line=null. If any constraint is violated "
                 "or uncertain, choose rework or escalate; do not manufacture verification."
             )
+        elif error.startswith("pass requires displayed coverage:"):
+            missing = self.coverage_facts()["missing"]
+            repair["coverage_missing"] = missing[:8]
+            target = next((item for item in missing if item.get("line_count", 1) > 0), None)
+            if target:
+                start = max(1, target.get("start_line", 1))
+                end = target.get("end_line", start + target.get("line_count", 40) - 1)
+                repair["suggested_action"] = {
+                    "action": "READ_FILE",
+                    "arguments": {
+                        "path": target["path"],
+                        "start_line": start,
+                        "end_line": min(end, start + 39),
+                    },
+                }
+            repair["instruction"] = (
+                "Read missing bounded evidence or report unresolved; display coverage is not semantic verification."
+            )
         elif "pass requires READ_FILE of at least one focused test file" in error:
             repair["suggested_action"] = {
                 "action": "READ_FILE",
@@ -1103,7 +1602,7 @@ all constraints are verified. If evidence is missing, choose rework or escalate.
         return repair
 
     def report_template(self) -> dict[str, Any]:
-        return {
+        result = {
             "action": "REPORT",
             "arguments": {
                 "decision": "CHOOSE pass_to_primary, rework, or escalate AFTER reviewing",
@@ -1142,10 +1641,28 @@ all constraints are verified. If evidence is missing, choose rework or escalate.
                 ],
             },
         }
+        if self.evidence_ids_enabled:
+            for item in result["arguments"]["contract_review"]:
+                item.pop("source_ref")
+                item["evidence_ids"] = ["REPLACE WITH ACTUALLY DISPLAYED E-ID"]
+        if self.assessment_protocol:
+            result["arguments"].pop("decision")
+            result["arguments"]["assessment"] = "CHOOSE issue nature AFTER independent review"
+        return result
 
     def initial_payload(self) -> dict[str, Any]:
+        # Re-entering an adapter must never rebase previously observed evidence.
+        self._assert_observed_sources_current()
         max_diff = int(self.config.get("reviewer_initial_diff_chars", 24000))
         diff = self.diff[:max_diff]
+        if len(diff) == len(self.diff):
+            for hunk in self.coverage_hunks():
+                self.displayed_diff_hunks.add(hunk["id"])
+                path, resolved = self._assert_read_allowed(hunk["path"])
+                if resolved.is_file():
+                    self.observed_read_hashes.setdefault(
+                        path, RUN_STATE.sha256_bytes(resolved.read_bytes())
+                    )
         return {
             "identity": {
                 "task_id": self.task_id,
@@ -1179,9 +1696,168 @@ all constraints are verified. If evidence is missing, choose rework or escalate.
             "search_required_for_pass": bool(self.config.get("reviewer_require_search", False)),
             "cumulative_diff": diff,
             "diff_truncated": len(self.diff) > len(diff),
+            "display_coverage": self.coverage_facts(),
+        }
+
+    def coverage_hunks(self) -> list[dict[str, Any]]:
+        """Parse actual archived hunks; a header or SEARCH is not a displayed hunk."""
+        hunks: list[dict[str, Any]] = []
+        path = None
+        for line in self.diff.splitlines():
+            if line.startswith("+++ b/"):
+                path = line[6:]
+            elif line.startswith("--- a/"):
+                path = line[6:]
+            elif path and (match := re.match(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", line)):
+                start = int(match[1])
+                count = int(match[2]) if match[2] is not None else 1
+                hunks.append(
+                    {
+                        "id": f"hunk-{len(hunks) + 1}",
+                        "path": path,
+                        "start_line": start,
+                        "line_count": count,
+                    }
+                )
+        return hunks
+
+    def coverage_facts(self) -> dict[str, Any]:
+        self._assert_observed_sources_current()
+        requirements: list[dict[str, Any]] = []
+        for hunk in self.coverage_hunks():
+            numbers = set(range(hunk["start_line"], hunk["start_line"] + hunk["line_count"]))
+            displayed = hunk["id"] in self.displayed_diff_hunks
+            read = bool(numbers) and numbers <= self.read_lines.get(hunk["path"], set())
+            requirements.append(
+                {
+                    **hunk,
+                    "displayed": displayed or read,
+                    "via": "diff" if displayed else "read" if read else None,
+                }
+            )
+        for path in self.diff_paths():
+            if not any(item["path"] == path for item in requirements):
+                # Binary/mode-only changes have no precise textual hunk evidence.
+                requirements.append(
+                    {"id": "changed-path:" + path, "path": path, "displayed": False, "via": None}
+                )
+        targets = self.request.get("coverage_targets")
+        if targets is None:
+            targets = [{"path": path} for path in self.focused_test_paths()]
+        if not isinstance(targets, list):
+            raise ReviewError("coverage_targets must be an array")
+        for index, target in enumerate(targets):
+            if not isinstance(target, dict):
+                raise ReviewError("coverage target must be an object")
+            path, resolved = self._assert_read_allowed(target.get("path"))
+            if not resolved.is_file():
+                raise ReviewError("coverage target does not exist: " + path)
+            total = len(resolved.read_text(encoding="utf-8-sig").splitlines())
+            start, end = target.get("start_line", 1), target.get("end_line", total)
+            if type(start) is not int or type(end) is not int or not 1 <= start <= end <= total:
+                raise ReviewError("coverage target requires a real source range")
+            numbers = set(range(start, end + 1))
+            requirements.append(
+                {
+                    "id": f"critical-{index + 1}",
+                    "path": path,
+                    "start_line": start,
+                    "end_line": end,
+                    "displayed": numbers <= self.read_lines.get(path, set()),
+                    "via": "read" if numbers <= self.read_lines.get(path, set()) else None,
+                }
+            )
+        return {
+            "requirements": requirements,
+            "missing": [item for item in requirements if not item["displayed"]],
+            "semantic_understanding": "not_inferred_from_display",
+        }
+
+    def _canonical_contract_ref(self, ref: dict[str, Any]) -> dict[str, Any]:
+        self._assert_observed_sources_current()
+        path, resolved = self._assert_read_allowed(
+            WORKER.require_string(ref.get("path"), "contract_review.path")
+        )
+        if path not in self.read_paths or not resolved.is_file():
+            raise ReviewError(f"contract_review source was not read: {path}")
+        source_bytes = resolved.read_bytes()
+        source_hash = RUN_STATE.sha256_bytes(source_bytes)
+        if self.observed_read_hashes.get(path) != source_hash:
+            raise ReviewError("read source changed during citation: " + path)
+        lines = source_bytes.decode("utf-8-sig").splitlines()
+        start, end = ref.get("start_line"), ref.get("end_line")
+        if (
+            type(start) is not int
+            or type(end) is not int
+            or not 1 <= start <= end <= len(lines)
+            or end - start >= 20
+        ):
+            raise ReviewError(
+                "contract_review.source_ref must name a real range of at most 20 lines"
+            )
+        for line in range(start, end + 1):
+            if line not in self.read_lines.get(path, set()):
+                raise ReviewError(f"contract_review source line was not read: {path}:{line}")
+        return {
+            "path": path,
+            "start_line": start,
+            "end_line": end,
+            "canonical_quote": "\n".join(lines[start - 1 : end]),
+            "source_hash": "sha256:" + source_hash,
         }
 
     def validate_report(self, args: dict[str, Any]) -> dict[str, Any]:
+        if not self.assessment_protocol:
+            if "assessment" in args:
+                raise ReviewError("assessment transport is not enabled")
+            return self._validate_report_core(args)
+        assessment = args.get("assessment")
+        if not isinstance(assessment, str) or assessment not in ASSESSMENT_DECISIONS:
+            raise ReviewError("assessment must select a valid issue nature")
+        if "decision" in args:
+            raise ReviewError("assessment cannot be combined with decision")
+        normalized = json.loads(json.dumps(args))
+        normalized.pop("assessment")
+        normalized["decision"] = ASSESSMENT_DECISIONS[assessment]
+        result = self._validate_report_core(normalized)
+        result["model_assessment"] = assessment
+        return result
+
+    def _validate_report_core(self, args: dict[str, Any]) -> dict[str, Any]:
+        self._assert_observed_sources_current()
+        args = json.loads(json.dumps(args))
+        for item in (
+            args.get("contract_review", [])
+            if isinstance(args.get("contract_review", []), list)
+            else []
+        ):
+            if not isinstance(item, dict) or "evidence_ids" not in item:
+                continue
+            ids = item["evidence_ids"]
+            if not self.evidence_ids_enabled:
+                raise ReviewError("evidence_ids transport is not enabled")
+            if any(
+                field in item
+                for field in ("source_ref", "source_refs", "path", "line", "source_quote")
+            ):
+                raise ReviewError(
+                    "evidence_ids cannot be combined with another citation representation"
+                )
+            if (
+                not isinstance(ids, list)
+                or not 1 <= len(ids) <= 3
+                or any(not isinstance(key, str) or key not in self.evidence_catalog for key in ids)
+                or len(set(ids)) != len(ids)
+            ):
+                raise ReviewError("evidence_ids must select 1 to 3 distinct actually displayed IDs")
+            item["source_refs"] = [
+                {
+                    field: self.evidence_catalog[key][field]
+                    for field in ("path", "start_line", "end_line")
+                }
+                for key in ids
+            ]
+            item.pop("evidence_ids")
         decision = args.get("decision")
         if decision not in {"pass_to_primary", "rework", "escalate"}:
             raise ReviewError("decision must be pass_to_primary, rework, or escalate")
@@ -1206,7 +1882,7 @@ all constraints are verified. If evidence is missing, choose rework or escalate.
             if path is not None:
                 path, _resolved = self._assert_read_allowed(path)
             line = finding.get("line")
-            if line is not None and (not isinstance(line, int) or line < 1):
+            if line is not None and (type(line) is not int or line < 1):
                 raise ReviewError("finding line must be a positive integer or null")
             if path is not None and line is not None:
                 if line not in self.read_lines.get(path, set()):
@@ -1279,7 +1955,7 @@ all constraints are verified. If evidence is missing, choose rework or escalate.
                 path, _resolved = self._assert_read_allowed(
                     WORKER.require_string(path, "ordering_review.path")
                 )
-                if not isinstance(line, int) or line < 1:
+                if type(line) is not int or line < 1:
                     raise ReviewError("source evidence line must be a positive integer")
                 source_lines = _resolved.read_text(encoding="utf-8-sig").splitlines()
                 if line > len(source_lines):
@@ -1317,10 +1993,13 @@ all constraints are verified. If evidence is missing, choose rework or escalate.
         required_obligations = {
             item_id
             for item_id, item in obligations.items()
-            if self.packet["risk"]["unit"] == "high" or item["kind"] == "focused_rework"
+            if self.packet["risk"]["unit"] == "high"
+            or item["kind"] == "focused_rework"
+            or item.get("implementation_ref") is not None
         }
-        if decision == "pass_to_primary" and not required_obligations:
-            contract_review = []
+        # Small/medium units need not submit optional contract_review entries.
+        # Once supplied, however, their claims must not be silently discarded:
+        # explicit violated/uncertain evidence cannot coexist with a pass.
         verified_obligations: dict[str, dict[str, Any]] = {}
         for item in contract_review:
             if not isinstance(item, dict):
@@ -1332,6 +2011,23 @@ all constraints are verified. If evidence is missing, choose rework or escalate.
             if status not in {"verified", "violated", "uncertain"}:
                 raise ReviewError("contract_review status must be verified, violated, or uncertain")
             source_ref = item.get("source_ref")
+            canonical_refs = []
+            if "source_refs" in item:
+                refs = item["source_refs"]
+                if (
+                    not isinstance(refs, list)
+                    or not 1 <= len(refs) <= 3
+                    or not all(isinstance(ref, dict) for ref in refs)
+                ):
+                    raise ReviewError(
+                        "contract_review.source_refs must contain 1 to 3 source_ref objects"
+                    )
+                if source_ref is not None:
+                    raise ReviewError(
+                        "contract_review must choose source_ref or source_refs, not both"
+                    )
+                canonical_refs = [self._canonical_contract_ref(ref) for ref in refs]
+                source_ref = refs[0]
             if source_ref is not None and not isinstance(source_ref, dict):
                 raise ReviewError("contract_review.source_ref must be an object")
             raw_path = source_ref.get("path") if isinstance(source_ref, dict) else item.get("path")
@@ -1340,13 +2036,17 @@ all constraints are verified. If evidence is missing, choose rework or escalate.
             )
             if path not in self.read_paths or not resolved.is_file():
                 raise ReviewError(f"contract_review source was not read: {path}")
-            lines = resolved.read_text(encoding="utf-8-sig").splitlines()
+            source_bytes = resolved.read_bytes()
+            source_hash = RUN_STATE.sha256_bytes(source_bytes)
+            if self.observed_read_hashes.get(path) != source_hash:
+                raise ReviewError("read source changed during citation: " + path)
+            lines = source_bytes.decode("utf-8-sig").splitlines()
             if isinstance(source_ref, dict):
                 line = source_ref.get("start_line")
                 end_line = source_ref.get("end_line")
                 if (
-                    not isinstance(line, int)
-                    or not isinstance(end_line, int)
+                    type(line) is not int
+                    or type(end_line) is not int
                     or not 1 <= line <= end_line <= len(lines)
                     or end_line - line >= 20
                 ):
@@ -1362,7 +2062,7 @@ all constraints are verified. If evidence is missing, choose rework or escalate.
             else:
                 line = item.get("line")
                 end_line = line
-                if not isinstance(line, int) or not 1 <= line <= len(lines):
+                if type(line) is not int or not 1 <= line <= len(lines):
                     raise ReviewError("contract_review line must be a real positive source line")
                 if line not in self.read_lines.get(path, set()):
                     raise ReviewError(f"contract_review source line was not read: {path}:{line}")
@@ -1374,11 +2074,30 @@ all constraints are verified. If evidence is missing, choose rework or escalate.
                         "contract_review source_quote must match the cited source line"
                     )
             required_anchor = obligations[obligation_id].get("source_anchor")
-            if required_anchor and required_anchor not in source_quote:
+            anchor_quotes = [ref["canonical_quote"] for ref in canonical_refs] or [source_quote]
+            if required_anchor and not any(required_anchor in quote for quote in anchor_quotes):
                 raise ReviewError(
                     f"contract_review {obligation_id} source_quote must contain "
                     "the required source_anchor"
                 )
+            binding = obligations[obligation_id].get("implementation_ref")
+            if binding is not None and status == "verified":
+                # Selected evidence, not every previously read file, must contain the
+                # Primary-bound implementation. Tests may supplement but not replace it.
+                _, implementation = self._assert_read_allowed(binding["path"])
+                selected = canonical_refs or [
+                    {"path": path, "start_line": line, "end_line": end_line}
+                ]
+                try:
+                    supported = WORKER.citation_binding().covers(
+                        binding, implementation.read_text(encoding="utf-8-sig"), selected
+                    )
+                except (OSError, UnicodeError, ValueError):
+                    supported = False
+                if not supported:
+                    raise ReviewError(
+                        f"contract_review {obligation_id} requires bound implementation citation"
+                    )
             evidence = WORKER.require_string(item.get("evidence"), "contract_review.evidence")
             if evidence.startswith("REPLACE WITH"):
                 raise ReviewError("contract_review still contains template evidence")
@@ -1395,9 +2114,13 @@ all constraints are verified. If evidence is missing, choose rework or escalate.
                     "end_line": end_line,
                 },
                 "canonical_quote": source_quote,
-                "source_hash": "sha256:" + RUN_STATE.sha256_bytes(resolved.read_bytes()),
+                "source_hash": "sha256:" + source_hash,
                 "evidence": evidence,
             }
+            if canonical_refs:
+                verified_obligations[obligation_id]["source_refs"] = canonical_refs
+            if binding is not None:
+                verified_obligations[obligation_id]["implementation_ref"] = dict(binding)
         if decision == "pass_to_primary":
             if not required_obligations <= set(verified_obligations) or any(
                 verified_obligations[item_id]["status"] != "verified"
@@ -1407,6 +2130,22 @@ all constraints are verified. If evidence is missing, choose rework or escalate.
                     "pass requires source-backed contract_review for every required "
                     "review_obligation: " + ", ".join(sorted(required_obligations))
                 )
+        contradictory = set(verified) & {
+            item["contract_id"] for item in normalized if item["contract_id"] is not None
+        }
+        contradictory.update(
+            set(verified)
+            & {
+                item_id
+                for item_id, item in verified_obligations.items()
+                if item["status"] != "verified" and item_id in self.packet["owned_contract_ids"]
+            }
+        )
+        if contradictory:
+            raise ReviewError(
+                "verified_contract_ids contradicts findings or non-verified contract_review: "
+                + ", ".join(sorted(contradictory))
+            )
         configured_checks = self.validation.get("configured_checks", [])
         if not isinstance(configured_checks, list):
             raise ReviewError("runtime configured_checks must be an array")
@@ -1415,6 +2154,18 @@ all constraints are verified. If evidence is missing, choose rework or escalate.
         )
         expected_check_ids = [item.get("id") for item in configured_checks]
         if decision == "pass_to_primary":
+            observed_failures = [
+                f"{item.get('kind')}:{item.get('id')}:{item.get('status')}"
+                for item in self.approved_execution
+                if item.get("status") != "passed"
+            ]
+            if observed_failures:
+                raise ReviewError(
+                    "pass_to_primary contradicts observed approved execution failures: "
+                    + ", ".join(observed_failures)
+                    + "; choose rework or escalate with the actual evidence. "
+                    "A retry success cannot erase a failure in this review invocation."
+                )
             if self.validation.get("status") != "passed":
                 raise ReviewError("pass_to_primary requires passed runtime validation")
             if any(item.get("status") != "passed" for item in configured_checks):
@@ -1443,16 +2194,13 @@ all constraints are verified. If evidence is missing, choose rework or escalate.
                         + ", ".join(f"{kind}:{item}" for kind, item in missing_execution)
                     )
             if self.config.get("reviewer_require_source_and_test_reads", False):
-                changed_source = [
-                    path
-                    for path in self.diff_paths()
-                    if path not in self.focused_test_paths() and path.endswith(".py")
-                ]
-                if changed_source and not any(self.read_lines.get(path) for path in changed_source):
-                    raise ReviewError("pass requires READ_FILE of at least one changed source file")
-                focused_tests = self.focused_test_paths()
-                if focused_tests and not any(self.read_lines.get(path) for path in focused_tests):
-                    raise ReviewError("pass requires READ_FILE of at least one focused test file")
+                missing = self.coverage_facts()["missing"]
+                if missing:
+                    raise ReviewError(
+                        "pass requires displayed coverage: "
+                        + ", ".join(f"{item['id']}:{item['path']}" for item in missing[:8])
+                        + " (changed hunks and focused test/call boundaries must be displayed)"
+                    )
         unverified = WORKER.require_string_list(
             args.get("unverified_claims", []), "unverified_claims"
         )
@@ -1486,15 +2234,86 @@ all constraints are verified. If evidence is missing, choose rework or escalate.
                 "read_only": True,
                 "inputs_unchanged": True,
                 "read_paths": sorted(self.read_paths),
+                "observed_read_hashes": dict(sorted(self.observed_read_hashes.items())),
                 "approved_execution": self.approved_execution,
                 "protocol_error_count": self.protocol_errors,
+                "display_coverage": self.coverage_facts(),
             },
             "next_action_required": {
                 "pass_to_primary": "primary_review_by_risk_route",
-                "rework": "bounded_coder_rework",
+                "rework": "primary_adjudicate_review_findings",
                 "escalate": "primary_takeover_or_replan",
             }[decision],
+            "automatic_coder_rework_authorized": False,
         }
+
+    def _prepass_challenge(self, report: dict[str, Any]) -> dict[str, Any] | None:
+        if self.finding_challenge_pending and report.get("decision") == "rework":
+            self.finding_challenge_pending = False
+            self.prepass_challenge_pending = False
+            self.deferred_report = None
+            RUN_STATE.write_json_once(
+                self.review_root / "provisional-report.json",
+                {
+                    "schema_version": 1,
+                    "terminal": False,
+                    "trigger": "finding_challenge",
+                    "report": report,
+                },
+            )
+            self.event(
+                "finding_challenge_issued",
+                {"finding_ids": [item["id"] for item in report["findings"]]},
+            )
+            self.prepass_challenge_context = {
+                "status": "review_pending",
+                "instruction": (
+                    "Your provisional rework is not finalized. Attempt to falsify your own "
+                    "finding before requesting an implementation change: trace the cited "
+                    "operation together with its enclosing caller/control flow, and identify "
+                    "a concrete input and observable contract violation. A helper need not "
+                    "independently enforce a protection already supplied by its caller; "
+                    "an unfamiliar but equivalent implementation is not a defect. Reconcile "
+                    "contradictory explanations against the actual source and executed evidence. "
+                    "Do not automatically withdraw a genuine defect: retain it with causal "
+                    "evidence if the counterexample survives, withdraw it if disproven, or "
+                    "escalate if unresolved. Submit a new REPORT subject to all existing "
+                    "citation, freshness and validation gates. No additional execution or "
+                    "model budget is authorized."
+                ),
+            }
+            return self.prepass_challenge_context
+        if not self.prepass_challenge_pending or report.get("decision") != "pass_to_primary":
+            return None
+        self.prepass_challenge_pending = False
+        self.finding_challenge_pending = False
+        self.deferred_report = None
+        RUN_STATE.write_json_once(
+            self.review_root / "provisional-report.json",
+            {
+                "schema_version": 1,
+                "terminal": False,
+                "trigger": "prepass_challenge",
+                "report": report,
+            },
+        )
+        self.event("prepass_challenge_issued", {"decision": "pass_to_primary"})
+        self.prepass_challenge_context = {
+            "status": "review_pending",
+            "instruction": (
+                "Your provisional pass is not finalized. Perform one adversarial contract check: "
+                "choose an important boundary not established by the executed tests and trace its "
+                "actual source control flow. For error/cleanup paths, consider the operation AND "
+                "cleanup both raising: which exception reaches the caller, and does that match "
+                "the contract? Do not assume a later bare raise executes. For other changes, "
+                "try an input that distinguishes the required invariant from the apparent happy "
+                "path. Submit a new REPORT: a concrete source-backed finding if violated, "
+                "or explain why that boundary satisfies the contract. Do not invent a defect; "
+                "missing context should be uncertain/escalate. All citation and validation "
+                "requirements still apply. No additional execution is authorized."
+            ),
+        }
+        return self.prepass_challenge_context
 
     def finalize(self, report: dict[str, Any]) -> dict[str, Any]:
         self._assert_inputs_current()
@@ -1575,6 +2394,8 @@ all constraints are verified. If evidence is missing, choose rework or escalate.
         ]
         deadline = time.monotonic() + self.invocation_timeout
         report_only_next = False
+        citation_shape_next = False
+        pending_report_repair: dict[str, Any] | None = None
         for turn in range(1, self.max_turns + 1):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -1592,6 +2413,8 @@ all constraints are verified. If evidence is missing, choose rework or escalate.
                 )
             )
             report_only_next = False
+            citation_shape_turn = citation_shape_next and isinstance(original_native_tools, list)
+            citation_shape_next = False
             if report_only_turn:
                 self.client.native_tools = [
                     tool
@@ -1600,6 +2423,9 @@ all constraints are verified. If evidence is missing, choose rework or escalate.
                 ]
                 self.client.native_tool_choice = "required"
                 self.event("report_only_nudge", {"turn": turn})
+            if citation_shape_turn:
+                self.client.native_tools = canonical_citation_tools(self.client.native_tools)
+                self.event("canonical_citation_transport_nudge", {"turn": turn})
             if isinstance(original_timeout, (int, float)):
                 self.client.timeout = max(1, min(original_timeout, int(remaining)))
             try:
@@ -1685,7 +2511,7 @@ all constraints are verified. If evidence is missing, choose rework or escalate.
             finally:
                 if isinstance(original_timeout, (int, float)):
                     self.client.timeout = original_timeout
-                if report_only_turn:
+                if report_only_turn or citation_shape_turn:
                     self.client.native_tools = original_native_tools
                     self.client.native_tool_choice = original_native_choice
             self.event(
@@ -1714,7 +2540,9 @@ all constraints are verified. If evidence is missing, choose rework or escalate.
                     observation = self.run_approved_static_check(args)
                 elif name == "REPORT":
                     report = self.validate_report(args)
-                    if self.diagnostic_logging:
+                    pending_report_repair = None
+                    observation = self._prepass_challenge(report)
+                    if observation is None and self.diagnostic_logging:
                         self.event(
                             "diagnostic_action",
                             {
@@ -1722,7 +2550,8 @@ all constraints are verified. If evidence is missing, choose rework or escalate.
                                 **RUN_STATE.diagnostic_facts(name, args, raw, {"status": "ok"}),
                             },
                         )
-                    return self.finalize(report)
+                    if observation is None:
+                        return self.finalize(report)
                 else:
                     raise ReviewError(f"unknown reviewer action: {name}")
                 if self.diagnostic_logging:
@@ -1744,11 +2573,16 @@ all constraints are verified. If evidence is missing, choose rework or escalate.
                         if "requires successful approved execution ids" not in str(deferred_exc):
                             raise
                     else:
-                        self.event(
-                            "deferred_report_finalized",
-                            {"turn": turn, "after_action": name},
-                        )
-                        return self.finalize(report)
+                        pending_report_repair = None
+                        challenge = self._prepass_challenge(report)
+                        if challenge is not None:
+                            observation = challenge
+                        else:
+                            self.event(
+                                "deferred_report_finalized",
+                                {"turn": turn, "after_action": name},
+                            )
+                            return self.finalize(report)
                 self.last_protocol_error = None
                 self.same_protocol_error_streak = 0
             except (ReviewError, WORKER.WorkerError, SAFE_EDIT.SafeEditError) as exc:
@@ -1758,6 +2592,8 @@ all constraints are verified. If evidence is missing, choose rework or escalate.
                     self.same_protocol_error_streak + 1 if error == self.last_protocol_error else 1
                 )
                 self.last_protocol_error = error
+                if error == "contract_review must choose source_ref or source_refs, not both":
+                    citation_shape_next = True
                 observation = {"status": "error", "error": error}
                 if name == "REPORT":
                     if error.startswith(
@@ -1787,6 +2623,9 @@ all constraints are verified. If evidence is missing, choose rework or escalate.
                         except (OSError, UnicodeError, ReviewError, SAFE_EDIT.SafeEditError):
                             pass
                     observation["report_repair"] = repair
+                    # Retain only trusted correction facts, never the invalid report.
+                    # A duplicate read may compact history before a valid replacement.
+                    pending_report_repair = json.loads(json.dumps(observation))
                 if name is None and error.startswith("response does not begin with a JSON object"):
                     if self.required_reads_complete():
                         example_action = self.report_template()
@@ -1843,28 +2682,50 @@ all constraints are verified. If evidence is missing, choose rework or escalate.
                     raise ReviewError("reviewer repeated reads made no progress")
             else:
                 self.duplicate_read_streak = 0
-            messages.extend(
-                [
-                    {
-                        "role": "assistant",
-                        "content": (
-                            "INVALID_REPORT_SUBMITTED"
-                            if name == "REPORT" and observation.get("status") == "error"
-                            else "INVALID_SEARCH_SUBMITTED"
-                            if name == "SEARCH" and observation.get("status") == "error"
-                            else "INVALID_NON_JSON_RESPONSE"
-                            if name is None and observation.get("status") == "error"
-                            else "DUPLICATE_READ_REJECTED"
-                            if observation.get("status") == "already_read"
-                            else raw
-                        ),
-                    },
-                    {
-                        "role": "user",
-                        "content": "OBSERVATION\n" + json.dumps(observation, ensure_ascii=False),
-                    },
-                ]
-            )
+            native_call = getattr(self.client, "last_native_call", None)
+            if (
+                self.native_history
+                and isinstance(native_call, dict)
+                and native_call.get("function", {}).get("name") == name
+                and observation.get("status") != "error"
+            ):
+                messages.extend(
+                    [
+                        {"role": "assistant", "content": "", "tool_calls": [native_call]},
+                        {
+                            "role": "tool",
+                            "name": name,
+                            "tool_call_id": native_call["id"],
+                            "content": "OBSERVATION\n"
+                            + json.dumps(observation, ensure_ascii=False),
+                        },
+                    ]
+                )
+                self.event("native_tool_history_retained", {"action": name, "turn": turn})
+            else:
+                messages.extend(
+                    [
+                        {
+                            "role": "assistant",
+                            "content": (
+                                "INVALID_REPORT_SUBMITTED"
+                                if name == "REPORT" and observation.get("status") == "error"
+                                else "INVALID_SEARCH_SUBMITTED"
+                                if name == "SEARCH" and observation.get("status") == "error"
+                                else "INVALID_NON_JSON_RESPONSE"
+                                if name is None and observation.get("status") == "error"
+                                else "DUPLICATE_READ_REJECTED"
+                                if observation.get("status") == "already_read"
+                                else raw
+                            ),
+                        },
+                        {
+                            "role": "user",
+                            "content": "OBSERVATION\n"
+                            + json.dumps(observation, ensure_ascii=False),
+                        },
+                    ]
+                )
             if (
                 observation.get("status") == "already_read"
                 and observation.get("required_next_action") == "REPORT"
@@ -1872,6 +2733,33 @@ all constraints are verified. If evidence is missing, choose rework or escalate.
                 messages = messages[:2] + messages[-2:]
             else:
                 messages = self._trim_messages(messages)
+            messages = [
+                message
+                for message in messages
+                if not message.get("content", "").startswith("PENDING_REPORT_REPAIR\n")
+            ]
+            if pending_report_repair is not None and observation.get("report_repair") is None:
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": "PENDING_REPORT_REPAIR\n"
+                        + json.dumps(pending_report_repair, ensure_ascii=False),
+                    }
+                )
+            if (
+                self.prepass_challenge_context is not None
+                and observation.get("status") != "review_pending"
+            ):
+                # Duplicate-read compaction can drop the still-unanswered
+                # challenge. Keep it explicit until a new report is validated;
+                # this is not source evidence or an additional model budget.
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": "PREPASS_CHALLENGE\n"
+                        + json.dumps(self.prepass_challenge_context, ensure_ascii=False),
+                    }
+                )
         raise ReviewError("reviewer model turn limit exhausted")
 
 

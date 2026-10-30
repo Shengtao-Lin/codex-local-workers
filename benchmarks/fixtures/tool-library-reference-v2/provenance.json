@@ -1,0 +1,20 @@
+{
+  "kind": "read-only local CPython 3.12 selected-source evidence, not executable replacement",
+  "files": {
+    "awaitable_protocol.txt": "f54f47a5df3e7c80a61879733aca1c50d53b19c185e4f865e40505271bd7874e",
+    "PSF-LICENSE.txt": "e502c6b880ff58d614901495a9009c136539cd0b1e2a2abb8fc00b934c203419",
+    "upstream/inspect.py": "07ff418cda6eb3f187cdb83b51e7da34e9524ed3cb68235dbcd0efcbde49014c",
+    "upstream/_collections_abc.py": "d0c7b4810d0d6e22968223599e2051aa2148c8ce435cad8798644e7b682a9147"
+  },
+  "source_files": {
+    "C:/Users/Lin/AppData/Local/Programs/Python/Python312/Lib/inspect.py": "07ff418cda6eb3f187cdb83b51e7da34e9524ed3cb68235dbcd0efcbde49014c",
+    "C:/Users/Lin/AppData/Local/Programs/Python/Python312/Lib/_collections_abc.py": "d0c7b4810d0d6e22968223599e2051aa2148c8ce435cad8798644e7b682a9147"
+  },
+  "ranges": [
+    {"source": "inspect.py", "start_line": 468, "end_line": 473},
+    {"source": "_collections_abc.py", "start_line": 131, "end_line": 143, "note": "selected class portion; excludes unrelated class_getitem"},
+    {"source": "_collections_abc.py", "start_line": 104, "end_line": 114}
+  ],
+  "license_from": "benchmarks/fixtures/tool-library-reference-v1/PSF-LICENSE.txt",
+  "limitations": "Source facts aid review, never auto-certify implementation. No preferred edit recipe, oracle implementation, protected test edits or new model permissions. At freeze time no model had read this v2 reference. Upstream copies support portable fidelity checks, not model-readable scope."
+}

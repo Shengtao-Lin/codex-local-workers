@@ -1,0 +1,118 @@
+{
+  "strata_node_path": "F:/Strata/node/node.exe",
+  "strata_harness_root": "F:/Strata/harness",
+  "strata_base_url": "http://127.0.0.1:47831/v1",
+  "coder_model": "iq3_s",
+  "coordinator_enabled": false,
+  "experimental_strata_subagent": true,
+  "strata_execution_profile": "strata-unit-v1",
+  "required_check_ids": [
+    "ruff-format",
+    "ruff-check",
+    "pyright",
+    "project-regression"
+  ],
+  "check_input_roots": [
+    "src",
+    "tests",
+    "applications",
+    "scripts",
+    "examples",
+    "validation"
+  ],
+  "validation_profiles": {
+    "project-strict": {
+      "python": "F:/ChatGPT/agent-runtime-kit/.venv/Scripts/python.exe",
+      "pytest_argv": [
+        "-B",
+        "-m",
+        "pytest",
+        "-m",
+        "not integration",
+        "--basetemp=.agent/focused-temp"
+      ],
+      "compile": true,
+      "commands": [
+        {
+          "id": "ruff-format",
+          "argv": [
+            "{python}",
+            "-B",
+            "-m",
+            "ruff",
+            "format",
+            "--check",
+            ".",
+            "--extend-exclude",
+            ".agent,.local-agents"
+          ]
+        },
+        {
+          "id": "ruff-check",
+          "argv": [
+            "{python}",
+            "-B",
+            "-m",
+            "ruff",
+            "check",
+            ".",
+            "--extend-exclude",
+            ".agent,.local-agents"
+          ]
+        },
+        {
+          "id": "pyright",
+          "argv": [
+            "{python}",
+            "-B",
+            "-m",
+            "pyright",
+            "--pythonpath",
+            "{python}"
+          ]
+        },
+        {
+          "id": "project-regression",
+          "argv": [
+            "{python}",
+            "-B",
+            "-m",
+            "pytest",
+            "tests",
+            "-m",
+            "not integration",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--basetemp=.agent/regression-temp"
+          ]
+        }
+      ]
+    }
+  },
+  "experimental_strata_readonly": true,
+  "strata_version_references": "observed-v1",
+  "strata_token_counter": {
+    "python": "F:\\Strata\\control\\python\\python.exe",
+    "source_root": "F:\\Strata\\control",
+    "tokenizer_root": "C:\\Users\\Lin\\Documents\\Strata\\packs\\iq3_s\\tokenizer",
+    "effort_end": false,
+    "files": {
+      "F:\\Strata\\control\\serve\\server.py": "bc09af76400932500f9ce09f401bf097ad7e7b120374d2cfbe3f4142fadd2304",
+      "F:\\Strata\\control\\serve\\frontend.py": "f8ea0ca4df1a01372795d1195803e3899d4341cf1cd5f540e55fda715c644354",
+      "F:\\Strata\\control\\tools\\strata_tokenizer.py": "e0cd8d6ae38dda0a4ad7c14f812eb64d5fd6f4fed9c920d4427a14bf585dc9b3",
+      "C:\\Users\\Lin\\Documents\\Strata\\packs\\iq3_s\\tokenizer\\chat_template.jinja": "12827f24b742ea4e80cdc12dbcf9622227056b9f797252a3149263d4f9aaadce",
+      "C:\\Users\\Lin\\Documents\\Strata\\packs\\iq3_s\\tokenizer\\merges.txt": "080cf95432173729d160346b7882bd2a644b07f7a3813a3eb73f4e66787bfde9",
+      "C:\\Users\\Lin\\Documents\\Strata\\packs\\iq3_s\\tokenizer\\tokenizer.json": "87be2ac47d8bc7393b7435df6ccd276740019a393941a2585d5edce59f450c54",
+      "C:\\Users\\Lin\\Documents\\Strata\\packs\\iq3_s\\tokenizer\\token_type.json": "5088c8c298fc06af8382ddb3b76c888703ac2634e82263b97eedcc2ad202738b",
+      "C:\\Users\\Lin\\Documents\\Strata\\packs\\iq3_s\\tokenizer\\vocab.json": "4ba64f0332abcfb0b600b7df1537d1e836e68009d5fb7cdb77339738dc6365c4",
+      "F:\\Strata\\control\\python\\python.exe": "5d4228a6447fbd60653132ca692fbcf1da95c8229b05ad50176f5046b2401e90"
+    }
+  },
+  "experimental_strata_task": true,
+  "experimental_strata_edit_profile": "observed-lines-v1",
+  "experimental_strata_review_delivery": "observed-line-v1",
+  "experimental_strata_continuation": "task-rework-v1",
+  "experimental_strata_repair_context": "enclosing-function-v1",
+  "experimental_strata_review_impl_binding": "observed-v1"
+}

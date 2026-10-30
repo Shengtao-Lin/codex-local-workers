@@ -1,0 +1,24 @@
+{
+  "decision": "SCOPED_SUPERVISED_CODING_TRIAL_READY",
+  "build": "0.3.0-task.34-binding-preflight-candidate",
+  "offline": "629 controls,9newincluded,118installedfiles;actualbadclasspacketblockedbeforemodel;finalpackagehash/install/doctor/overwritecontrolsPASS",
+  "live_coding": "CorrectedcontractdiagnosticACCEPT,7Coderrequests3edits,7Reviewerrequests1citationrepair,574independenttestsandNativeAgentintegrationPASS",
+  "sequential_operation": "PASS execution/duplicate refusal/archive preservation",
+  "full_sequential_answer_gate": "HOLD;U2overbroadnormalcompletion/after_hookclaim;Primaryclarificationassisted",
+  "general_release": "HOLD",
+  "bundle": {
+    "path": "F:\\ChatGPT\\local-worker-kit\\benchmarks\\work\\releases\\strata-task34-supervised-coding-trial.zip",
+    "sha256": "aa2da4a5d6bf095d5d5ca91d4743aed535d42725e25f976203e234169f752efd",
+    "bytes": 426359,
+    "all_package_hashes_match": true,
+    "runtime_matches_full_tested_manifest": true,
+    "status": "SCOPED_SUPERVISED_CODING_TRIAL_READY",
+    "general_release": "HOLD",
+    "includes_current_machine_examples": true,
+    "published": false
+  },
+  "old_task33_and_bad_class_batch": "Preserved;no reroll/refill/rescore",
+  "model_budget_prompt_permission_changes": false,
+  "production_default_changed": false,
+  "cost": "Known invalid packet preflight now uses0modelrequests versus prior failed run9Coder+6Reviewer;not net cloud savings. Primary preparation/diagnosis/semantic clarification still required,exact cloud usage/active time unknown."
+}

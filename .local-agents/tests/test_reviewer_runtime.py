@@ -28,6 +28,638 @@ class FakeClient:
 
 
 class ReviewerRuntimeTests(unittest.TestCase):
+    def test_retained_report_repair_is_latest_only_and_does_not_accept_bad_report(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            client = FakeClient(
+                [
+                    {"action": "READ_FILE", "arguments": {"path": "src/example.py"}},
+                    {"action": "READ_FILE", "arguments": {"path": "tests/test_example.py"}},
+                    {"action": "REPORT", "arguments": {"decision": "SECRET_INVALID"}},
+                    {"action": "READ_FILE", "arguments": {"path": "src/example.py"}},
+                    {
+                        "action": "REPORT",
+                        "arguments": {
+                            "decision": "pass_to_primary",
+                            "findings": "SECRET_BAD_FINDINGS",
+                        },
+                    },
+                    {"action": "READ_FILE", "arguments": {"path": "src/example.py"}},
+                    {"action": "REPORT", "arguments": {"decision": "STILL_INVALID"}},
+                ]
+            )
+            runtime = REVIEWER.ReviewerRuntime(
+                root, self.make_run(root), {"max_reviewer_protocol_errors": 3}, client
+            )
+            with self.assertRaisesRegex(REVIEWER.ReviewError, "protocol error budget exhausted"):
+                runtime.run()
+            retained = [
+                m["content"]
+                for m in client.messages_seen[-1]
+                if m.get("content", "").startswith("PENDING_REPORT_REPAIR\n")
+            ]
+            self.assertEqual(len(retained), 1)
+            self.assertIn("findings must be an array", retained[0])
+            self.assertNotIn("decision must be", retained[0])
+            self.assertNotIn("SECRET", retained[0])
+            self.assertEqual(runtime.protocol_errors, 3)
+
+    def test_invalid_report_repair_survives_duplicate_read_compaction(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            good = {
+                "action": "REPORT",
+                "arguments": {
+                    "decision": "pass_to_primary",
+                    "findings": [],
+                    "verified_contract_ids": ["behavior-1"],
+                    "unverified_claims": [],
+                },
+            }
+            client = FakeClient(
+                [
+                    {"action": "READ_FILE", "arguments": {"path": "src/example.py"}},
+                    {"action": "READ_FILE", "arguments": {"path": "tests/test_example.py"}},
+                    {"action": "REPORT", "arguments": {"decision": "INVALID_SECRET_REPORT"}},
+                    {"action": "READ_FILE", "arguments": {"path": "src/example.py"}},
+                    good,
+                ]
+            )
+            runtime = REVIEWER.ReviewerRuntime(root, self.make_run(root), {}, client)
+            self.assertEqual(runtime.run()["decision"], "pass_to_primary")
+            final_context = [
+                m["content"]
+                for m in client.messages_seen[-1]
+                if m.get("content", "").startswith("PENDING_REPORT_REPAIR\n")
+            ]
+            self.assertEqual(len(final_context), 1)
+            repair = json.loads(final_context[0].split("\n", 1)[1])
+            self.assertIn("valid_decisions", repair["report_repair"])
+            self.assertNotIn("INVALID_SECRET_REPORT", final_context[0])
+            self.assertEqual(runtime.protocol_errors, 1)
+
+    def test_approved_test_requires_nonempty_executed_junit_evidence(self):
+        for xml in (
+            None,
+            "<invalid",
+            "<testsuites/>",
+            "<testsuites><testsuite><testcase><skipped/></testcase></testsuite></testsuites>",
+        ):
+            with self.subTest(xml=xml), TemporaryDirectory() as directory:
+                root = Path(directory)
+                runtime = REVIEWER.ReviewerRuntime(root, self.make_run(root), {}, FakeClient([]))
+                runtime.prepare()
+                completed = type("Completed", (), {"returncode": 0, "stdout": "ok", "stderr": ""})()
+
+                def fake_run(argv, **_kwargs):
+                    junit_args = [arg for arg in argv if arg.startswith("--junitxml=")]
+                    if xml is not None and junit_args:
+                        Path(junit_args[-1].split("=", 1)[1]).write_text(xml, encoding="utf-8")
+                    return completed
+
+                with patch.object(REVIEWER.subprocess, "run", side_effect=fake_run):
+                    result = runtime.run_approved_test({"test_id": "focused-tests"})
+                self.assertNotEqual(result["status"], "passed")
+
+    def test_approved_junit_keeps_failure_and_partial_skip_counts(self):
+        for tag, expected in (("failure", "failed"), ("error", "failed"), ("skipped", "passed")):
+            with self.subTest(tag=tag), TemporaryDirectory() as directory:
+                root = Path(directory)
+                runtime = REVIEWER.ReviewerRuntime(root, self.make_run(root), {}, FakeClient([]))
+                runtime.prepare()
+                completed = type("Completed", (), {"returncode": 0, "stdout": "ok", "stderr": ""})()
+
+                def fake_run(argv, **_kwargs):
+                    path = next(
+                        arg.split("=", 1)[1] for arg in argv if arg.startswith("--junitxml=")
+                    )
+                    Path(path).write_text(
+                        f"<testsuites><testsuite><testcase/><testcase><{tag}/></testcase></testsuite></testsuites>"
+                    )
+                    return completed
+
+                with patch.object(REVIEWER.subprocess, "run", side_effect=fake_run):
+                    first = runtime.run_approved_test({"test_id": "focused-tests"})
+                    second = runtime.run_approved_test({"test_id": "focused-tests"})
+                self.assertEqual(first["status"], expected)
+                self.assertEqual(first["junit"]["tests"], 2)
+                self.assertEqual(first["junit"][tag], 1)
+                self.assertNotEqual(first["junit"]["path"], second["junit"]["path"])
+                self.assertTrue((root / first["junit"]["path"]).exists())
+                self.assertTrue((root / second["junit"]["path"]).exists())
+
+    def test_execution_failure_repair_never_suggests_erasing_failure(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = REVIEWER.ReviewerRuntime(root, self.make_run(root), {}, FakeClient([]))
+            runtime.approved_execution = [
+                {"kind": "test", "id": "focused-tests", "status": "timed_out", "exit_code": None}
+            ]
+            repair = runtime.report_repair(
+                "pass_to_primary contradicts observed approved execution failures", {}
+            )
+            self.assertEqual(repair["observed_execution_failures"][0]["status"], "timed_out")
+            self.assertIn("cannot erase", repair["instruction"])
+            self.assertNotIn("required_actions", repair)
+
+    def test_observed_execution_failure_blocks_pass_even_when_execution_is_optional(self):
+        for status in ("failed", "timed_out", "missing_evidence"):
+            for required in (False, True):
+                with (
+                    self.subTest(status=status, required=required),
+                    TemporaryDirectory() as directory,
+                ):
+                    root = Path(directory)
+                    runtime = REVIEWER.ReviewerRuntime(
+                        root,
+                        self.make_run(root),
+                        {"reviewer_require_approved_execution": required},
+                        FakeClient([]),
+                    )
+                    # An older success must not erase the failure, or vice versa.
+                    runtime.approved_execution = [
+                        {"kind": "test", "id": "focused-tests", "status": "passed"},
+                        {"kind": "test", "id": "focused-tests", "status": status},
+                        {"kind": "test", "id": "focused-tests", "status": "passed"},
+                    ]
+                    with self.assertRaisesRegex(
+                        REVIEWER.ReviewError, "observed approved execution"
+                    ):
+                        runtime.validate_report(
+                            {
+                                "decision": "pass_to_primary",
+                                "findings": [],
+                                "verified_contract_ids": ["behavior-1"],
+                                "unverified_claims": [],
+                            }
+                        )
+
+    def test_diff_path_repair_names_only_actual_changed_paths_without_read_credit(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = REVIEWER.ReviewerRuntime(
+                root, self.make_run(root, ordering=True), {}, FakeClient([])
+            )
+            repair = runtime.report_repair("diff evidence path must be an actual changed path", {})
+            self.assertEqual(repair["actual_changed_paths"], ["src/example.py"])
+            self.assertEqual(
+                repair["diff_evidence_shape"], {"path": "actual changed path or null", "line": None}
+            )
+            self.assertIn("Required order still needs", repair["instruction"])
+            self.assertEqual(runtime.read_lines, {})
+            self.assertNotIn("suggested_action", repair)
+
+    def test_ordering_field_shape_hint_distinguishes_flat_and_nested_citations(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = REVIEWER.ReviewerRuntime(root, self.make_run(root), {}, FakeClient([]))
+            repair = runtime.report_repair("ordering_review.path must be a non-empty string", {})
+            self.assertEqual(
+                repair["ordering_entry_fields"],
+                ["constraint_id", "status", "evidence_type", "path", "line", "evidence"],
+            )
+            self.assertIn("not the nested source_ref", repair["ordering_shape_instruction"])
+            self.assertEqual(runtime.read_lines, {})
+            self.assertNotIn("verified", repair["evidence_shapes"])
+
+    def test_optional_contract_review_cannot_be_discarded_to_pass_small_or_medium_unit(self):
+        for risk in ("small", "medium"):
+            with self.subTest(risk=risk), TemporaryDirectory() as directory:
+                root = Path(directory)
+                runtime = REVIEWER.ReviewerRuntime(
+                    root, self.make_run(root, risk=risk), {}, FakeClient([])
+                )
+                runtime.read_file({"path": "src/example.py"})
+                args = {
+                    "decision": "pass_to_primary",
+                    "findings": [],
+                    "verified_contract_ids": ["behavior-1"],
+                    "contract_review": [
+                        {
+                            "obligation_id": "behavior-1",
+                            "status": "violated",
+                            "path": "src/example.py",
+                            "line": 1,
+                            "source_quote": "VALUE = 2",
+                            "evidence": "Explicit contrary claim",
+                        }
+                    ],
+                }
+                for status in ("violated", "uncertain"):
+                    args["contract_review"][0]["status"] = status
+                    with self.assertRaisesRegex(
+                        REVIEWER.ReviewError, "verified_contract_ids contradicts"
+                    ):
+                        runtime.validate_report(args)
+                args["contract_review"][0]["status"] = "verified"
+                self.assertEqual(len(runtime.validate_report(args)["contract_review"]), 1)
+                args["contract_review"][0]["obligation_id"] = "invented"
+                with self.assertRaisesRegex(
+                    REVIEWER.ReviewError, "unknown or duplicate obligation_id"
+                ):
+                    runtime.validate_report(args)
+                args.pop("contract_review")
+                self.assertEqual(runtime.validate_report(args)["decision"], "pass_to_primary")
+
+    def test_range_repair_identifies_obligation_and_preserves_unread_gaps(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = REVIEWER.ReviewerRuntime(
+                root, self.make_run(root, source_content="a\nb\nc\n"), {}, FakeClient([])
+            )
+            runtime.read_file({"path": "src/example.py", "start_line": 1, "end_line": 1})
+            runtime.read_file({"path": "src/example.py", "start_line": 3, "end_line": 3})
+            repair = runtime.report_repair(
+                "contract_review.source_ref must name a real range of at most 20 lines",
+                {
+                    "contract_review": [
+                        {
+                            "obligation_id": "behavior-1",
+                            "source_refs": [
+                                {"path": "src/example.py", "start_line": 1, "end_line": 30}
+                            ],
+                        }
+                    ]
+                },
+            )
+            self.assertEqual(
+                repair["displayed_source_ranges"]["src/example.py"],
+                [{"start_line": 1, "end_line": 1}, {"start_line": 3, "end_line": 3}],
+            )
+            self.assertEqual(repair["invalid_source_refs"][0]["obligation_id"], "behavior-1")
+            self.assertEqual(repair["invalid_source_refs"][0]["maximum_lines_per_ref"], 20)
+            self.assertEqual(runtime.read_lines["src/example.py"], {1, 3})
+            self.assertIn("do not discard needed evidence", repair["instruction"])
+
+    def test_finding_challenge_is_optional_once_and_never_accepts_claim_automatically(self):
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled), TemporaryDirectory() as directory:
+                root = Path(directory)
+                report = {
+                    "action": "REPORT",
+                    "arguments": {
+                        "decision": "rework",
+                        "findings": [
+                            {
+                                "id": "bug",
+                                "severity": "high",
+                                "category": "logic_error",
+                                "path": "src/example.py",
+                                "line": 1,
+                                "evidence": "Concrete defect",
+                                "contract_id": "behavior-1",
+                                "suggested_fix": "Repair",
+                            }
+                        ],
+                        "verified_contract_ids": [],
+                        "unverified_claims": [],
+                    },
+                }
+                client = FakeClient(
+                    [
+                        {"action": "READ_FILE", "arguments": {"path": "src/example.py"}},
+                        report,
+                        report,
+                    ]
+                )
+                runtime = REVIEWER.ReviewerRuntime(
+                    root,
+                    self.make_run(root),
+                    {"reviewer_finding_challenge": enabled, "reviewer_prepass_challenge": True},
+                    client,
+                )
+                result = runtime.run()
+                self.assertEqual(result["decision"], "rework")
+                self.assertEqual(len(client.messages_seen), 3 if enabled else 2)
+                self.assertEqual(runtime.protocol_errors, 0)
+                self.assertEqual(runtime.read_lines["src/example.py"], {1})
+                if enabled:
+                    self.assertIn("Attempt to falsify", client.messages_seen[-1][-1]["content"])
+                    self.assertFalse(runtime.prepass_challenge_pending)
+                    self.assertFalse(runtime.finding_challenge_pending)
+                    provisional = json.loads(
+                        (runtime.review_root / "provisional-report.json").read_text()
+                    )
+                    self.assertFalse(provisional["terminal"])
+                    self.assertEqual(provisional["trigger"], "finding_challenge")
+                    self.assertEqual(provisional["report"]["findings"][0]["id"], "bug")
+                else:
+                    self.assertFalse((runtime.review_root / "provisional-report.json").exists())
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self.assertRaisesRegex(
+                REVIEWER.ReviewError, "reviewer_finding_challenge must be a boolean"
+            ):
+                REVIEWER.ReviewerRuntime(
+                    root,
+                    self.make_run(root),
+                    {"reviewer_finding_challenge": "true"},
+                    FakeClient([]),
+                )
+
+    def test_verified_contract_cannot_also_have_finding_or_uncertain_review(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = REVIEWER.ReviewerRuntime(root, self.make_run(root), {}, FakeClient([]))
+            runtime.read_file({"path": "src/example.py"})
+            args = {
+                "decision": "rework",
+                "findings": [
+                    {
+                        "id": "defect",
+                        "severity": "high",
+                        "category": "logic_error",
+                        "path": "src/example.py",
+                        "line": 1,
+                        "evidence": "Observed defect",
+                        "contract_id": "behavior-1",
+                        "suggested_fix": "Repair the defect",
+                    }
+                ],
+                "verified_contract_ids": ["behavior-1"],
+                "unverified_claims": [],
+            }
+            with self.assertRaisesRegex(REVIEWER.ReviewError, "verified_contract_ids contradicts"):
+                runtime.validate_report(args)
+            args["verified_contract_ids"] = []
+            self.assertEqual(runtime.validate_report(args)["decision"], "rework")
+            args.update(
+                decision="escalate",
+                findings=[],
+                verified_contract_ids=["behavior-1"],
+                contract_review=[
+                    {
+                        "obligation_id": "behavior-1",
+                        "status": "uncertain",
+                        "path": "src/example.py",
+                        "line": 1,
+                        "source_quote": "VALUE = 2",
+                        "evidence": "Not established",
+                    }
+                ],
+            )
+            with self.assertRaisesRegex(REVIEWER.ReviewError, "verified_contract_ids contradicts"):
+                runtime.validate_report(args)
+            args["verified_contract_ids"] = []
+            self.assertEqual(runtime.validate_report(args)["decision"], "escalate")
+            repair = runtime.report_repair(
+                "verified_contract_ids contradicts findings or non-verified contract_review: behavior-1",
+                args,
+            )
+            self.assertEqual(repair["conflicting_contract_ids"], ["behavior-1"])
+            self.assertIn("withdraw a disproven finding", repair["instruction"])
+            self.assertEqual(runtime.read_lines["src/example.py"], {1})
+
+    def test_canonical_citation_transport_preserves_actions_and_original_schema(self):
+        tools = json.loads(json.dumps(REVIEWER.REVIEW_NATIVE_TOOLS))
+        before = json.dumps(tools)
+        narrowed = REVIEWER.canonical_citation_tools(tools)
+        self.assertEqual(json.dumps(tools), before)
+        self.assertEqual(
+            [item["function"]["name"] for item in narrowed],
+            [item["function"]["name"] for item in tools],
+        )
+        for original, updated in zip(tools, narrowed):
+            if original["function"]["name"] != "REPORT":
+                self.assertEqual(original, updated)
+                continue
+            item = updated["function"]["parameters"]["properties"]["contract_review"]["items"]
+            self.assertNotIn("source_ref", item["properties"])
+            self.assertIn("source_refs", item["required"])
+            self.assertFalse(item["additionalProperties"])
+
+    def test_mixed_citation_repair_is_one_request_and_still_validates_report(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            request = self.make_run(
+                root,
+                review_feedback=[
+                    {
+                        "finding_id": "shape",
+                        "contract_id": "behavior-1",
+                        "text": "Check the actual value.",
+                        "source_anchor": "VALUE",
+                        "verify_in_review": True,
+                    }
+                ],
+            )
+            ref = {"path": "src/example.py", "start_line": 1, "end_line": 1}
+            bad = {
+                "decision": "pass_to_primary",
+                "findings": [],
+                "verified_contract_ids": ["behavior-1"],
+                "unverified_claims": [],
+                "contract_review": [
+                    {
+                        "obligation_id": "RF-shape",
+                        "status": "verified",
+                        "source_ref": ref,
+                        "source_refs": [ref],
+                        "evidence": "The actual line assigns VALUE = 2.",
+                    }
+                ],
+            }
+            good = json.loads(json.dumps(bad))
+            del good["contract_review"][0]["source_ref"]
+
+            class NativeClient(FakeClient):
+                def complete(self, messages):
+                    self.schemas.append(json.loads(json.dumps(self.native_tools)))
+                    return super().complete(messages)
+
+            client = NativeClient(
+                [
+                    {"action": "READ_FILE", "arguments": {"path": "src/example.py"}},
+                    {"action": "REPORT", "arguments": bad},
+                    {"action": "REPORT", "arguments": good},
+                ]
+            )
+            client.native_tools = json.loads(json.dumps(REVIEWER.REVIEW_NATIVE_TOOLS))
+            original = json.dumps(client.native_tools)
+            client.native_tool_choice = "auto"
+            client.schemas = []
+            runtime = REVIEWER.ReviewerRuntime(root, request, {}, client)
+            self.assertEqual(runtime.run()["decision"], "pass_to_primary")
+            self.assertEqual(runtime.protocol_errors, 1)
+            self.assertEqual(json.dumps(client.native_tools), original)
+            self.assertEqual(client.native_tool_choice, "auto")
+            repaired = next(
+                t["function"] for t in client.schemas[-1] if t["function"]["name"] == "REPORT"
+            )
+            self.assertNotIn(
+                "source_ref",
+                repaired["parameters"]["properties"]["contract_review"]["items"]["properties"],
+            )
+            self.assertEqual(runtime.read_lines["src/example.py"], {1})
+            feedback = json.loads(client.messages_seen[-1][-1]["content"].split("\n", 1)[1])
+            self.assertIn("Remove source_ref", feedback["report_repair"]["instruction"])
+
+    def test_prepass_challenge_is_once_optional_and_requires_new_valid_report(self):
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled), TemporaryDirectory() as directory:
+                root = Path(directory)
+                report = {
+                    "action": "REPORT",
+                    "arguments": {
+                        "decision": "pass_to_primary",
+                        "findings": [],
+                        "verified_contract_ids": ["behavior-1"],
+                        "unverified_claims": [],
+                    },
+                }
+                client = FakeClient(
+                    [
+                        {"action": "READ_FILE", "arguments": {"path": "src/example.py"}},
+                        {"action": "READ_FILE", "arguments": {"path": "tests/test_example.py"}},
+                        report,
+                        report,
+                    ]
+                )
+                runtime = REVIEWER.ReviewerRuntime(
+                    root,
+                    self.make_run(root),
+                    {
+                        "reviewer_prepass_challenge": enabled,
+                        "reviewer_require_source_and_test_reads": True,
+                    },
+                    client,
+                )
+                result = runtime.run()
+                self.assertEqual(result["decision"], "pass_to_primary")
+                self.assertEqual(len(client.messages_seen), 4 if enabled else 3)
+                self.assertEqual(runtime.protocol_errors, 0)
+                if enabled:
+                    self.assertIn("provisional pass", client.messages_seen[-1][-1]["content"])
+                    self.assertFalse(runtime.prepass_challenge_pending)
+                    self.assertIsNone(runtime.deferred_report)
+                    provisional = json.loads(
+                        (runtime.review_root / "provisional-report.json").read_text()
+                    )
+                    self.assertFalse(provisional["terminal"])
+                    self.assertEqual(provisional["trigger"], "prepass_challenge")
+
+    def test_prepass_challenge_never_accepts_an_invalid_second_report(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            client = FakeClient(
+                [
+                    {"action": "READ_FILE", "arguments": {"path": "src/example.py"}},
+                    {"action": "READ_FILE", "arguments": {"path": "tests/test_example.py"}},
+                    {
+                        "action": "REPORT",
+                        "arguments": {
+                            "decision": "pass_to_primary",
+                            "findings": [],
+                            "verified_contract_ids": ["behavior-1"],
+                            "unverified_claims": [],
+                        },
+                    },
+                    {"action": "REPORT", "arguments": {"decision": "pass_to_primary"}},
+                ]
+            )
+            runtime = REVIEWER.ReviewerRuntime(
+                root,
+                self.make_run(root),
+                {"reviewer_prepass_challenge": True, "max_reviewer_protocol_errors": 1},
+                client,
+            )
+            with self.assertRaisesRegex(REVIEWER.ReviewError, "protocol error budget"):
+                runtime.run()
+            self.assertFalse((runtime.review_root / "report.json").exists())
+
+    def test_prepass_challenge_survives_duplicate_read_history_compaction(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            good = {
+                "action": "REPORT",
+                "arguments": {
+                    "decision": "pass_to_primary",
+                    "findings": [],
+                    "verified_contract_ids": ["behavior-1"],
+                    "unverified_claims": [],
+                },
+            }
+            client = FakeClient(
+                [
+                    {"action": "READ_FILE", "arguments": {"path": "src/example.py"}},
+                    {"action": "READ_FILE", "arguments": {"path": "tests/test_example.py"}},
+                    good,
+                    {"action": "READ_FILE", "arguments": {"path": "src/example.py"}},
+                    good,
+                ]
+            )
+            runtime = REVIEWER.ReviewerRuntime(
+                root,
+                self.make_run(root),
+                {
+                    "reviewer_prepass_challenge": True,
+                    "reviewer_require_source_and_test_reads": True,
+                },
+                client,
+            )
+            self.assertEqual(runtime.run()["decision"], "pass_to_primary")
+            self.assertEqual(len(client.messages_seen), 5)
+            self.assertTrue(
+                client.messages_seen[-1][-1]["content"].startswith("PREPASS_CHALLENGE\n")
+            )
+            self.assertIn("both raising", client.messages_seen[-1][-1]["content"])
+            self.assertEqual(runtime.protocol_errors, 0)
+
+    def test_native_history_preserves_call_result_pair_but_redacts_invalid_report(self):
+        class NativeClient(FakeClient):
+            def complete(self, messages):
+                raw = super().complete(messages)
+                action = json.loads(raw)
+                self.last_native_call = {
+                    "id": "call_" + str(len(self.messages_seen)),
+                    "type": "function",
+                    "function": {
+                        "name": action["action"],
+                        "arguments": json.dumps(action["arguments"]),
+                    },
+                }
+                return raw
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            good = {
+                "action": "REPORT",
+                "arguments": {
+                    "decision": "pass_to_primary",
+                    "findings": [],
+                    "verified_contract_ids": ["behavior-1"],
+                    "unverified_claims": [],
+                },
+            }
+            client = NativeClient(
+                [
+                    {"action": "READ_FILE", "arguments": {"path": "src/example.py"}},
+                    {"action": "READ_FILE", "arguments": {"path": "tests/test_example.py"}},
+                    {"action": "REPORT", "arguments": {"decision": "INVALID_SECRET_REPORT"}},
+                    good,
+                ]
+            )
+            runtime = REVIEWER.ReviewerRuntime(
+                root,
+                self.make_run(root),
+                {
+                    "reviewer_native_history": True,
+                    "reviewer_require_source_and_test_reads": True,
+                },
+                client,
+            )
+            result = runtime.run()
+            self.assertEqual(result["decision"], "pass_to_primary")
+            pair = client.messages_seen[1][-2:]
+            self.assertEqual(pair[0]["role"], "assistant")
+            self.assertEqual(pair[1]["role"], "tool")
+            self.assertEqual(pair[0]["tool_calls"][0]["id"], pair[1]["tool_call_id"])
+            self.assertEqual(pair[1]["name"], "READ_FILE")
+            runtime._update_active_read_context(client.messages_seen[2])
+            self.assertIn(1, runtime.active_read_lines["src/example.py"])
+            self.assertNotIn("INVALID_SECRET_REPORT", json.dumps(client.messages_seen[3]))
+            self.assertEqual(client.messages_seen[3][-2]["content"], "INVALID_REPORT_SUBMITTED")
+
     def test_budgeted_retention_keeps_long_read_chain_when_it_fits(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -320,6 +952,24 @@ class ReviewerRuntimeTests(unittest.TestCase):
         self.assertIn("null", item["properties"]["line"]["type"])
         self.assertIn("diff", item["properties"]["evidence_type"]["enum"])
 
+    def test_native_contract_citation_schema_names_real_bounded_range_fields(self) -> None:
+        report = next(
+            tool["function"]
+            for tool in REVIEWER.REVIEW_NATIVE_TOOLS
+            if tool["function"]["name"] == "REPORT"
+        )
+        item = report["parameters"]["properties"]["contract_review"]["items"]
+        single = item["properties"]["source_ref"]
+        multiple = item["properties"]["source_refs"]
+        self.assertEqual(multiple["items"], single)
+        self.assertEqual(set(single["required"]), {"path", "start_line", "end_line"})
+        self.assertFalse(single["additionalProperties"])
+        for field in ("start_line", "end_line"):
+            self.assertEqual(single["properties"][field], {"type": "integer", "minimum": 1})
+        self.assertEqual((multiple["minItems"], multiple["maxItems"]), (1, 3))
+        # Shape hints confer neither read coverage nor semantic verification;
+        # unread/range/anchor checks remain validate_report's responsibility.
+
     def test_compatibility_pass_can_require_search(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -585,6 +1235,12 @@ class ReviewerRuntimeTests(unittest.TestCase):
             self.assertIn("protocol_fallback_model", events)
 
     def test_report_waiting_only_for_approved_execution_finalizes_after_last_check(self) -> None:
+        self._assert_deferred_execution_report(challenge=False)
+
+    def test_deferred_approved_execution_cannot_bypass_prepass_challenge(self):
+        self._assert_deferred_execution_report(challenge=True)
+
+    def _assert_deferred_execution_report(self, *, challenge):
         with TemporaryDirectory() as directory:
             root = Path(directory)
             configured = [
@@ -614,7 +1270,10 @@ class ReviewerRuntimeTests(unittest.TestCase):
                     },
                 ]
             )
+            if challenge:
+                client.actions.append(report)
             config = {
+                "reviewer_prepass_challenge": challenge,
                 "reviewer_require_approved_execution": True,
                 "validation_profiles": {
                     "python-focused": {
@@ -631,11 +1290,14 @@ class ReviewerRuntimeTests(unittest.TestCase):
             }
             result = REVIEWER.ReviewerRuntime(root, request, config, client).run()
             self.assertEqual(result["decision"], "pass_to_primary")
-            self.assertEqual(len(client.messages_seen), 3)
+            self.assertEqual(len(client.messages_seen), 4 if challenge else 3)
             events = (
                 root / ".agent" / "tasks" / "task-1" / "reviews" / "review-1" / "events.jsonl"
             ).read_text(encoding="utf-8")
-            self.assertIn("deferred_report_finalized", events)
+            self.assertEqual("deferred_report_finalized" in events, not challenge)
+            if challenge:
+                self.assertIn("prepass_challenge_issued", events)
+                self.assertIn("provisional pass", client.messages_seen[-1][-1]["content"])
 
     def test_reviewer_receives_contract_and_diff_without_coder_self_assessment(self) -> None:
         with TemporaryDirectory() as directory:
@@ -666,10 +1328,10 @@ class ReviewerRuntimeTests(unittest.TestCase):
                 "verified_contract_ids": ["behavior-1"],
                 "unverified_claims": [],
             }
-            with self.assertRaisesRegex(REVIEWER.ReviewError, "changed source file"):
+            with self.assertRaisesRegex(REVIEWER.ReviewError, "hunk-1:src/example.py"):
                 runtime.validate_report(report)
             runtime.read_file({"path": "src/example.py"})
-            with self.assertRaisesRegex(REVIEWER.ReviewError, "focused test file"):
+            with self.assertRaisesRegex(REVIEWER.ReviewError, "critical-1:tests/test_example.py"):
                 runtime.validate_report(report)
             runtime.read_file({"path": "tests/test_example.py"})
             self.assertEqual(runtime.validate_report(report)["decision"], "pass_to_primary")
@@ -957,14 +1619,31 @@ class ReviewerRuntimeTests(unittest.TestCase):
             self.assertEqual(catalog["static_checks"][0]["id"], "ruff-check")
             self.assertEqual(catalog["static_checks"][0]["arguments"], {"check_id": "ruff-check"})
             completed = type("Completed", (), {"returncode": 0, "stdout": "ok\n", "stderr": ""})()
-            with patch.object(REVIEWER.subprocess, "run", return_value=completed) as run:
+
+            def fake_run(argv, **_kwargs):
+                for item in argv:
+                    if item.startswith("--junitxml="):
+                        Path(item.split("=", 1)[1]).write_text(
+                            "<testsuites><testsuite><testcase/></testsuite></testsuites>",
+                            encoding="utf-8",
+                        )
+                return completed
+
+            with patch.object(REVIEWER.subprocess, "run", side_effect=fake_run) as run:
                 test_result = runtime.run_approved_test({"test_id": "focused-tests"})
                 check_result = runtime.run_approved_static_check({"check_id": "ruff-check"})
             self.assertEqual(test_result["status"], "passed")
             self.assertEqual(check_result["status"], "passed")
             self.assertEqual(
                 run.call_args_list[0].args[0],
-                ["trusted-python", "-B", "-m", "pytest", "tests/test_example.py"],
+                [
+                    "trusted-python",
+                    "-B",
+                    "-m",
+                    "pytest",
+                    "tests/test_example.py",
+                    f"--junitxml={runtime.review_root / 'approved-tests-1.xml'}",
+                ],
             )
             self.assertEqual(
                 run.call_args_list[1].args[0],
@@ -1092,6 +1771,108 @@ class ReviewerRuntimeTests(unittest.TestCase):
             args["contract_review"][0]["source_quote"] = "VALUE = 2"
             self.assertEqual(runtime.validate_report(args)["decision"], "pass_to_primary")
 
+    def test_context_citation_rejects_changed_content_outside_validation_inputs(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = REVIEWER.ReviewerRuntime(
+                root, self.make_run(root, risk="high"), {}, FakeClient([])
+            )
+            reference = root / "src/reference.py"
+            reference.write_text("VALUE = 2\n", encoding="utf-8")
+            self.assertNotIn("src/reference.py", runtime.expected_inputs)
+            runtime.read_file({"path": "src/example.py"})
+            runtime.read_file({"path": "tests/test_example.py"})
+            runtime.read_file({"path": "src/reference.py"})
+            args = {
+                "decision": "pass_to_primary",
+                "findings": [],
+                "verified_contract_ids": ["behavior-1"],
+                "unverified_claims": [],
+                "contract_review": [
+                    {
+                        "obligation_id": "behavior-1",
+                        "status": "verified",
+                        "source_ref": {"path": "src/reference.py", "start_line": 1, "end_line": 1},
+                        "evidence": "Read reference assignment supports value two.",
+                    }
+                ],
+            }
+            self.assertEqual(runtime.validate_report(args)["decision"], "pass_to_primary")
+            reference.write_text("VALUE = 3\n", encoding="utf-8")
+            with self.assertRaisesRegex(REVIEWER.ReviewError, "changed"):
+                runtime.validate_report(args)
+
+    def test_deleted_read_context_cannot_grant_new_read_evidence(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = REVIEWER.ReviewerRuntime(root, self.make_run(root), {}, FakeClient([]))
+            reference = root / "src/reference.py"
+            reference.write_text("REFERENCE = 1\n", encoding="utf-8")
+            runtime.read_file({"path": "src/reference.py"})
+            reference.unlink()
+            with self.assertRaisesRegex(REVIEWER.ReviewError, "disappeared"):
+                runtime.read_file({"path": "src/example.py"})
+            self.assertNotIn("src/example.py", runtime.read_lines)
+
+    def test_finalize_rejects_changed_uncited_read_context(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = REVIEWER.ReviewerRuntime(root, self.make_run(root), {}, FakeClient([]))
+            reference = root / "src/reference.py"
+            reference.write_text("REFERENCE = 1\n", encoding="utf-8")
+            runtime.prepare()
+            runtime.read_file({"path": "src/example.py"})
+            runtime.read_file({"path": "tests/test_example.py"})
+            runtime.read_file({"path": "src/reference.py"})
+            report = runtime.validate_report(
+                {
+                    "decision": "pass_to_primary",
+                    "findings": [],
+                    "verified_contract_ids": ["behavior-1"],
+                    "unverified_claims": [],
+                }
+            )
+            self.assertEqual(
+                report["runtime_facts"]["observed_read_hashes"]["src/reference.py"],
+                REVIEWER.RUN_STATE.sha256_bytes(reference.read_bytes()),
+            )
+            reference.write_text("REFERENCE = 2\n", encoding="utf-8")
+            with self.assertRaisesRegex(REVIEWER.ReviewError, "changed"):
+                runtime.finalize(report)
+            self.assertFalse((runtime.review_root / "completed.json").exists())
+
+    def test_single_source_ref_rejects_boolean_line_boundaries(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = REVIEWER.ReviewerRuntime(
+                root, self.make_run(root, risk="high"), {}, FakeClient([])
+            )
+            runtime.read_file({"path": "src/example.py"})
+            runtime.read_file({"path": "tests/test_example.py"})
+            for start, end in ((True, 1), (1, True)):
+                with self.subTest(start=start, end=end):
+                    with self.assertRaisesRegex(REVIEWER.ReviewError, "at most 20"):
+                        runtime.validate_report(
+                            {
+                                "decision": "pass_to_primary",
+                                "findings": [],
+                                "verified_contract_ids": ["behavior-1"],
+                                "unverified_claims": [],
+                                "contract_review": [
+                                    {
+                                        "obligation_id": "behavior-1",
+                                        "status": "verified",
+                                        "source_ref": {
+                                            "path": "src/example.py",
+                                            "start_line": start,
+                                            "end_line": end,
+                                        },
+                                        "evidence": "The source assigns value two.",
+                                    }
+                                ],
+                            }
+                        )
+
     def test_source_ref_materializes_quote_and_hash_without_model_copy(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1125,6 +1906,134 @@ class ReviewerRuntimeTests(unittest.TestCase):
             self.assertTrue(reviewed["source_hash"].startswith("sha256:"))
             args["contract_review"][0]["source_ref"]["end_line"] = 2
             with self.assertRaisesRegex(REVIEWER.ReviewError, "real range"):
+                runtime.validate_report(args)
+
+    def test_anchor_repair_names_exact_bounded_read_without_waiving_review(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            request = self.make_run(
+                root,
+                source_content="VALUE = 2\nanchor_token = 1\n",
+                review_feedback=[
+                    {
+                        "finding_id": "anchored",
+                        "contract_id": "behavior-1",
+                        "text": "Inspect the intended symbol and behavior.",
+                        "source_anchor": "anchor_token",
+                        "verify_in_review": True,
+                    }
+                ],
+            )
+            runtime = REVIEWER.ReviewerRuntime(root, request, {}, FakeClient([]))
+            repair = runtime.report_repair(
+                "contract_review RF-anchored source_quote must contain the required source_anchor",
+                {},
+            )
+            self.assertEqual(repair["required_source_anchor"], "anchor_token")
+            self.assertEqual(
+                repair["suggested_action"]["arguments"],
+                {
+                    "path": "src/example.py",
+                    "start_line": 2,
+                    "end_line": 2,
+                },
+            )
+            self.assertEqual(repair["anchor_citation"]["exact_source_quote"], "anchor_token = 1")
+            self.assertNotIn("src/example.py", runtime.read_paths)
+            self.assertIn("not proof of semantics", repair["instruction"])
+            runtime.read_file({"path": "src/example.py", "start_line": 1, "end_line": 2})
+            before = {path: set(lines) for path, lines in runtime.read_lines.items()}
+            grounded = runtime.report_repair(
+                "contract_review RF-anchored source_quote must contain the required source_anchor",
+                {},
+            )
+            self.assertTrue(grounded["anchor_already_read"])
+            self.assertNotIn("suggested_action", grounded)
+            self.assertIn("Do not reread", grounded["instruction"])
+            self.assertEqual(runtime.read_lines, before)
+            self.assertIn("not proof of semantics", grounded["instruction"])
+            # A previously read line is not current evidence after external drift.
+            (root / "src/example.py").write_text("VALUE = 3\nanchor_token = 1\n", encoding="utf-8")
+            stale = runtime.report_repair(
+                "contract_review RF-anchored source_quote must contain the required source_anchor",
+                {},
+            )
+            self.assertFalse(stale["anchor_already_read"])
+            self.assertIn("suggested_action", stale)
+            missing = runtime.report_repair(
+                "contract_review unknown source_quote must contain the required source_anchor", {}
+            )
+            self.assertNotIn("suggested_action", missing)
+
+    def test_multi_range_contract_citations_preserve_read_scope_and_anchor_gates(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            request = self.make_run(
+                root,
+                source_content="VALUE = 2\n" + "# padding\n" * 25 + "OTHER = 3\n",
+                review_feedback=[
+                    {
+                        "finding_id": "split",
+                        "contract_id": "behavior-1",
+                        "text": "Review the symbol and distant body.",
+                        "source_anchor": "VALUE",
+                        "verify_in_review": True,
+                    }
+                ],
+            )
+            runtime = REVIEWER.ReviewerRuntime(root, request, {}, FakeClient([]))
+            refs = [
+                {"path": "src/example.py", "start_line": 1, "end_line": 1},
+                {"path": "src/example.py", "start_line": 27, "end_line": 27},
+            ]
+            args = {
+                "decision": "pass_to_primary",
+                "findings": [],
+                "verified_contract_ids": ["behavior-1"],
+                "unverified_claims": [],
+                "contract_review": [
+                    {
+                        "obligation_id": "RF-split",
+                        "status": "verified",
+                        "source_refs": refs,
+                        "evidence": "The symbol and implementation were independently inspected.",
+                    }
+                ],
+            }
+            with self.assertRaisesRegex(REVIEWER.ReviewError, "source was not read"):
+                runtime.validate_report(args)
+            runtime.read_file({"path": "src/example.py", "start_line": 1, "end_line": 1})
+            with self.assertRaisesRegex(REVIEWER.ReviewError, "source line was not read"):
+                runtime.validate_report(args)
+            runtime.read_file({"path": "src/example.py", "start_line": 27, "end_line": 27})
+            result = runtime.validate_report(args)
+            quotes = [ref["canonical_quote"] for ref in result["contract_review"][0]["source_refs"]]
+            self.assertEqual(quotes, ["VALUE = 2", "OTHER = 3"])
+            args["contract_review"][0]["source_refs"] = refs[1:]
+            with self.assertRaisesRegex(REVIEWER.ReviewError, "source_anchor"):
+                runtime.validate_report(args)
+            args["contract_review"][0]["source_refs"] = refs * 2
+            with self.assertRaisesRegex(REVIEWER.ReviewError, "1 to 3"):
+                runtime.validate_report(args)
+            args["contract_review"][0]["source_refs"] = [
+                {"path": "../escape.py", "start_line": 1, "end_line": 1}
+            ]
+            with self.assertRaises((REVIEWER.ReviewError, REVIEWER.SAFE_EDIT.SafeEditError)):
+                runtime.validate_report(args)
+            args["contract_review"][0]["source_refs"] = [
+                {"path": "src/example.py", "start_line": 1, "end_line": 27}
+            ]
+            with self.assertRaisesRegex(REVIEWER.ReviewError, "at most 20"):
+                runtime.validate_report(args)
+            args["contract_review"][0]["source_refs"] = refs
+            args["contract_review"][0]["source_ref"] = refs[0]
+            with self.assertRaisesRegex(REVIEWER.ReviewError, "not both"):
+                runtime.validate_report(args)
+            args["contract_review"][0].pop("source_ref")
+            args["contract_review"][0]["source_refs"] = [
+                {"path": "src/example.py", "start_line": True, "end_line": 1}
+            ]
+            with self.assertRaisesRegex(REVIEWER.ReviewError, "at most 20"):
                 runtime.validate_report(args)
 
     def test_high_risk_focused_rework_requires_seen_line_and_anchor(self) -> None:
@@ -1392,6 +2301,9 @@ class ReviewerRuntimeTests(unittest.TestCase):
                 ],
             }
             with self.assertRaisesRegex(REVIEWER.ReviewError, "beyond the end"):
+                runtime.validate_report(args)
+            args["ordering_review"][0]["line"] = True
+            with self.assertRaisesRegex(REVIEWER.ReviewError, "positive integer"):
                 runtime.validate_report(args)
             args["ordering_review"][0]["line"] = 1
             with self.assertRaisesRegex(REVIEWER.ReviewError, "template evidence"):
@@ -1778,6 +2690,58 @@ class ReviewerRuntimeTests(unittest.TestCase):
             self.assertEqual(
                 runtime.search({"query": "VALUE"})["results"][0]["path"], "src/example.py"
             )
+
+    def test_boolean_read_ranges_receive_no_read_credit(self) -> None:
+        for field in ("start_line", "end_line"):
+            with self.subTest(field=field), TemporaryDirectory() as directory:
+                root = Path(directory)
+                runtime = REVIEWER.ReviewerRuntime(root, self.make_run(root), {}, FakeClient([]))
+                with self.assertRaisesRegex(REVIEWER.ReviewError, "start_line|end_line"):
+                    runtime.read_file({"path": "src/example.py", field: True})
+                self.assertFalse(runtime.read_paths)
+                self.assertFalse(runtime.read_lines)
+                self.assertFalse(runtime.observed_read_hashes)
+
+    def test_boolean_finding_and_legacy_contract_lines_are_rejected(self) -> None:
+        for kind in ("finding", "legacy_contract"):
+            with self.subTest(kind=kind), TemporaryDirectory() as directory:
+                root = Path(directory)
+                runtime = REVIEWER.ReviewerRuntime(
+                    root, self.make_run(root, risk="high"), {}, FakeClient([])
+                )
+                runtime.read_file({"path": "src/example.py"})
+                args = {
+                    "decision": "escalate",
+                    "findings": [],
+                    "verified_contract_ids": [],
+                    "unverified_claims": [],
+                }
+                if kind == "finding":
+                    args["findings"] = [
+                        {
+                            "id": "f1",
+                            "severity": "medium",
+                            "category": "test_gap",
+                            "path": "src/example.py",
+                            "line": True,
+                            "contract_id": "behavior-1",
+                            "evidence": "Boundary not covered.",
+                            "suggested_fix": "Review boundary coverage.",
+                        }
+                    ]
+                else:
+                    args["contract_review"] = [
+                        {
+                            "obligation_id": "behavior-1",
+                            "status": "uncertain",
+                            "path": "src/example.py",
+                            "line": True,
+                            "source_quote": "VALUE = 2",
+                            "evidence": "Boundary not covered.",
+                        }
+                    ]
+                with self.assertRaisesRegex(REVIEWER.ReviewError, "line"):
+                    runtime.validate_report(args)
 
     def test_reviewer_rejects_inputs_changed_after_coder_run(self) -> None:
         with TemporaryDirectory() as directory:

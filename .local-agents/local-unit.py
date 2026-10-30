@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import ast
 import hashlib
+import importlib.util
 import json
 import re
 import subprocess
@@ -17,6 +18,11 @@ from typing import Any
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+_host_spec = importlib.util.spec_from_file_location(
+    "local_unit_host_protocol", SCRIPT_DIR / "host-proposal-protocol.py"
+)
+HOST = importlib.util.module_from_spec(_host_spec)
+_host_spec.loader.exec_module(HOST)
 
 
 class HandoffError(ValueError):
@@ -163,9 +169,13 @@ def _introduced_local_import_violations(
     return violations
 
 
-def verify_handoff(repo_root: Path, coder_report: dict[str, Any]) -> dict[str, str]:
-    if coder_report.get("status") != "ready_for_review":
+def verify_handoff(repo_root: Path, coder_report: dict[str, Any], *, config=None) -> dict[str, str]:
+    host_mode = coder_report.get("status") == HOST.PENDING
+    expected_status = HOST.PENDING if host_mode else "ready_for_review"
+    if coder_report.get("status") != expected_status:
         raise HandoffError("Coder is not ready_for_review")
+    if not host_mode and coder_report.get("execution_protocol") is not None:
+        raise HandoffError("Unknown execution protocol")
     identity = coder_report.get("identity") or {}
     task_id = _identifier(identity.get("task_id"), "task_id")
     unit_id = _identifier(identity.get("unit_id"), "unit_id")
@@ -181,10 +191,16 @@ def verify_handoff(repo_root: Path, coder_report: dict[str, Any]) -> dict[str, s
         packet.get("task_id") != task_id
         or packet.get("unit_id") != unit_id
         or packet.get("run_id") != run_id
-        or completed.get("status") != "ready_for_review"
-        or handoff.get("status") != "ready_for_review"
+        or completed.get("status") != expected_status
+        or handoff.get("status") != expected_status
     ):
         raise HandoffError("Coder report does not match the completed canonical run")
+    if host_mode:
+        if coder_report.get("execution_protocol") != HOST.PROTOCOL:
+            raise HandoffError("Unknown host execution protocol")
+        HOST.verify(repo_root, run_root, packet, handoff, validation, config or {})
+    elif handoff.get("execution_protocol") is not None:
+        raise HandoffError("Unknown canonical execution protocol")
     focused = validation.get("focused_tests") or {}
     junit = focused.get("junit") or {}
     if (
@@ -200,9 +216,13 @@ def verify_handoff(repo_root: Path, coder_report: dict[str, Any]) -> dict[str, s
     # Diagnostic acknowledgements may be false/unknown; green tests do not
     # upgrade those model claims into submission eligibility.
     acknowledgement = validation.get("contract_check")
-    if packet.get("contract_check_required") and not isinstance(acknowledgement, dict):
-        raise HandoffError("Coder submission contract acknowledgement is missing")
     if (
+        not host_mode
+        and packet.get("contract_check_required")
+        and not isinstance(acknowledgement, dict)
+    ):
+        raise HandoffError("Coder submission contract acknowledgement is missing")
+    if not host_mode and (
         acknowledgement is not None
         or packet.get("required_order")
         or packet.get("forbidden_orderings")
@@ -333,16 +353,25 @@ def run_unit(
         "coder_report": str(coder_report_path),
         "reviewer_decision": None,
     }
-    if coder.returncode != 0 or coder_report.get("status") != "ready_for_review":
+    if coder.returncode != 0 or coder_report.get("status") not in {
+        "ready_for_review",
+        HOST.PENDING,
+    }:
         result["next_action_required"] = coder_report.get("next_action_required")
         return coder.returncode or 2, result
     try:
-        identity = verify_handoff(repo_root, coder_report)
+        identity = verify_handoff(
+            repo_root,
+            coder_report,
+            config=_object(config) if coder_report.get("status") == HOST.PENDING else None,
+        )
         request = {
             "schema_version": 1,
             **identity,
             "review_id": "auto-" + uuid.uuid4().hex,
         }
+        if coder_report.get("status") == HOST.PENDING:
+            request["execution_protocol"] = HOST.PROTOCOL
         request_path = (
             repo_root
             / ".agent"
@@ -366,7 +395,7 @@ def run_unit(
         )
         return 2, result
     result["review_attempts"] = []
-    for attempt in (1, 2):
+    for attempt in (1,) if coder_report.get("status") == HOST.PENDING else (1, 2):
         prior_review_mtime = (
             review_report_path.stat().st_mtime_ns if review_report_path.exists() else None
         )
@@ -423,7 +452,11 @@ def run_unit(
                 "infra_failure": review_report.get("infra_failure"),
             }
         )
-        if attempt == 2 or not _retryable_reviewer_startup_failure(review_report):
+        if (
+            coder_report.get("status") == HOST.PENDING
+            or attempt == 2
+            or not _retryable_reviewer_startup_failure(review_report)
+        ):
             break
         try:
             verify_handoff(repo_root, coder_report)
@@ -446,7 +479,12 @@ def run_unit(
         {
             "reviewer_decision": review_report.get("decision"),
             "review_report": str(review_report_path),
-            "next_action_required": review_report.get("next_action_required"),
+            "next_action_required": (
+                "primary_adjudicate_review_findings"
+                if review_report.get("decision") == "rework"
+                else review_report.get("next_action_required")
+            ),
+            "automatic_coder_rework_authorized": False,
         }
     )
     if reviewed.returncode != 0 or review_report.get("decision") not in {

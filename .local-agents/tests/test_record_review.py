@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
@@ -20,6 +21,102 @@ SPEC.loader.exec_module(REVIEW)
 
 
 class RecordReviewTests(unittest.TestCase):
+    def test_primary_disposition_cli_enforces_rework_and_preserves_acceptance_gate(self):
+        cases = [
+            (None, "rework", 2),
+            ("confirmed_defect", "rework", 0),
+            ("contract_revision", "rework", 2),
+            ("contract_revision", "replan", 0),
+            ("nonblocking", "accept", 2),
+            ("stale", "rework", 2),
+            ("stale_source", "rework", 2),
+        ]
+        for kind, decision, expected in cases:
+            with self.subTest(kind=kind, decision=decision), TemporaryDirectory() as directory:
+                root = Path(directory)
+                task = root / ".agent/tasks/t"
+                run = task / "runs/r"
+                archive = task / "reviews/v"
+                run.mkdir(parents=True)
+                archive.mkdir(parents=True)
+                source = root / "source.py"
+                source.write_text("VALUE = 2\n", encoding="utf-8")
+                identity = {"task_id": "t", "unit_id": "u", "run_id": "r"}
+                documents = {
+                    run / "completed.json": {"status": "ready_for_review"},
+                    run / "handoff.json": {
+                        "identity": identity,
+                        "next_action_required": "local_review",
+                    },
+                    task / "state.json": {
+                        "reviews": [],
+                        "completed_units": [],
+                        "recent_attempts": [],
+                    },
+                    archive / "completed.json": {"decision": "rework"},
+                    archive / "handoff.json": {
+                        "identity": {**identity, "review_id": "v"},
+                        "decision": "rework",
+                        "findings": [{"id": "f"}],
+                        "runtime_facts": {
+                            "observed_read_hashes": {
+                                "source.py": hashlib.sha256(source.read_bytes()).hexdigest()
+                            }
+                        },
+                    },
+                }
+                for path, data in documents.items():
+                    path.write_text(json.dumps(data), encoding="utf-8")
+                original = (archive / "handoff.json").read_bytes()
+                argv = [
+                    "record-review.py",
+                    "--repo",
+                    str(root),
+                    "--task-id",
+                    "t",
+                    "--run-id",
+                    "r",
+                    "--decision",
+                    decision,
+                    "--summary",
+                    "Primary inspected evidence",
+                ]
+                if kind:
+                    payload = {
+                        "schema_version": 1,
+                        "authority": "primary",
+                        "identity": {**identity, "review_id": "v"},
+                        "report_sha256": hashlib.sha256(original).hexdigest()
+                        if kind != "stale"
+                        else "wrong",
+                        "resolution": "cleared",
+                        "evidence": ["Independent source/test evidence"],
+                        "findings": [
+                            {
+                                "finding_id": "f",
+                                "disposition": "confirmed_defect"
+                                if kind in {"stale", "stale_source"}
+                                else kind,
+                                "evidence": "Concrete inspected evidence",
+                            }
+                        ],
+                    }
+                    path = root / "disposition.json"
+                    path.write_text(json.dumps(payload), encoding="utf-8")
+                    argv.extend(["--disposition", str(path)])
+                    if kind == "stale_source":
+                        source.write_text("VALUE = 3\n", encoding="utf-8")
+                with patch.object(sys, "argv", argv), contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(REVIEW.main(), expected)
+                self.assertEqual((archive / "handoff.json").read_bytes(), original)
+                self.assertEqual((run / "review.json").exists(), expected == 0)
+                if expected == 0:
+                    saved = json.loads((run / "review.json").read_text(encoding="utf-8"))
+                    self.assertEqual(
+                        saved["review_disposition"]["report_sha256"],
+                        hashlib.sha256(original).hexdigest(),
+                    )
+
     def test_accept_requires_local_review_for_new_routed_runs(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)

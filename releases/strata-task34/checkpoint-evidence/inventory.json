@@ -1,0 +1,62 @@
+[
+  {
+    "file": "binding-preflight/decision.json",
+    "source_batch": "strata-binding-preflight-20261030-1",
+    "sha256": "c58478de7c563ed17a3ceebb82634b9b976488574dadfb23dc239f4a04ba53a1"
+  },
+  {
+    "file": "binding-preflight/handoff.md",
+    "source_batch": "strata-binding-preflight-20261030-1",
+    "sha256": "86df3751c08068d2f648baeee49ebac610b34b843852b77cce01b547dc3c5319"
+  },
+  {
+    "file": "binding-preflight/full-results.json",
+    "source_batch": "strata-binding-preflight-20261030-1",
+    "sha256": "f7d66321aa37bf35b942505bbd885f12947dfb813e220f7ecfa8d678fe2fc7f3"
+  },
+  {
+    "file": "binding-preflight/package-control.json",
+    "source_batch": "strata-binding-preflight-20261030-1",
+    "sha256": "7d06c10007c0136afaefa2d12ba5cb803ca2255ecc355d05ba4c2260a56a2704"
+  },
+  {
+    "file": "original-sequential/decision.json",
+    "source_batch": "strata-sequential-use-20261030-1",
+    "sha256": "98761e9112f9f17f9f2c8c441d1868a393491e9b6b0dab9c69c83bdf8168a725"
+  },
+  {
+    "file": "original-sequential/handoff.md",
+    "source_batch": "strata-sequential-use-20261030-1",
+    "sha256": "e0acbd977eb2b4572c31c1bd308f3f352d5061bd7d2a099ac6a1c84b8321e8ce"
+  },
+  {
+    "file": "original-sequential/diagnosis-addendum.json",
+    "source_batch": "strata-sequential-use-20261030-1",
+    "sha256": "5ae34bcd3412e86ecb4730cfa3d44a4b854e4bee9403ceb746bb96719ab962ec"
+  },
+  {
+    "file": "corrected-sequential/decision.json",
+    "source_batch": "strata-sequential-use-contract-corrected-20261030-1",
+    "sha256": "4e5bb3b55499303155818f3897c9b0286bed15cbe1b1b52a5a391a78acc5f933"
+  },
+  {
+    "file": "corrected-sequential/handoff.md",
+    "source_batch": "strata-sequential-use-contract-corrected-20261030-1",
+    "sha256": "3f0f39e94845375064018aaceddb0e2830cb7faf24d3e11744a66cc2f6cd65e9"
+  },
+  {
+    "file": "corrected-sequential/u1-decision.json",
+    "source_batch": "strata-sequential-use-contract-corrected-20261030-1",
+    "sha256": "ccb4de4161b45388fc7d060af1a8d2bab8b85b3af8fb1519cedbb13062b8c147"
+  },
+  {
+    "file": "corrected-sequential/u2-decision.json",
+    "source_batch": "strata-sequential-use-contract-corrected-20261030-1",
+    "sha256": "2816063cf7d4dbc02f3ef62df4186dc37872d72236e9d15e5421d6f589f23400"
+  },
+  {
+    "file": "corrected-sequential/u2-completion-counterexample.json",
+    "source_batch": "strata-sequential-use-contract-corrected-20261030-1",
+    "sha256": "619eb7ca4a16dd0ddf35425926ea171153f7eed48bc562a706e84bb9b20d47dc"
+  }
+]

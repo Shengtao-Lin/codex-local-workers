@@ -241,6 +241,245 @@ class RequiredTestReadClient:
 
 
 class ExplorerRuntimeTests(unittest.TestCase):
+    def test_locator_completion_obligations_survive_report_only_recovery(self):
+        for omit_caller in (False, True):
+            with self.subTest(omit_caller=omit_caller), TemporaryDirectory() as directory:
+                root = Path(directory)
+                self.make_tree(root)
+                (root / "caller.py").write_text("from greeting import build_greeting\n")
+                paths = ["greeting.py", "caller.py", "tests/test_greeting.py"]
+                refs = [
+                    {
+                        "path": path,
+                        "start_line": 1,
+                        "end_line": 1,
+                        "kind": "test" if path.startswith("tests/") else "implementation",
+                    }
+                    for path in paths
+                    if not (omit_caller and path == "caller.py")
+                ]
+                actions = [
+                    *({"action": "READ_FILE", "path": path} for path in paths),
+                    {"action": "READ_FILE", "path": "caller.py"},
+                    {"action": "FINISH_SUCCESS", "source_refs": refs, "uncertainties": []},
+                ]
+
+                class Client:
+                    def __init__(self):
+                        self.messages = []
+
+                    def complete(self, messages):
+                        self.messages.append(messages)
+                        return json.dumps(actions[len(self.messages) - 1])
+
+                client = Client()
+                runtime = RUNTIME.ExplorerRuntime(
+                    root,
+                    "Locate implementation, caller and tests.",
+                    {
+                        "explorer_mode": "locate",
+                        "explorer_required_citation_paths": paths,
+                        "explorer_duplicate_action_report_recovery": True,
+                    },
+                    client,
+                )
+                result = runtime.run()
+                prompt = client.messages[-1][0]["content"]
+                self.assertIn("Trusted required citation paths", prompt)
+                self.assertIn(json.dumps(paths), prompt)
+                self.assertIn("Distinct unit", prompt)
+                self.assertTrue(
+                    any("REPORT_ONLY_RECOVERY" in m["content"] for m in client.messages[-1])
+                )
+                self.assertEqual(len(client.messages), 5)
+                self.assertEqual(result["status"], "failed" if omit_caller else "success")
+                if omit_caller:
+                    self.assertIn("missing required paths", result["failure_reason"])
+
+    def test_locator_eof_and_read_but_uncited_integration_are_not_filled_in(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            (root / "tests/test_greeting.py").write_text(
+                "def test_unit(): pass\ndef test_roundtrip(): pass\n", encoding="utf-8"
+            )
+            runtime = RUNTIME.ExplorerRuntime(
+                root,
+                "Locate both tests.",
+                {
+                    "explorer_mode": "locate",
+                    "explorer_required_source_anchors": [
+                        {"path": "tests/test_greeting.py", "text": "def test_roundtrip"}
+                    ],
+                },
+                FailIfCalledClient(),
+            )
+            runtime.read_file({"path": "tests/test_greeting.py"})
+            ref = {
+                "path": "tests/test_greeting.py",
+                "start_line": 1,
+                "end_line": 20,
+                "kind": "test",
+            }
+            args = {"source_refs": [ref], "uncertainties": []}
+            with self.assertRaisesRegex(RUNTIME.ExplorerError, "file ends at line 2"):
+                runtime.finish_success(args)
+            ref["end_line"] = 1
+            with self.assertRaisesRegex(RUNTIME.ExplorerError, "missing required source anchor"):
+                runtime.finish_success(args)
+            self.assertEqual(args["source_refs"], [ref])
+            ref["end_line"] = 2
+            self.assertEqual(runtime.finish_success(args)["semantic_verdict"], "not_evaluated")
+
+    def test_locator_anchor_config_is_copied_normalized_and_invalid_path_is_preflight(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            anchors = [{"path": "./greeting.py", "text": "build_greeting"}]
+            runtime = RUNTIME.ExplorerRuntime(
+                root,
+                "Locate.",
+                {"explorer_mode": "locate", "explorer_required_source_anchors": anchors},
+                AdaptiveExplorerClient(),
+            )
+            anchors[0]["text"] = "mutated"
+            self.assertEqual(
+                runtime.required_source_anchors, [{"path": "greeting.py", "text": "build_greeting"}]
+            )
+            for path in ("../outside.py", "C:/outside.py", "/outside.py"):
+                with self.subTest(path=path), self.assertRaises(RUNTIME.ExplorerPreflightBlocked):
+                    RUNTIME.ExplorerRuntime(
+                        root,
+                        "Locate.",
+                        {
+                            "explorer_mode": "locate",
+                            "explorer_required_source_anchors": [{"path": path, "text": "anchor"}],
+                        },
+                        AdaptiveExplorerClient(),
+                    )
+
+    def test_locator_anchor_requires_cited_current_line_not_an_uncited_read(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            (root / "greeting.py").write_text(
+                "def build_greeting():\n    return 'hello'\n", encoding="utf-8"
+            )
+            runtime = RUNTIME.ExplorerRuntime(
+                root,
+                "Locate return.",
+                {
+                    "explorer_mode": "locate",
+                    "explorer_required_source_anchors": [
+                        {"path": "greeting.py", "text": "return 'hello'"}
+                    ],
+                },
+                AdaptiveExplorerClient(),
+            )
+            runtime.read_file({"path": "greeting.py"})
+            args = {
+                "source_refs": [
+                    {
+                        "path": "greeting.py",
+                        "start_line": 1,
+                        "end_line": 1,
+                        "kind": "implementation",
+                    }
+                ],
+                "uncertainties": [],
+            }
+            before = dict(runtime.displayed_line_numbers)
+            with self.assertRaises(RUNTIME.ExplorerSourceReferenceError) as caught:
+                runtime.finish_success(args)
+            self.assertEqual(caught.exception.category, "missing_required_anchor")
+            self.assertEqual(caught.exception.read_paths, ())
+            self.assertEqual(runtime.displayed_line_numbers, before)
+            args["source_refs"][0]["end_line"] = 2
+            result = runtime.finish_success(args)
+            self.assertEqual(result["semantic_verdict"], "not_evaluated")
+            (root / "greeting.py").write_text(
+                "def build_greeting():\n    return 'changed'\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(RUNTIME.ExplorerError, "changed since"):
+                runtime.finish_success(args)
+
+    def test_locator_unread_anchor_provides_navigation_without_read_coverage(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            (root / "greeting.py").write_text(
+                "def build_greeting():\n    return 'hello'\n", encoding="utf-8"
+            )
+            runtime = RUNTIME.ExplorerRuntime(
+                root,
+                "Locate return.",
+                {
+                    "explorer_mode": "locate",
+                    "explorer_required_source_anchors": [
+                        {"path": "greeting.py", "text": "return 'hello'"}
+                    ],
+                },
+                AdaptiveExplorerClient(),
+            )
+            runtime.read_file({"path": "greeting.py", "start_line": 1, "end_line": 1})
+            with self.assertRaises(RUNTIME.ExplorerSourceReferenceError) as caught:
+                runtime.finish_success(
+                    {
+                        "source_refs": [
+                            {
+                                "path": "greeting.py",
+                                "start_line": 1,
+                                "end_line": 1,
+                                "kind": "implementation",
+                            }
+                        ],
+                        "uncertainties": [],
+                    }
+                )
+            self.assertEqual(caught.exception.read_paths, ("greeting.py",))
+            self.assertNotIn(2, runtime.displayed_line_numbers["greeting.py"])
+            self.assertIn("Navigation lines: [2]", str(caught.exception))
+
+    def test_locator_anchor_config_is_bounded_and_changes_cache_obligations(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            base = {"explorer_mode": "locate"}
+            first = RUNTIME.ExplorerRuntime(root, "Locate.", base, AdaptiveExplorerClient())
+            anchors = [{"path": "greeting.py", "text": "build_greeting"}]
+            second = RUNTIME.ExplorerRuntime(
+                root,
+                "Locate.",
+                {**base, "explorer_required_source_anchors": anchors},
+                AdaptiveExplorerClient(),
+            )
+            self.assertNotEqual(first.cache_task, second.cache_task)
+            self.assertIn("location obligations, not semantic proof", second.system_prompt())
+            for invalid in (
+                None,
+                "anchor",
+                anchors * 7,
+                [{"path": "greeting.py", "text": "a\nb"}],
+                [{"path": "greeting.py", "text": "a", "extra": True}],
+            ):
+                with (
+                    self.subTest(invalid=invalid),
+                    self.assertRaises(RUNTIME.ExplorerPreflightBlocked),
+                ):
+                    RUNTIME.ExplorerRuntime(
+                        root,
+                        "Locate.",
+                        {**base, "explorer_required_source_anchors": invalid},
+                        AdaptiveExplorerClient(),
+                    )
+            with self.assertRaises(RUNTIME.ExplorerPreflightBlocked):
+                RUNTIME.ExplorerRuntime(
+                    root,
+                    "Investigate.",
+                    {"explorer_required_source_anchors": anchors},
+                    AdaptiveExplorerClient(),
+                )
+
     def test_filename_search_hint_does_not_claim_source_evidence(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -584,6 +823,83 @@ class ExplorerRuntimeTests(unittest.TestCase):
             self.assertIn("citations", client.requests[-1][2])
             self.assertEqual(client.native_tools, RUNTIME.EXPLORER_TOOLS)
             self.assertEqual(client.native_tool_choice, "auto")
+
+    def test_missing_required_dependency_can_be_read_before_report_repair(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            (root / "dependency.py").write_text("dependency = 1\n", encoding="utf-8")
+            paths = ["greeting.py", "tests/test_greeting.py", "dependency.py"]
+
+            def report(cited):
+                return {
+                    "action": "FINISH_SUCCESS",
+                    "relevant_files": ["greeting.py"],
+                    "relevant_tests": ["tests/test_greeting.py"],
+                    "call_flow": [],
+                    "findings": [],
+                    "uncertainties": [],
+                    "citations": [
+                        {"path": p, "line": 1, "claim": "observed source"} for p in cited
+                    ],
+                }
+
+            actions = [
+                *({"action": "READ_FILE", "path": p} for p in paths[:2]),
+                report(paths[:2]),
+                {"action": "READ_FILE", "path": "dependency.py"},
+                # All sources now read: a formatting mistake retains report-only repair.
+                report(paths[:2]),
+                report(paths),
+            ]
+
+            class Client:
+                native_tools = RUNTIME.EXPLORER_TOOLS
+                native_tool_choice = "auto"
+
+                def __init__(self):
+                    self.allowed = []
+
+                def complete(self, _messages):
+                    self.allowed.append([t["function"]["name"] for t in self.native_tools])
+                    return json.dumps(actions[len(self.allowed) - 1])
+
+            client = Client()
+            runtime = RUNTIME.ExplorerRuntime(
+                root,
+                "Inspect implementation, tests and required dependency.",
+                {"explorer_mode": "investigate", "explorer_required_citation_paths": paths},
+                client,
+            )
+            result = runtime.run()
+            self.assertEqual(result["status"], "success")
+            self.assertIn("dependency.py", runtime.read_files)
+            self.assertIn("READ_FILE", client.allowed[3])
+            self.assertEqual(client.allowed[-1], ["FINISH_SUCCESS"])
+            self.assertEqual(result["budget_usage"]["protocol_errors"], 2)
+
+    def test_missing_required_dependency_does_not_waive_turn_limit(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_tree(root)
+            client = FinishRepairClient()
+            runtime = RUNTIME.ExplorerRuntime(
+                root,
+                "Inspect required dependency within the fixed budget.",
+                {
+                    "explorer_required_citation_paths": [
+                        "greeting.py",
+                        "tests/test_greeting.py",
+                        "dependency.py",
+                    ],
+                    "max_explorer_turns": 3,
+                },
+                client,
+            )
+            result = runtime.run()
+            self.assertEqual(result["status"], "failed")
+            self.assertNotIn("dependency.py", runtime.read_files)
+            self.assertEqual(len(client.requests), 3)
 
     def test_invalid_finish_repair_survives_no_evidence_boundary(self) -> None:
         with TemporaryDirectory() as directory:

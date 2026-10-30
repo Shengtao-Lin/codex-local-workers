@@ -92,6 +92,12 @@ def evaluate_task_state(state: dict[str, Any]) -> dict[str, Any]:
             "reason": "the Coder result passed runtime gates and needs independent Local Reviewer",
             "streaks": {},
         }
+    if latest.get("result") == "validation_passed_pending_review":
+        return {
+            "decision": "primary_decision",
+            "reason": "Versioned host facts need the opt-in handoff verifier before local review; not a legacy success",
+            "streaks": {},
+        }
     if latest.get("worker") == "reviewer":
         if latest.get("result") == "pass_to_primary":
             route = latest.get("review_route", "primary_full_review")
@@ -102,8 +108,8 @@ def evaluate_task_state(state: dict[str, Any]) -> dict[str, Any]:
             }
         if latest.get("result") == "rework":
             return {
-                "decision": "bounded_coder_rework",
-                "reason": "Local Reviewer produced structured findings for the same unit",
+                "decision": "primary_adjudicate_review_findings",
+                "reason": "Reviewer findings need explicit Primary disposition before rework",
                 "streaks": {},
             }
         if latest.get("result") == "escalate":

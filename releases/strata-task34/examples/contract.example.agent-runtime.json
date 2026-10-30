@@ -1,0 +1,164 @@
+{
+  "schema_version": 1,
+  "task_id": "tool-unregister-corrected-1",
+  "feature_id": "tool-unload-reload",
+  "kind": "implement",
+  "goal": "Support unloading and reloading a registered tool through ToolRegistry.unregister(name: str) -> ToolDefinition. The removed registration disappears from future lookups and definitions, while already-started calls retain their original handler. Preserve the accepted definition snapshot ownership and all existing tool behavior. Add meaningful tests only in the approved new file.",
+  "deliverable": "Scoped implementation passing complete checks, fresh review and independent acceptance.",
+  "scope": {
+    "read": [
+      "src/agent_runtime",
+      "tests/unit/test_worker_tool_unregister.py",
+      "tests/unit/test_tools.py",
+      "tests/unit/test_tool_payloads.py",
+      "tests/unit/test_tool_snapshot_contract.py",
+      "tests/unit/test_worker_tool_snapshot.py",
+      "tests/unit/test_tool_unregister_contract.py",
+      "tests/conftest.py",
+      "pyproject.toml",
+      "README.md"
+    ],
+    "readonly": [
+      "tests/unit/test_tools.py",
+      "tests/unit/test_tool_payloads.py",
+      "tests/unit/test_tool_snapshot_contract.py",
+      "tests/unit/test_worker_tool_snapshot.py",
+      "tests/unit/test_tool_unregister_contract.py",
+      "tests/conftest.py",
+      "pyproject.toml",
+      "README.md"
+    ],
+    "modify": [
+      "src/agent_runtime/tools/registry.py"
+    ],
+    "create": [
+      "tests/unit/test_worker_tool_unregister.py"
+    ],
+    "forbidden": [
+      ".agent",
+      ".local-agents",
+      ".git",
+      "private"
+    ]
+  },
+  "risk": {
+    "feature": "high",
+    "unit": "high",
+    "integration": "high",
+    "reasons": [
+      "Public plugin lifecycle, in-flight invocation identity and removal/re-registration boundaries."
+    ]
+  },
+  "dependencies": [
+    "tool-snapshot-1"
+  ],
+  "owned_contract_ids": [
+    "remove",
+    "unknown",
+    "inflight",
+    "compatible-register",
+    "compatible-definitions",
+    "compatible-invoke"
+  ],
+  "required_behavior": [
+    {
+      "id": "remove",
+      "text": "Add unregister(name: str) -> ToolDefinition. Removing an existing registered name returns its original metadata as a normal mutable independent snapshot and removes it from subsequent definitions and invoke lookups. Remaining tools stay in stable sorted order and continue working. Previously returned snapshots remain independent.",
+      "risk_floor": "high",
+      "implementation_ref": {
+        "path": "src/agent_runtime/tools/registry.py",
+        "symbol": "ToolRegistry.unregister"
+      }
+    },
+    {
+      "id": "unknown",
+      "text": "Unknown-name removal raises the existing ToolNotFoundError and does not change the registry; no exact exception-message requirement.",
+      "risk_floor": "high",
+      "implementation_ref": {
+        "path": "src/agent_runtime/tools/registry.py",
+        "symbol": "ToolRegistry.unregister"
+      }
+    },
+    {
+      "id": "inflight",
+      "text": "An invocation whose original handler has already started is not cancelled or redirected by removal or re-registration. New lookup after removal raises ToolNotFoundError; after the same name is registered again, new invocation uses the replacement handler and new discovery metadata. This task does not promise multi-threaded atomicity or stop side effects of an already-running handler.",
+      "risk_floor": "high",
+      "implementation_ref": {
+        "path": "src/agent_runtime/tools/registry.py",
+        "symbol": "ToolRegistry.invoke"
+      }
+    },
+    {
+      "id": "compatible-register",
+      "text": "Preserve existing register/definitions/invoke signatures, ownership behavior, validation, hooks, timeouts and errors. Do not change protected tests, dependencies or external I/O. Supplemental assertions must follow these public behaviors, not exact error messages or incidental implementation shape.",
+      "risk_floor": "high",
+      "implementation_ref": {
+        "path": "src/agent_runtime/tools/registry.py",
+        "symbol": "ToolRegistry.register"
+      }
+    },
+    {
+      "id": "compatible-definitions",
+      "text": "Preserve existing register/definitions/invoke signatures, ownership behavior, validation, hooks, timeouts and errors. Do not change protected tests, dependencies or external I/O. Supplemental assertions must follow these public behaviors, not exact error messages or incidental implementation shape.",
+      "risk_floor": "high",
+      "implementation_ref": {
+        "path": "src/agent_runtime/tools/registry.py",
+        "symbol": "ToolRegistry.definitions"
+      }
+    },
+    {
+      "id": "compatible-invoke",
+      "text": "Preserve existing register/definitions/invoke signatures, ownership behavior, validation, hooks, timeouts and errors. Do not change protected tests, dependencies or external I/O. Supplemental assertions must follow these public behaviors, not exact error messages or incidental implementation shape.",
+      "risk_floor": "high",
+      "implementation_ref": {
+        "path": "src/agent_runtime/tools/registry.py",
+        "symbol": "ToolRegistry.invoke"
+      }
+    }
+  ],
+  "acceptance_criteria": [
+    {
+      "id": "complete",
+      "text": "All project checks, protected lifecycle tests, fresh Reviewer and independent Primary acceptance must pass.",
+      "risk_floor": "high"
+    }
+  ],
+  "implementation": {
+    "edit_targets": [
+      {
+        "path": "src/agent_runtime/tools/registry.py",
+        "anchor": "class ToolRegistry:"
+      }
+    ],
+    "focused_tests": [
+      "tests/unit/test_tool_unregister_contract.py",
+      "tests/unit/test_tools.py",
+      "tests/unit/test_tool_payloads.py",
+      "tests/unit/test_worker_tool_unregister.py"
+    ],
+    "supplemental_tests": [
+      "tests/unit/test_worker_tool_unregister.py"
+    ],
+    "validation_profile": "project-strict",
+    "required_order": [
+      "An already-started invocation retains the original registration through completion while future lookup observes removal/re-registration."
+    ],
+    "forbidden_orderings": [
+      "Do not cancel or redirect an already-started invocation as a side effect of unregister; do not allow future invocation of a removed registration before replacement."
+    ],
+    "acceptance_scenarios": [
+      {
+        "id": "remove",
+        "text": "Remove one tool, preserve another and sorted discovery."
+      },
+      {
+        "id": "unknown",
+        "text": "Unknown removal raises stable error without mutation."
+      },
+      {
+        "id": "reload",
+        "text": "Same name re-registers with new metadata/handler;old snapshot and running call remain original."
+      }
+    ]
+  }
+}

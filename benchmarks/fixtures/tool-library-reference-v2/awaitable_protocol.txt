@@ -1,0 +1,36 @@
+Read-only selected CPython 3.12 excerpts; not an executable replacement module.
+# inspect.py:468-473
+def isawaitable(object):
+    """Return true if object can be passed to an ``await`` expression."""
+    return (isinstance(object, types.CoroutineType) or
+            isinstance(object, types.GeneratorType) and
+                bool(object.gi_code.co_flags & CO_ITERABLE_COROUTINE) or
+            isinstance(object, collections.abc.Awaitable))
+
+# _collections_abc.py:131-143 (selected class portion)
+class Awaitable(metaclass=ABCMeta):
+
+    __slots__ = ()
+
+    @abstractmethod
+    def __await__(self):
+        yield
+
+    @classmethod
+    def __subclasshook__(cls, C):
+        if cls is Awaitable:
+            return _check_methods(C, "__await__")
+        return NotImplemented
+
+# _collections_abc.py:104-114
+def _check_methods(C, *methods):
+    mro = C.__mro__
+    for method in methods:
+        for B in mro:
+            if method in B.__dict__:
+                if B.__dict__[method] is None:
+                    return NotImplemented
+                break
+        else:
+            return NotImplemented
+    return True

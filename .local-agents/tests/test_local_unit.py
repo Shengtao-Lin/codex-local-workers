@@ -18,6 +18,34 @@ SPEC.loader.exec_module(UNIT)
 
 
 class HandoffTests(unittest.TestCase):
+    def test_legacy_reviewer_rework_never_authorizes_another_coder(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            coder, _ = self.fixture(root)
+            coder_path, reviewer_path = root / "coder.json", root / "reviewer.json"
+            calls = []
+
+            def fake_run(argv, **kwargs):
+                calls.append(argv)
+                data = (
+                    coder
+                    if len(calls) == 1
+                    else {"decision": "rework", "next_action_required": "bounded_coder_rework"}
+                )
+                path = coder_path if len(calls) == 1 else reviewer_path
+                path.write_text(json.dumps(data), encoding="utf-8")
+                return Mock(returncode=0, stderr="")
+
+            with patch.object(UNIT.subprocess, "run", side_effect=fake_run):
+                code, result = UNIT.run_unit(
+                    root, root / "packet.json", root / "config.json", coder_path, reviewer_path
+                )
+            self.assertEqual(code, 0)
+            self.assertEqual(result["reviewer_decision"], "rework")
+            self.assertEqual(result["next_action_required"], "primary_adjudicate_review_findings")
+            self.assertFalse(result["automatic_coder_rework_authorized"])
+            self.assertEqual(len(calls), 2)
+
     def test_v13_legacy_contract_ids_remain_compatible_at_handoff(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory).resolve()

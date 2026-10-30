@@ -1,15 +1,22 @@
 # codex-local-workers
 
+For the current **Strata supervised coding trial (task.34)**, start with the
+[quickstart](docs/strata-quickstart.md) and
+[checkpoint evidence and limitations](docs/strata-task34-checkpoint.md).
+The [frozen bundle](releases/strata-task34/README.md) is versioned here;
+general autonomous use and the full investigation gate remain HOLD.
+
 Run scoped Python coding tasks with local LM Studio models while Codex handles
 planning, review and final acceptance.
 
 Codex remains the Primary Agent: it owns user intent, architecture, scope, Git
 operations, review, broader validation, and final acceptance. The local
 Explorer performs read-only repository investigation. The local Coder receives
-a schema-version-2 implementation packet and can only use bounded read, search,
-edit, and validation actions implemented by the runtime. A separate read-only
-Local Reviewer examines actual diffs and runtime evidence before risk-routed
-Primary review.
+a schema-version-2 implementation packet. In the qualified opt-in bounded profile,
+it proposes a scoped function replacement or reports a concrete blocker; the host
+applies changes, formats, checks and provides bounded repair feedback. The older
+action-loop protocol remains available separately. A fresh read-only Local
+Reviewer examines actual implementation and runtime evidence before Primary review.
 
 ## Why this exists
 
@@ -30,13 +37,51 @@ Codex Primary
 
 ## What you can use
 
-- Explorer locates source and tests with file/line evidence.
-- Coder reads, searches, edits authorized files and runs configured validation.
-- Reviewer independently checks the actual diff and can run registered tests
-  and static checks in a fresh context.
-- Optional Coordinator prepares bounded execution proposals for an approved
-  feature. Each step requires Primary authorization; completion returns to
-  Primary for acceptance.
+An independent [Strata implementation-subagent preview](docs/strata-preview.md)
+now has a create-only installer and a frozen, separately tested local-native
+entry. It uses host-owned edits/checks and full Primary final review, not the
+LM Studio E/C/R route or automatic acceptance. Qualification is limited to the
+recorded single-function families; no general coding or cloud-savings claim.
+The default configuration below is unchanged.
+
+For the current opt-in Strata development candidate, see the
+[supervised quickstart](docs/strata-quickstart.md),
+[architecture and boundaries](docs/strata-architecture.md),
+[supervised usage guide](docs/strata-supervised-usage.md), and
+[next-step plan](docs/strata-supervised-next-step.md). These describe the current
+supervised coding and bounded rework; they do not replace the published preview,
+change the LM Studio defaults, or establish general autonomous qualification.
+
+Current evidence supports **limited supervised use, not general autonomous
+coding**. For the explicitly tested single-function path, use
+[`local-bounded-prepare.py` and `local-bounded-unit.py`](.local-agents/host-proposal.md)
+with the approved `bounded-v1` / `flat-v1` profile. Installation does not select
+that profile. The legacy action-loop commands below remain available, but their
+presence is not a qualification claim for arbitrary tasks.
+
+Qualification follows the recorded contract/task family, not just a function's
+size or a model's name. A passing identity-normalization task does not establish
+integer-zero/falsy-value repair capability. Unknown families need an isolated
+trial or Primary implementation; a failed unit is not retried unchanged until it
+gets a favorable review. No cloud-usage savings have been measured yet.
+
+- Explorer's qualified location mode returns source/test evidence; causal
+  diagnosis is not generally qualified.
+- Bounded Coder can repair within fixed request/edit/check limits. The host runs
+  every configured check after each effective edit; the model cannot declare success.
+- Bounded Reviewer receives independently assembled source, diff and observed
+  checks in a fresh context. It reports to Primary, not automatic acceptance;
+  neither passing checks nor a report proves all unknown defects were detected.
+- Optional [decomposition-only Coordinator](.local-agents/coordinator-bounded.md)
+  proposes units and dependencies from a detailed Primary brief. The host suggests
+  owners from the exact Primary-qualified catalog. The explicit proposal command
+  does not approve or dispatch; Primary still controls each execution and acceptance.
+
+The tested two-unit snapshot chains establish repeatability of known contracts,
+not reliable decomposition from vague plans or general multi-file implementation.
+Contracts/tests, qualification, dependency transfer and final review still require
+Primary preparation. Copying a completed run to another directory does not move
+its validation authority: executed command paths remain bound to the original run.
 
 The default configuration uses OSS Explorer, Qwen Coder and Muse Reviewer;
 the optional Coordinator also uses Muse in an independent context. Model IDs

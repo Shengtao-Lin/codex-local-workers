@@ -1,0 +1,8 @@
+{
+  "driver_sha256": "6d64ec5144b48c8eca9e326332c37fc14a2095c5f6a2ccfc33efccadeb418d91",
+  "transitive_local_imports_verified": true,
+  "retained_failed_preparations": [
+    "real-adapter-datetime-trial-1",
+    "real-adapter-datetime-trial-2"
+  ]
+}

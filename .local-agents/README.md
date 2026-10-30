@@ -6,6 +6,88 @@ The local workers call LM Studio's OpenAI-compatible chat endpoint directly.
 `reviewer-runtime.py` performs an independent read-only review of completed
 Coder runs.
 
+For explicitly configured bounded execution, use `local-bounded-unit.py` and
+the `flat-v1` compatibility profile described in [host-proposal.md](host-proposal.md).
+This profile sends flat `kind`/`content` Coder proposals and selects direct
+Reviewer reports while reusing the same editor, checks and acceptance gates.
+It remains opt-in; installing the kit does not select it or qualify new task
+families. CLI model loading can separately use `model_load_ack_policy: "api_verified"`
+to verify native readiness after a CLI timeout. The default loading policy is unchanged.
+
+`local-bounded-review.py --inspect-only --request <request.json> --config
+<config.json> --report <new-inspection.json>` authenticates the canonical run and
+assembles the actual Reviewer evidence without loading/calling a model or claiming
+its one-shot dispatch. It writes only the requested inspection report, not a
+Reviewer archive or acceptance. Use a new report path for every inspection.
+Real review still rechecks current evidence and claims its original single dispatch;
+inspection cannot reopen an already dispatched run or replace independent review.
+
+The bounded unit entry checks capture policy shape, declared scope/protection,
+target-function binding and pinned interpreter before acquiring a model lease.
+An incompatibility returns `blocked` / `bounded_capture_preflight`, with zero
+model calls, so Primary can correct preparation without retrying the Worker.
+This is not a complete dependency-import check or a passing validation result;
+offline replay and the final canonical evidence gate remain necessary.
+
+### Preparing one already-approved bounded unit
+
+In a fresh isolated workspace, `local-bounded-prepare.py` assembles the capture
+material that previously required manual copies and hashes. It does not author a
+contract, choose tests/dependencies, widen scope, enable a profile, or call a model.
+Supply a complete schema-2 packet, an explicitly selected bounded-v1 project
+configuration, and a capture specification with exactly these fields:
+
+```json
+{
+  "schema_version": 1,
+  "target": {"path": "src/product/code.py", "module": "product.code", "symbol": "merge_labels"},
+  "source_paths": ["src/product/code.py", "src/product/__init__.py", "tests/test_contract.py", "pyproject.toml"],
+  "family": "json-call-model-dump-v1",
+  "cases": [{"args": [{"a": "old"}, {"a": "new"}], "kwargs": {}}]
+}
+```
+
+This example supplies factual inputs, not expected answers. Use the actual
+approved function, complete explicit local dependency list and focused tests.
+The packet must already make `acceptance/capture-policy.json`,
+`acceptance/capture_validation_facts.py`, and
+`acceptance/reviewer_capture_envelope.py` readable and protected readonly.
+Existing project-specific Ruff format/lint, Pyright and actual-observations
+commands must already be configured. Preparation never removes or substitutes
+checks, and retains the registered bounded execution budget.
+
+```powershell
+python -B .local-agents/local-bounded-prepare.py --packet .agent/packet.json --config .agent/config.json --capture-spec .agent/capture-spec.json
+# Explicit create-only application after inspecting the preview:
+python -B .local-agents/local-bounded-prepare.py --packet .agent/packet.json --config .agent/config.json --capture-spec .agent/capture-spec.json --apply
+```
+
+The default preview does not write files or execute commands. Apply creates the
+three capture files and `.agent/prepared/<run_id>/{packet,config,preparation}.json`;
+the packet is copied byte-for-byte and only the task-specific capture-policy hash
+changes in the copied configuration. Original inputs and production defaults
+remain unchanged. Existing destinations, unsafe paths, missing protection and
+stale inputs are rejected. All paths supplied to this entry are workspace-relative.
+An interrupted write may leave partial files; the completion receipt is written
+last, and a retry never overwrites them. Inspect and use a fresh snapshot instead.
+
+Use the reported `next_inputs` for `local-bounded-unit.py --mode preflight` and
+offline replay before live dispatch. Preparation is not passing validation or
+qualification: package-initializer checks are not complete import discovery,
+and actual checks, fresh Reviewer and Primary acceptance still apply. The
+current fixed capture paths support one unit per fresh isolated workspace;
+inheritance and multi-unit in-place preparation are deliberately not supported.
+
+For source-only Explorer questions, Primary may explicitly set
+`explorer_require_test_evidence: false` in the trusted per-call configuration.
+This prevents a phrase such as "no test changes" from creating a mandatory test
+report obligation. Use `true` when test evidence is required; omission retains
+the legacy task-word inference. The obligation is included in the evidence-cache
+identity. Any claimed citation still requires an actual allowed source read.
+For qualified location work prefer the existing `explorer_mode: "locate"` with
+approved paths/symbol anchors: the host returns source excerpts, not a trusted
+model-authored causal verdict. Neither flag grants additional file permissions.
+
 ## Layout and compatibility
 
 The project-local `.local-agents` directory is the default installation and
@@ -75,8 +157,11 @@ policy coordinates this kit's CLIs, not unrelated LM Studio clients.
 Run all runtime tests with a Python environment that has pytest installed:
 
 ```powershell
-python -m unittest discover -s .local-agents/tests -p "test_*.py" -v
+python -B -m pytest -q .local-agents/tests
 ```
+
+This collects both unittest-style and pytest fixture-based controls. Running only
+unittest discovery omits the pytest-style Coordinator and bounded-entry controls.
 
 `test_e2e_pipeline.py` starts a scripted loopback LM Studio-compatible HTTP
 server and exercises the real Explorer, Coder, inherited rework, pytest
@@ -374,3 +459,56 @@ Native LM Studio model keys and loaded-instance ids can differ. Readiness reuses
 the resident instance of the matching model key while retaining the configured
 context floor; it does not reload merely because an instance has an alias id.
 The role lease still enforces exactly one resident managed model instance.
+
+## Limited, capability-routed Coordinator entry
+
+`coordinator-limited.py` is an opt-in, explicitly supervised entry. It does not
+replace `coordinator-supervised.py` or change the default `coordinator_enabled`.
+It is qualified only for the named small transformations and sequential async
+collection/receipt contracts tested with this kit. Classification remains
+Primary-owned; unknown task families require a Primary decision, not a local retry.
+No general semantic reliability or cloud-cost saving is established.
+
+Primary supplies a schema-1 brief with `acceptance_catalog`, complete
+`capability_catalog`, and hashes of writable and protected inputs. Each capability
+entry has `owner`, `route` (`direct_local` or `primary_owned`), exact `modify`
+paths, and qualification `evidence`. The model cannot add qualification. Primary
+must review both the actual task's fit and the proposed ownership/dependencies.
+New file creation is not qualified in this entry. Do not label an unsupported
+task as qualified merely to make its dispatch pass.
+
+Use a project-specific configuration with `single_model_residency: true`, the
+existing local models, and required project lint/format checks. The tested modes
+are `explorer_answer_protocol: true`, `reviewer_evidence_ids: true`,
+`reviewer_assessment_protocol: true`, and `coder_typed_action_arguments: true`.
+Set `coordinator_enabled: true` only in this explicitly selected test config.
+Installation does not copy or overwrite `config.json`.
+
+From the target repository, with all Primary JSON inputs under `.agent`:
+
+```powershell
+$python = '.\.venv\Scripts\python.exe'
+$entry = '.local-agents\coordinator-limited.py'
+& $python -B $entry propose --brief .agent/brief.json --context .agent/context.json --proposal .agent/proposal.json --config .agent/config.json --authorize-step
+# Inspect the untrusted proposal and review ownership, atomic contracts and tests.
+& $python -B $entry approve --brief .agent/brief.json --proposal .agent/proposal.json --approval .agent/approval.json --config .agent/config.json --authorize-step --note 'Primary reviewed qualification, contracts and dependencies'
+# Primary materializes one bounded packet using coordinator-contract.py.
+& $python -B $entry dispatch --brief .agent/brief.json --proposal .agent/proposal.json --approval .agent/approval.json --config .agent/config.json --refs .agent/accepted-refs.json --packet .agent/unit-packet.json --authorize-step
+```
+
+An initial `accepted-refs.json` is `{}`. Dispatch runs the installed `local-unit.py`
+and its automatic fresh Reviewer, never acceptance. Primary inspects the real
+diff and current validation, records the immutable `record-review.py` decision,
+and supplies the selected canonical `{task_id, run_id}` reference for that unit.
+Only then can a separately authorized dependent step start. Primary-owned units
+use the fixed Primary review path and hashed passing test/lint/format receipts,
+not synthetic local-worker credit. After all units, run independent integration
+checks and perform final risk-routed review. `inspect` verifies selected records
+and current source hashes but does not claim integration or feature acceptance.
+
+Approvals bind brief, proposal, plan, configuration and installed runtime bytes.
+Contract/config/runtime drift, unaccepted dependencies, stale evidence, and
+duplicate dispatch fail closed. A started, failed or interrupted step is not
+replayed automatically: retain its archive and ask Primary to adjudicate a new
+reviewed identity. These checks assume trusted Primary files and a trusted local
+repository; they are not a security boundary against the host user.
