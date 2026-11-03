@@ -1,0 +1,30 @@
+{
+  "reason": "Preserve exact pre-edit documents including user/uncommitted changes; no experiment histories rewritten",
+  "files": [
+    {
+      "path": "docs/strata-architecture.md",
+      "sha256": "95660f5ab7bba14695abdb4770fb4eaae5d763cdfe7986c2185b9c0a675112f5"
+    },
+    {
+      "path": "docs/strata-supervised-next-step.md",
+      "sha256": "0a594b484467cb539f246ce42fc0854c3e405b5ae981a281423881244726c889"
+    },
+    {
+      "path": "docs/strata-quickstart.md",
+      "sha256": "2d3717a694f98a08e2281fe2c76b87e8be8bd4f9fe1fde555645d884cd364270"
+    },
+    {
+      "path": "docs/strata-supervised-usage.md",
+      "sha256": "99fadddeaf81423ba5e147c2a9896fc3bb5a03fbd9fb6cb8a7e19fca64ef7aca"
+    },
+    {
+      "path": "docs/strata-skill-manual-loading.md",
+      "sha256": "52e37606773156f49d629929b9ae22766cac9b11a4df81b3a0707146577997a4"
+    },
+    {
+      "path": "strata-skills/source-backed-handoff/SKILL.md",
+      "sha256": "f2c24824d632d23473227cf80f1b5cb209c0b45088307d2b1cbaf85e33d799b4"
+    }
+  ],
+  "published_manifest_sha256": "0263e8d3e49949ede83a849b55c9dd29a465c9bcb4e38b91173b7f7628c6ab6f"
+}

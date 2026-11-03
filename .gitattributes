@@ -2,3 +2,10 @@
 releases/strata-task34/** -text whitespace=cr-at-eol
 # Replay fixtures also carry hashes/provenance for their original bytes.
 benchmarks/fixtures/** -text whitespace=cr-at-eol
+# Release support inputs are packaged as bytes; checkout must not convert them.
+strata-product/** text eol=lf
+strata-skills/** text eol=lf
+tools/package-strata-supervised.py text eol=lf
+tools/strata-setup.py text eol=lf
+tools/prepare-strata-return.py text eol=lf
+docs/strata-practical-contract.md text eol=lf

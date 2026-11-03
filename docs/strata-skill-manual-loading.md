@@ -1,7 +1,9 @@
 # Strata 手动加载技能
 
-当前提供一个技能：[`source-backed-handoff/SKILL.md`](../strata-skills/source-backed-handoff/SKILL.md)，
-版本 0.1.0。它帮助受 Primary 委派的 Worker 自主取证、处理普通失败、交付简洁且
+Primary按任务选择的完整目录见[选择与传递指南](strata-skill-selection.md)，包括新增的行为追踪、
+结构化数据汇总候选；行为追踪已有一次加载实测但报告HOLD，数据技能有一次新切片正确接受，默认均不强制加载。
+本文的安装示例及历史实测针对[`source-backed-handoff/SKILL.md`](../strata-skills/source-backed-handoff/SKILL.md)，
+仓库候选版本 0.1.1。它帮助受 Primary 委派的 Worker 自主取证、处理普通失败、交付简洁且
 可复核的结果；不包含历史测试答案、不授予新权限、不固定某一版 runtime 的预算。
 技能正文使用英文，以保持与现有工具和任务协议一致。
 
@@ -48,9 +50,11 @@ provider、实际工作目录都会影响发现结果。不要仅凭默认路径
 ## 与 kit subagent 的边界
 
 手动安装到 Strata 主会话，不保证独立 harness 创建的 subagent 继承它。
-当前实验只读适配器可以通过批准目录向 `kit_skill` 提供技能，但统一
-`task_contract` 入口尚未透传 `approved_skills`；此路径未修改。文末的最小实测走已有
-只读入口，而不是统一入口或 UI 会话继承。
+当前 task.34 的统一 `task_contract` 入口已为 `kind: investigate` 透传
+`approved_skills`；实现任务仍拒绝非空技能列表。只读配置须显式开启
+`experimental_strata_skills`，每个批准技能使用固定的 `name/description/content`
+字段；宿主校验后才暴露 `kit_skill`。这不是自动继承 UI 技能目录。
+此前“统一入口尚未透传”的说明已过时；文末历史最小实测仍只证明当时的只读入口。
 不要为加载技能绕过入口校验或给 subagent 整个用户目录的读取权限。
 
 正式使用前，需要核对实际 Worker 会话的完整加载记录。若 kit 安装指导内容，
@@ -77,3 +81,43 @@ provider、实际工作目录都会影响发现结果。不要仅凭默认路径
 该测试的摘要要求 900 字符，实际 936；宿主仍采用全局 6,000 上限，因此完整合同
 未通过。加载成功与合同通过继续分开记录，没有补跑或放宽。详情见
 [该批交接](../benchmarks/work/harness-convergence/strata-skill-tool-smoke-20261025-1/handoff.md)。
+
+## 2026-10-31 输出与技能复核
+
+`compact-transfer-20261031-2` 三题实际请求只有 `kit_read/kit_search/kit_report/kit_block`，
+没有 `kit_skill`，请求中也没有技能正文。因此该批 2 接受、1 回答不完整不能归因于
+本技能的有效或无效。主会话已安装与该 Worker 实际加载是不同事实。
+
+仓库 0.1.1 仅补充“沿明确证据关系完成有条件的必要推导”和“精简不省略题目所需推理”；
+不含历史题目答案，不增加权限或工具。它是待验证候选，未替换用户安装副本，
+未注入旧批次；该次修改时尚无新的模型效果成绩。历史 0.1.0 加载结果保持原样。
+下一次使用应固定正文版本/hash，并检查完整加载结果；不把名称可见当作正文已加载。
+详见[输出与宿主归因复核](strata-output-and-harness-audit.md)。
+
+## 0.1.1 配对结果与当前使用决定
+
+[skill-deduction-20261031-1](../benchmarks/work/skill-deduction-20261031-1/report.md)
+已经完成：三格通过现有只读入口加载完整0.1.1，与冻结正文逐字核对；成本计入原预算。
+无skill组完整接受3/3，有skill组2/3；两组核心答案均正确，有skill一格存在附加证据过度延伸。
+有skill组16请求、125.234秒；无skill组14请求、99.688秒。仅三个配对，任务本身明确要求推导，
+不能证明skill有害，也没有默认强制加载的收益证据。
+
+因此保持0.1.1为显式可选方法指导，当前不继续增加全局提示。权限、版本、预算和验收仍由宿主
+机械执行；必要工具参数保持在真实schema；本次需求留在合同，实验历史不放入skill。
+完整加载可验证，是否有益必须另看任务结果和成本。编码入口目前拒绝approved_skills，
+不能通过UI安装或把技能目录塞进普通read范围来宣称编码技能已接通。
+
+## 专项技能的首次真实调查
+
+[supervised-cooperation-20261031-1](../benchmarks/work/supervised-cooperation-20261031-1/report.md)
+的tool-trace显式加载trace-behavior0.1.0，正文与冻结输入完全一致；4请求、40.954秒，加载成本计入。
+核心调用顺序正确，24条引用有效，但附加“after_tool不能修改返回值”的断言被Primary实际反例证伪，
+完整报告HOLD。Primary另写纠正后的assisted摘要，未反馈重跑或覆盖原结果。
+这是加载与语义正确性分离的新证据，无技能收益对照，不据此修改技能或提升资格。
+
+## 可携带候选中的数据技能
+
+[strata-portable-20261031-1](../benchmarks/work/strata-portable-20261031-1/report.md)从ZIP干净安装后，
+显式传递summarize-structured-data0.1.0。真实加载的全文hash与包内文件一致，18行跨物种数据
+分组/缺失值/汇总全部正确，3请求/35.875秒，Primary无提示或代写。单题没有无技能对照，
+只能证明该任务与传递路径可用，不能宣称一般效果提升；旧Strata安装副本没有自动替换。

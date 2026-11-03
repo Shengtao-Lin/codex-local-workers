@@ -1,0 +1,21 @@
+--- a/strata/general_prepare.py
++++ b/strata/general_prepare.py
+@@ -93,7 +93,8 @@
+             ):
+                 continue
+             editor.resolve(relative)
+-            if path.is_file() and path.suffix.lower() in {
++            explicit_text_input = (target.is_file() and path == target and path.suffix.lower() in {".csv", ".rst"})
++            if path.is_file() and (path.suffix.lower() in {
+                 ".py",
+                 ".toml",
+                 ".json",
+@@ -101,7 +102,7 @@
+                 ".cfg",
+                 ".md",
+                 ".txt",
+-            }:
++            } or explicit_text_input):
+                 if relative in paths:
+                     continue
+                 if len(paths) >= max_files:

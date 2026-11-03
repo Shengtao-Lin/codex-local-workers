@@ -1,104 +1,187 @@
 # Strata 当前推进计划
 
-更新：2026-10-30。用户当前停止线为 weekly used **20%**，每次启动新live前读取
-实际用量；旧计划中的15%/50%等不再是本轮停止线。单模型iq3_s驻留，兄弟仓库与
-Strata安装只读；保留所有既有修改和历史，不commit/push，不改变生产默认。
+更新：2026-10-31。weekly used上限 **30%**，最后观测22%；最新用户指令优先。
+保持iq3_s单驻留，兄弟仓库与Strata安装只读，隔离工作，保留既有改动和历史，
+不commit/push、不改生产默认。此文件是唯一当前执行顺序；旧顺序原样见
+[本次改写前快照](history/strata-design-before-supervised-handoff-20261031/docs/strata-supervised-next-step.md)。
 
-目标保持为通用、受监督的子代理：Primary给目标、合同与权限，Worker自主调查、
-实现、补测试并有界修复，fresh Reviewer后由Primary独立验收。普通错误允许恢复，
-以可靠最终成果、错误接受控制及Primary重复工作量评价，不要求一次正确。
+## 目标与设计决定
 
-## 当前证据
+2026-11-03发布执行授权：用户已批准提交并push当前dev分支，发布0.3.0-supervised.2预发行版，
+随后从真实Release下载到新项目做安装/校准/完整smoke复验。上限仍为weekly50%，初始观测28%。
+此前“不commit/push”和“待发布授权”段落为已被本次明确授权更新的历史，不再作为阻碍；main不改，旧成绩全部保留。
 
-| 项目 | 有效结论 | 记录 |
-| --- | --- | --- |
-| 已发布/推荐入口 | 新隔离编码试用显式选择task.34；整体通用版/调查门槛HOLD，无生产默认升级或自动扩大资格 | [短操作说明](strata-quickstart.md) |
-| 当前实验执行构建 | task.34冻结；629项宿主控制、真实错误合同0调用拒绝、118文件安装/doctor/拒绝覆盖通过；模型侧行为未改 | [候选交接](../benchmarks/work/harness-convergence/strata-binding-preflight-20261030-1/handoff.md) |
-| 调度真实切片 | 两个单元及模拟集成受限接受；真实PostgreSQL未测试 | [交接](../benchmarks/work/harness-convergence/strata-scheduler-clock-20261030-1/handoff.md) |
-| 畸形工具调用 | 恢复后原第一格受限接受；491独立检查通过，数据集错误分类对照通过；旧NOT_RUN保留 | [恢复结果](../benchmarks/work/harness-convergence/strata-malformed-tool-call-20261030-1/decision-resumed.json) |
-| 二进制trace解析与自编测试 | 单元接受、526独立检查通过；模型自修静态问题；完整输入特性因内部过滤不一致HOLD | [单元结果](../benchmarks/work/harness-convergence/strata-binary-trace-20261030-1/handoff.md) |
-| 序列化内部trace过滤 | 单元和输入特性受限接受；635独立检查通过，两个适配器/四种表示的模拟集成通过 | [decision](../benchmarks/work/harness-convergence/strata-serialized-internal-20261030-1/decision.json) |
-| Primary接受记录绑定 | task.33完整620项宿主控制通过，含13项针对性控制；118文件安装及拒绝覆盖通过。同版本完整入口已接受 | [交接](../benchmarks/work/harness-convergence/strata-primary-review-binding-20261030-1/handoff.md) |
-| 实际非变异测试修复 | 固定一格受限接受；6请求/1编辑，fresh Reviewer6请求PASS，独立613项目检查通过且变异被检出，接受记录绑定真实报告 | [decision](../benchmarks/work/harness-convergence/strata-nonmutation-test-20261030-1/decision.json) |
-| 工具定义快照隔离 | task.33标准入口新单元受限接受；10请求/2编辑，真实静态失败自修；559独立检查和三种provider的mock序列化核对通过，无Primary修法 | [decision](../benchmarks/work/harness-convergence/strata-tool-snapshot-20261030-1/decision.json) |
-| 搜索覆盖提示 | 两臂都正确限定搜索范围，未观察到新提示优势；task.32不推进默认 | [A/B](../benchmarks/work/harness-convergence/strata-search-scope-ab-20261030-1/handoff.md) |
-| 新源码回答诊断 | 两题诊断2/2受限接受，分别5/4请求、0纠错；Primary核对完整回答与引用，无正式Reviewer；不满足完整调查迁移门槛 | [decision](../benchmarks/work/harness-convergence/strata-source-answer-transfer-20261030-1/decision.json) |
-| 同安装连续使用 | U1 Coder9请求/3编辑后配置检查通过；Primary写了绑定器不支持的类引用，prepare漏拦，Reviewer无法交付；U1 HOLD、U2 NOT_RUN | [decision](../benchmarks/work/harness-convergence/strata-sequential-use-20261030-1/decision.json) |
-| 正确绑定后的连续使用 | 编码U1受限接受：7Coder/7Reviewer请求、3编辑、一次引用纠错，574独立检查及NativeAgent集成通过。同安装U2执行完成但原回答过度延伸HOLD；旧档案和预算未变 | [decision](../benchmarks/work/harness-convergence/strata-sequential-use-contract-corrected-20261030-1/decision.json) |
+2026-11-03最新：[发布候选0.3.0-supervised.2](strata-release-preparation.md)已可审阅。
+已消除builder对忽略实验目录的依赖，三份可重复构建hash一致，59项支持控制通过；功能文件与已验收setup候选原样。
+当前无活动批次、无新增模型调用，weekly27%/上限50%。不commit/push约束仍保留，待集中发布授权后做真实GitHub全链复验。
 
-这些测试有大量重叠，数量不相加推断独立规模或成功率。实现、审查报告和特性
-集成分别判断。Coordinator未参与，不能由Worker成绩推断其分解任务能力。
+最新安装阶段结论：`strata-bootstrap-20261101-1`已补齐固定Release获取/完整包校验、
+新项目安装与一致安装复用、自动路径发现、服务未开等待、当前计数校准、完整项目基线和AGENTS保留。
+58项离线控制与最终ZIP编码smoke通过（3Coder+4Reviewer、16配置/20独立合并验收），完成后再setup未改任务历史。
+见[安装与校准](strata-installation-and-calibration.md)。本机候选READY；真实GitHub仅旧preview，
+新版远程全链为NOT_RUN_UNPUBLISHED，需要授权发布后复验。weekly最新25%/上限50%，无活动批次，未commit/push。
 
-## 不得被后续通过掩盖的边界
+最新完成：按用户“先修复再跑三题”授权，count-only校准7组精确一致/4负控正确拒绝，
+只在新隔离配置更新3个环境指纹；原task34、iq3_s、合同/范围/检查/预算不变。
+三题3/3独立接受，29本地请求/556.830秒；其中tags首稿被拦后在原额度自主修复，0Primary代写/语义提示。
+见[完成报告](../benchmarks/work/real-project-trial-20261101-1/calibrated-environment-v3/report.md)。
+weekly最后观测25%，上限50%；无活动批次，不commit/push。下一项产品边界为发布前环境预检/自动配置验证，
+本轮不自动新增实验或发布；下述阻塞/未运行仍是保留的历史阶段状态。
 
-- 有限超时原2/2接受已追加更正为1/2 HOLD；异常消息断言越界同时被Reviewer和
-  当时的Primary漏掉。SSE独立CR额外断言的HOLD保持。
-- 聚焦审查能识别异常文案越界，却未正确判定SSE明确排除范围的断言；不给它
-  通用语义资格，也不为此加常驻角色或以重抽PASS放行。
-- Reviewer曾把限定搜索说成唯一调用方；Primary必须核实完整调用方或明确缺口。
-- 宿主检查/引用/哈希证明事实与版本，不证明完整语义。模型自写测试也是交付，
-  Primary按风险审查断言依据；不能把与当前实现一致当作合同授权。
-- 15%停止时的NOT_RUN、准备错误、外层GBK解码、私有测试同名和导入绑定错误等
-  均保留，不能算Worker失败，亦不能隐去Primary准备成本。
+最新试用结果：用户已开启Strata并批准三题live，weekly上限现为50%（开始/结束25%）。
+批次`real-project-trial-20261101-1`第一题在模型前因counter外部源码3项hash失配而conflicted，
+0模型请求/0编辑；其余2题按冻结漂移规则NOT_RUN。见[报告](../benchmarks/work/real-project-trial-20261101-1/report.md)。
+Primary已replan，无活动批次；未修改旧绑定/合同/模型/安装。需先独立核对当前Strata编码兼容性，
+不能以doctor ready替代或直接更新hash绕过。下方“仅离线/等待开启/30%”保留为原准备阶段历史。
 
-## 本轮固定顺序和分支
+2026-11-01新增授权：用户暂未开启Strata，本轮**仅规划和离线准备三项真实源码试用**。
+当前操作说明见[三题试用](strata-real-project-trial.md)，登记批次`real-project-trial-20261101-1`。
+当前weekly实测23%，停止线30%。已冻结相同v1 ZIP、三份原始源码/检查起点和私有验收，
+离线控制通过；所有live为NOT_RUN，未连接服务/核实驻留。等待用户开启后再核对环境并派发。
+此前完成结论与下方历史不变；本次不commit/push。试用顺利后再决定新的Release及自动安装验证。
 
-1. 序列化内部trace已完成，接受只限登记特性；旧解析单元曾发现的集成HOLD不改写。
-   保留全部源码、测试、真实请求和独立验收。不得把后续通过变成旧批次原本通过。
-2. task.33离线回归及安装完成。旧task.31档案被task.33拒绝的原因是安装哈希不同，
-   属于正确跨版本负控，不绕过、不重新绑定旧记录，不算正向资格。
-   以新登记的test-repair-v1实际测试修复验证同版本完整入口；原预算/门槛不变。
-   实际测试应检出调用方bytearray变异，生产源只读；fresh审查和Primary独立终验
-   后才记录接受。准备时误将测试路径绑定为生产实现引用的错误已原样归档，
-   仅修正未注册packet，没有改变候选。若错误拒绝合法同版本流程，只按证据窄修。
-3. 以上成立后，整理一个可直接审查的受监督候选及安装说明，明确支持能力、
-   未准入能力、固定预算、真实调用和一次返工路径；仍不发布或改生产默认。
-   下一次新任务须验证完整行为单元及跨单元不变量，优先复用已有工程检查，
-   降低逐任务参考实现/专用runner的准备负担；不因普通成功扩成大benchmark。
-   此项已形成task.33试用zip及配套manifest，解包哈希核对通过，尚未发布。
-4. 编码与调查分别判断。保持task.33/普通只读协议不变，完成已冻结的ownership、
-   http-error两个新源码问题；无新权限、技能或提示修订。按预登记事实清单与实际
-   原文独立核对，普通错误继续第二格，安全/漂移/驻留或usage停止新格。失败不
-   反复问到正确；通过也只是本批诊断，不满足完整调查迁移门槛，不补写通用资格。
-5. 最新用户要求继续趋近可用版。同安装链已暴露一个确定性Primary输入/prepare缺口。
-   保留原HOLD；只做task.34类引用前置拒绝，先9条负控和宿主回归，不给类声明新增
-   PASS能力。控制通过后，正确绑定的已暴露需求以新registration复测；旧账本不充值、
-   原Reviewer不重抽、不把复测当盲迁移。之后再验证同安装后续任务与重复派发拒绝。
+目标是可靠的受监督子代理：Worker尽量完成完整单元，Primary独立验收，按剩余工作选择合法返工或直接补完。
+最终正确性不降低；独立完成、部分成果复用、Primary补完和最后交付分别计量。
+日常准备复用工程配置，减少专用runner、参考实现、手工hash和逐步指挥。无需为了自主PASS重复刷任务。
 
-## 本阶段结论
+设计整理与后续已登记live均已完成，runtime未改。[架构](strata-architecture.md)是职责和能力依据，
+[短操作说明](strata-quickstart.md)是操作入口，skill按[选择指南](strata-skill-selection.md)显式可选。
+原交接skill保持0.1.1；行为追踪技能实测报告HOLD，数据技能已有一次正确接受，均无一般效果收益证明。
 
-继续推进后，task.34已整理成可使用的**有限受监督编码试用版**：配套zip、实际本机
-配置/合同格式、短操作说明、安装/doctor和成果导出均核对。class引用的Primary输入
-错误现可在模型前拒绝，原HOLD/未运行不改分。正确绑定后的代码单元接受，原预算
-内自修，不由Primary代写。不是通用正式版或净云节约证明。
+## 当前结论：受监督v1完成
 
-同安装实现→调查执行和去重/档案机制通过，但要求原调查回答全部准确的整体门槛
-仍HOLD。调查中的正常完成/after hook过度延伸已用实际反例核实，Primary纠正整合
-单列assisted；不能以代码通过掩盖调查问题，也不能因后续报告问题撤销正确代码。
-这次不再为措辞问题追加提示/新角色或重抽答案。通用目标仍未完成。
+已按新subagent定义完成可携带受监督版本。[版本说明](strata-supervised-v1.md)和
+[逐项审计](strata-supervised-release-audit.md)是当前入口。下述阶段条款保留为历史执行规则，
+不再表示有活动批次。旧自主调查HOLD、模型错误和assisted成绩不变；生产默认未启用。
+目标按“自主执行、有界恢复/Primary补完、独立最终验收”的设计完成，不等于全自主语义放行。
 
-此前四项完成时，task.33作为显式、隔离、受监督的试用候选：完整宿主控制和
-安装通过，同版本实际测试修复及新源码单元均接受，后者在原预算内完成真实提案/
-静态错误恢复；两个只读新问题也分别接受。zip和每批decision/handoff均已落盘。
-冻结候选继续保持，不因后续题目不通过就来回改协议，也不把本阶段当通用正式发布。
+同一ZIP安装后的新编码任务已接受：6Coder请求/3编辑、fresh Reviewer4请求，
+13配置测试/严格Pyright/Ruff，Primary18独立测试及完整diff/补测审查，无Primary提示或代写。
+最终发行物只更新资格元数据/状态文案；再次核对所有manifest文件、安装、防覆盖、真实合同预览和doctor。
+下一步是实际受监督使用与成本观察，遇见新故障再针对性处理，不再自动刷旧题/扩实验。
 
-下一步应使用该原样包承接一个真实需求，以现有工程检查为主并记录准备/协调/
-终验工作，而不是继续为每个单元先写完整参考实现。超出已记录族先隔离；通用调查、
-联网/脚本/递归组合、Coordinator分解及净云收益仍分别未证明，须沿原门槛登记验证。
-普通模型语义错误先保留并确定是否在原合同内，允许的返工只用原封存预算；确认
-机械故障才离线修复并另冻候选。不能用新成功覆盖旧HOLD或为成功而补刷。
+## 最新执行结论（阶段2已完成）
 
-权限、安全或合同重大变化需要用户决定。其余实现与可修复问题自主处理。
-达到20%停止新工作并交接；执行中的批次保留真实终态，不将未运行标成失败。
+[supervised-cooperation-20261031-1](../benchmarks/work/supervised-cooperation-20261031-1/report.md)：
+编码5请求/2编辑，自主修复一次后12项配置测试、严格Pyright和Ruff/format通过，fresh Reviewer通过；
+Primary独立19项通过、canonical accept，无代写或语义反馈。调查4请求、实际加载trace-behavior，
+核心调用顺序正确，但错误断言after_tool无法原地修改结果；Primary反例证伪，原报告HOLD，另行整合为assisted。
+合计13本地请求、306.876秒，不含准备/加载/人工；云成本节省unknown。
 
-## 计量与历史
+本批没有新的live机械故障，不触发阶段3改runtime。当前继续有限编码试用，调查保留实质Primary审查。
+后续真实使用优先复用工程检查和成果，调查重点核对影响结论的可变对象/依赖断言；
+不为这一失败追加skill提示、放宽标准或重跑旧题。下面阶段2条款保留为已执行批次的规则。
 
-记录本地请求、实改、协议恢复、检查/审查/独立验收、真实介入和耗时；Primary的
-合同/测试/定位/语义反馈/代写分别注明。未量测的主动时间、云token、加载时间
-写unknown。没有Primary-only配对和完整用量，不能报告净节省百分比。
+## 当前执行：复用已有只读续作，补齐交互闭环
 
-设计职责见[架构](strata-architecture.md)；未完成的总体能力门槛见
-[完整资格计划](strata-practical-readiness-plan.md)。
-此前完整行动文档已逐字节归档并记录sha256：
-[历史计划](history/strata-supervised-next-step-through-20261030-15pct.md)。
-历史记录中的预算和“当前”是当时快照，当前用户指令及最新有效decision优先。
+用户持续目标是新定义下的稳定subagent，不能把有限编码成功替代整个目标。
+源码复核确认`task-v1`调查续作已存在；上一批是独立调查配置，未选择此通路。
+因此优先复用现有宿主，开发工具只补机械feedback生成，不改runtime或旧任务。
+
+`evidence-continuation-20261031-1`预登记两个新生命周期调查（correlation与message-batch），
+每个首段加一次原合同证据核实；问题在live前封存。任务/配置/来源固定，默认无skill，
+首段4普通请求、全任务8普通请求加至多两次协议报告修复，共原10请求/12证据/16工具/900秒。
+普通失败保留并继续另一独立任务；无资格后段记NOT_ELIGIBLE。两段独立评分，不以续作覆盖首段。
+每次派发前检查weekly30%和单驻留。全部正确且累计账本/版本/权限成立只支持该已有续作组合，
+若语义仍错则分析关键断言；若宿主拒绝本来合法动作，先离线窄修，不改题冲分。
+
+26项开发工具控制和Ruff/format通过，预览及模型驻留通过。
+该批现已结束：首段1/2，续作后2/2，8累计请求/184.625秒；message-batch首段HOLD保留，
+模型按封存问题自行纠正证据等级，无Primary答案或诊断输入。完整结果见
+[报告](../benchmarks/work/evidence-continuation-20261031-1/report.md)。
+
+## 下一步：完整产品准入核对与可携带交付
+
+按[受监督版本完成审计](strata-supervised-release-audit.md)检查整体目标的剩余项：
+先聚焦可选能力的最新有效decision/当前组合限制，再收敛隔离的产品候选，包含准确的Primary指导、
+可选skill选择说明和反馈准备工具，复用现有runtime。安装/导出/反馈控制通过后，
+只为未覆盖的新组合准备必要live。保留旧包/成绩，不改变生产默认、预算或信任边界。
+当前不因两个调查续作通过而宣称整个目标完成。
+
+当前组合复核和可携带RC已完成一部分：
+[能力报告](../benchmarks/work/capability-refresh-20261031-1/report.md)实际2种工具路径均触及，
+报告1接受/1HOLD（孩子对象身份过度推断），9请求/124.203秒；不更改旧失败。
+[RC报告](../benchmarks/work/strata-portable-20261031-1/report.md)完成干净安装、4profile预览、doctor、
+create-only导出及31项支持工具控制；ZIP安装后数据技能完整加载、新18行切片正确接受（3请求/35.875秒）。
+下一项应在同一ZIP安装副本用新的真实编码单元执行完整检查/fresh Reviewer/独立验收，
+并核对产品文档/示例的实际可用性；不以配置预览代替编码live，也不为失败的孩子报告重新抽样。
+
+## 核实后的当前证据
+
+|证据|结论及限制|
+|---|---|
+|[真实JSON深层任务](../benchmarks/work/subagent-handoff-pilot-20261031-1/report.md)|Worker实现及15补测，配置检查和Reviewer PASS；Primary35项行为检查通过，额外Pyright发现类型标注问题。Primary在副本补2行后完整通过，canonical takeover。9调用/233.672秒；无净云节省证明。|
+|[skill三题配对](../benchmarks/work/skill-deduction-20261031-1/report.md)|三次完整加载核对；A完整接受3/3、B2/3，两臂核心答案均正确。没有默认强制skill收益证据；保持可选，不从小样本推断有害。|
+|[跨来源调查](../benchmarks/work/compact-transfer-20261031-2/report.md)|2接受/1不完整，必要推导未完成；不是宿主误拒，旧结果保留。|
+|[读取窗口重放](../benchmarks/work/read-window-native-replay-20261031-1/report.md)|实现路径原124行请求可有界返回120行；无模型重放证明机械改善，不证明旧Click可修好。|
+|[明确CSV/RST输入](../benchmarks/work/explicit-text-input-20261031-1/report.md)|隔离manifest/原生负控通过；原后缀模型live未运行，未纳入发布。|
+|task.34|当前冻结受监督入口；通用版本/完整调查资格HOLD。旧配置、旧失败、辅助返工及未运行保持原口径。|
+
+其余历史索引见[稳定性增量](strata-supervised-stability-update.md)及
+[资格进展](strata-practical-readiness-progress.md)，不同测试不相加成总体成功率。
+
+## 阶段1：对齐工程准备和Primary处置（本次文档阶段）
+
+- 明确accept / 合法rework / Primary补完 / replan的条件，采用架构中的决策表。
+- 检查映射覆盖测试、lint、format、typecheck；使用工程现有命令，记录切片省略的项目检查及原因。
+  格式化和只读检查分开；实际导入来源必须来自目标副本。
+- 保留完整原稿，Primary更改后独立重验，旧Reviewer不覆盖新版本；最终产物标assisted。
+- skill加载、协议、权限、任务事实分层；保持0.1.1不变，更新已完成的加载对照事实。
+- AGENTS.md说明Primary如何按任务选择、冻结并提供可选skill；只读支持与编码未接通分别标明。
+- 归档现有文档后收敛当前入口；核对引用、命令、现有返回限制和Git diff。
+
+完成条件：文档与源码一致，历史未覆盖，明确区分现有功能与待开发能力。无新runtime资格声明。
+
+## 阶段2：有限真实协作批次（已完成，规则保留）
+
+只准备两个行为不同、任务级别的新单元：一个带现有工程检查的编码改动，一个需要综合证据的只读交付。
+优先从可信项目复制完整必要依赖、现有测试和配置；不为方便把严格typecheck删掉，也不要求新完整参考解。
+若现有环境缺依赖或任务超出能力范围，选择可运行的不同任务并在live前说明，不能执行后改门槛。
+
+在启动前冻结任务、候选、批准范围、检查、关键验收、预算和顺序；记录既有暴露情况，不重用旧题当新题。
+编码保持task.34/task-rework-v1（16/4加一次封存14/4及fresh Reviewer）；只读保持已测profile，
+不默认加载skill或额外Reviewer。Primary如认为只读任务需要某项方法，在注册前冻结技能选择与理由，
+区分提供和实际加载；不把这两题当作技能效果对照，也不在失败后换skill补跑。
+一次普通失败不阻止另一独立任务，但安全、漂移、驻留或weekly上限停止新派发。
+
+Primary输入目标与真实边界，不给实现答案。Worker本地自修；终态后核对实际产物，按以下分支决定：
+
+|结果|下一步|
+|---|---|
+|完整正确|记录接受，继续下一单元；不人为制造返工|
+|原合同缺陷适合本地修且resume资格满足|使用现有绑定feedback和封存额度；保留原失败，实改后新检查/审查|
+|小缺口或重复低进展|保留原稿，Primary补完；如无法有界补完，记录未完成并解释，不假定必能救回|
+|首段失败或报告不完整且当前入口不支持续作|记录真实状态，评估已产出价值；直接接手或replan，不换身份充值|
+|只是报告附加断言不可靠|核实核心成果是否可用；Primary纠正整合单列，原报告不改分|
+|检查配置或环境有缺口|单列准备/基础设施问题；只读纠正后可核对同产物，但不伪称原configured checks覆盖|
+|确定性宿主故障|按阶段3先离线窄修；其余无依赖任务可继续，已执行分母不重写|
+|需求、权限、信任边界发生变化|明确提出所需决策，普通实现选择自行处理|
+
+批次结束必须给出结论：两单元各自最终验收、原Worker独立结果、复用部分、Primary补完量、
+准备/终验负担和是否值得下一次受监督使用。两题通过只支持这些任务，不直接放行通用版。
+如两个都需要Primary重做主要实现或持续逐步指导，结论应为该任务选择/协作方式价值不足，停止扩题并分析共同阻碍。
+如主要工作可复用且最终验证可靠，继续有限真实试用；只列有证据的收益，不凭主观完成比例宣称省云用量。
+
+## 阶段3：仅修已确认的流程阻碍（条件执行）
+
+候选须有实际轨迹证明：合法有用动作被拒、缺必要事实、或Primary重复机械工作有可复用部分。
+先判断既有读取、编辑器、反馈准备器、导出和账本能否处理。每批最多一个窄修订，先离线负控再另行冻结验证。
+不得逐格改候选、扩大权限、删除验收、用新成功冲掉旧失败；无机械证据不改runtime。
+
+若问题是“有资源却不符合resume状态”，需分别登记原状态、检查/源码版本、剩余额度、确认缺陷和所需后续动作。
+普通task-rework-v1目前不允许失败首段偷用返工预留；读后不完整也不是通用追问入口。
+任何调整必须作为新候选验证同任务累计预算、不重抽相同审查、保护输入、历史与最终版本绑定。
+本设计不批准凭文档绕过现有门槛，也不假定需要取消全部状态限制。
+
+若一个窄修订仍不能解决已确认阻碍，结束该批并给出具体设计决定，不继续堆profile或提示。
+现有读取裁剪/明确文本输入patch仍是独立隔离候选，不能顺带混入日常试用构建。
+
+## 测量与停止
+
+复用现有结果/ledger/检查，不新造计量平台。记录请求、实改、自修、no-op、协议恢复、
+检查和审查耗时；加载能测则单列。Primary准备/定位/反馈/审查/代写分项，能可靠计时再计时。
+没有Primary-only对照和完整账单就不报省了百分之多少；weekly仅作预算观测。
+
+达到30%停止新派发；保留正在执行任务的实际状态，不以NOT_RUN作模型失败。
+完成固定批次和处置后提交阶段结论；未达通用资格不自动触发无限新实验。
+如用户另行要求持续迭代，按最新授权和预算继续，仍在各阶段保留明确结果。

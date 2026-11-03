@@ -1,13 +1,25 @@
 # Strata 受监督试用：从这里开始
 
-当前本机编码试用候选是 **task.34**。适用于可信Python工程中的有界实现和补测试。
+新项目优先使用[自动安装与环境校准](strata-installation-and-calibration.md)和候选包内SETUP.md。
+本机安装/等待/续配/计数校准/完整编码smoke已验证；新版GitHub远程全链仍待实际发布后复验。
+下方手动安装说明继续保留，不把doctor ready当作完整计数绑定兼容证明。
+
+当前发布准备版本为 **0.3.0-supervised.2**，运行时保持 **task.34**；用户已批准发布，远程复验结果另记。
+此前 **0.3.0-supervised.1** 的资格和记录保持。
+新版ZIP与资格见[受监督v1说明](strata-supervised-v1.md)，解压后从其中README.md开始。
+适用于可信Python工程中的有界实现和补测试。
 源码调查可提供线索，完整自主回答资格仍为HOLD，需要Primary逐项核对、修正并整合。
 Primary给目标、行为边界和权限，Strata自主查读、实现并按真实检查反馈修复；编码
 成功后自动fresh Reviewer，Primary独立验收。不是通用无人值守或已发布的生产默认。
 
+交回成果后，Primary可以接受、按现有规则退回、直接补完或重新规划。小缺口无需为了
+得到Worker自主PASS反复派工；原稿和原成绩保留，最终补完明确标记assisted。
+已有[真实源码案例](../benchmarks/work/subagent-handoff-pilot-20261031-1/report.md)验证了
+“Worker完成主体与补测，Primary修正两行类型标注后验收”的路径。设计见[架构](strata-architecture.md)。
+
 ## 1. 使用配套安装包
 
-已纳入版本控制的[试用zip](../releases/strata-task34/strata-task34-supervised-coding-trial.zip)
+旧的已纳入版本控制的[task.34试用zip](../releases/strata-task34/strata-task34-supervised-coding-trial.zip)
 包含README、install.py、manifest和完整runtime。解压后保持目录结构。
 需要已有Strata harness、iq3_s单驻留，以及目标工程可用的Python/pytest/Ruff/Pyright。
 安装器不下载模型或依赖。当前doctor观察到服务context131072、并发1；客户端仍用
@@ -34,6 +46,9 @@ $python = "F:/work/my-project/.venv/Scripts/python.exe" # 已有工程解释器
 理解格式；它们针对agent-runtime-kit切片，不能跨工程原样使用。
 
 - 核对工程的formatter/linter/typecheck和测试命令，绑定它们实际覆盖的输入目录。
+  使用切片时明确每项原工程检查如何映射，省略时写明原因；不要只保留pytest和Ruff而漏掉原有Pyright。
+- 验证命令必须只检查：Ruff 使用 `ruff check --no-fix ...`，格式检查使用 `ruff format --check ...`。工程配置可能含 `fix = true`，仅写 `ruff check` 仍会改源码或测试，导致验证输入漂移。受控格式化由宿主单独执行，不在检查阶段自动修复。新任务先在副本上核对检查前后哈希。
+- Primary按实际合同检查边界：例如深层输入/极端大小；模型和上游参考同时通过小样例也不能证明这些边界。只读报告的附加断言也必须核对，核心答案正确不等于整份报告正确。
 - `strata_token_counter`是当前Strata/iq3_s的显式路径与文件哈希绑定，不是API密钥。
   本机可以复用已验证连接部分；安装或tokenizer变化时先核对，不删除绑定来绕过。
 - 新补充测试放精确`scope.create`；已有文件用`scope.modify`和稳定anchor。保护测试只读。
@@ -41,6 +56,9 @@ $python = "F:/work/my-project/.venv/Scripts/python.exe" # 已有工程解释器
   `edit_targets.anchor`可以是class。task.34提前拒绝已有类引用，task.33的原失败保留。
 - 无新身份来充值旧失败、无Git权限、无任意shell或默认联网/递归。只读调查用其独立
   已有profile；编码配置不能随意改成调查配置或相反。
+- skill由Primary按[任务选择表](strata-skill-selection.md)决定，通常零个或一个。
+  只读入口用approved_skills和独立配置显式提供，Worker按需加载；不能把UI安装当作继承。
+  当前编码和自动Reviewer不传skill；技能也不能开启联网或脚本等权限。
 
 本开发快照已包含安装包；跨机器安装和未知工程族需要另外核对，不由本机成绩自动保证。
 
@@ -83,6 +101,14 @@ fresh Reviewer及风险相称的独立关键/整体验收，再明确记录编�
 task.34继承拒绝缺失/不匹配的独立PASS或已漂移输入；该门槛不证明语义正确。调查
 结论单独记录Primary核对结果，不套用只服务编码交付的record-review。
 
+若Primary决定直接补完：先确认任务终止且无活动writer，保留原稿和canonical档案，
+按原状态记录takeover/处置；在独立副本完成修改并对最终版本重验。旧Reviewer只审查了
+旧源码，不替Primary修改后的版本背书。最终结果同时记录“复用了哪些Worker产物”和
+“Primary修改及验收”，不要将其改成Worker独立成功。
+
+当前resume有具体状态限制：首段失败不能自动借用封存额度，报告不完整也没有通用语义
+追问入口。已有工具拒绝时核对原因，不能通过新task_id充值。同一阶段内普通自修仍由Worker完成。
+
 ## 5. 交付和下一个任务
 
 Primary可以读取全部原始成果；不要只信模型总结。候选提供create-only成果导出：
@@ -118,5 +144,7 @@ Primary负责目标、风险、行为边界、批准范围和关键验收；Stra
 不覆盖旧任务、不以新身份给失败充值。implementation_ref使用具体方法/函数。
 配置检查通过后走fresh Reviewer；Primary读取完整实际成果，独立核对并整合结果。
 普通原合同缺陷按已登记封存预算和canonical反馈续作，新要求另作决定。
+终态后按剩余工作判断：直接接受、合法退回、Primary补完或重新规划。小且清晰的缺口
+可以在保留原稿的独立副本补完并重验；原Worker结果和最终assisted结果分别记录。
 记录真实请求/编辑/失败、自修、Reviewer、独立验收及Primary额外介入；不可测成本写unknown。
 ```

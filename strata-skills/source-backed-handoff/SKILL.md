@@ -2,7 +2,7 @@
 name: source-backed-handoff
 description: Complete Primary-delegated investigation or implementation tasks with bounded autonomous recovery and a concise, source-backed handoff. Use when reporting work to a supervising Primary, not for unrelated conversation.
 metadata:
-  version: "0.1.0"
+  version: "0.1.1"
 ---
 
 # Source-backed handoff
@@ -24,6 +24,12 @@ methods; it grants no permissions and does not replace the current tool schemas.
   scope, inspect it. Otherwise state the precise missing evidence and its effect
   on the answer, or use the mounted blocked/request mechanism. Do not invent a
   tool, permission or dependency definition.
+- Source-backed answers may require deduction. Follow explicit equivalence,
+  delegation or reference relationships, checking applicable conditions before
+  carrying behavior across them. Cite the premises and label the deduction;
+  absence of a repeated statement in one section is not by itself an evidence
+  gap. If the relationship or a necessary premise is unverified, keep that
+  uncertainty explicit rather than guessing.
 - For implementation, make a cohesive in-scope change, obtain the required
   current checks through the available mechanism, and repair ordinary failures
   while credits remain. If the host drives checks automatically, use that result
@@ -74,6 +80,10 @@ when requested; use host-bound quotes when the interface supplies them.
 
 Treat displayed size/item limits as upper bounds, not targets. Remove repeated
 explanations and unused evidence before compressing essential qualifications.
+Conciseness removes unrelated commentary, not reasoning needed to answer the
+requested question. Before reporting, distinguish each requested item's supported
+answer (direct or derived) from an unresolved gap; do not substitute quotations
+for the conclusion they establish.
 Do not silently drop unresolved findings or claim checks that were not run.
 Primary independently accepts the work; a legal report or local pass is not that
 acceptance.

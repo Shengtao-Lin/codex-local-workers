@@ -1,5 +1,9 @@
 # 按任务启用 Strata subagent 能力
 
+> 本文保留0.2.3-ondemand.5当时的入口与成绩。当前task.34的统一入口、审查与续作已有变化，
+> 不能直接套用本文配置组合或把旧live当作当前版本准入。当前版本核对见
+> [受监督版本完成审计](strata-supervised-release-audit.md)与[当前架构](strata-architecture.md)。
+
 这是默认关闭的受控试用功能，不是任意终端或无限递归代理。
 当前候选 `0.2.3-ondemand.5`；最终资格以
 `benchmarks/work/harness-convergence/strata-ondemand-stage-20261024-1/decision.json`

@@ -1,10 +1,12 @@
 # codex-local-workers
 
-For the current **Strata supervised coding trial (task.34)**, start with the
-[quickstart](docs/strata-quickstart.md) and
-[checkpoint evidence and limitations](docs/strata-task34-checkpoint.md).
-The [frozen bundle](releases/strata-task34/README.md) is versioned here;
-general autonomous use and the full investigation gate remain HOLD.
+For **Strata supervised subagent 0.3.0-supervised.2**, start with
+[installation and calibration](docs/strata-installation-and-calibration.md),
+the [quickstart](docs/strata-quickstart.md), and the release asset's README/SETUP.
+This is a supervised prerelease using the unchanged task.34 runtime. Primary
+reviews real project checks and independently accepts the result. General
+autonomous use remains unqualified. Historical task.34 evidence and its older
+[frozen bundle](releases/strata-task34/README.md) remain available.
 
 Run scoped Python coding tasks with local LM Studio models while Codex handles
 planning, review and final acceptance.

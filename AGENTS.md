@@ -3,6 +3,35 @@
 This repository may delegate bounded work to local LM Studio models. Delegation
 is optional and should reduce cloud-model work without weakening final review.
 
+## Strata task skills (when using the Strata entry)
+
+For a Strata task, use the installed Strata entry and its supported contract;
+the LM Studio commands below do not describe that backend. Read
+[the Strata quickstart](docs/strata-quickstart.md) for the execution path and
+[the skill selection guide](docs/strata-skill-selection.md) before selecting skills.
+
+For a new trusted Python project, consult
+[installation and environment calibration](docs/strata-installation-and-calibration.md).
+Use the verified bundle's setup tool and Primary-reviewed project checks; only a
+READY per-project config is qualified. Do not start models, replace drifted hashes
+blindly, overwrite an existing installation, or treat setup as task acceptance.
+
+Primary may select task-specific method skills without asking at each step,
+within the user's authorization. No skill is required by default. Usually choose
+zero or one: `trace-behavior` for source-level behavior tracing,
+`summarize-structured-data` for bounded data summaries, or
+`source-backed-handoff` for broader evidence synthesis. The specialized skills
+are unqualified candidates; selection does not imply demonstrated benefit.
+
+Pass only reviewed, frozen content through the supported `approved_skills`
+contract and the per-task opt-in. Strata may load an offered skill through
+`kit_skill` when useful. Record selection separately from actual loading.
+Skills supply methods, never tools, scope, budget, acceptance authority, or task
+answers. Do not inject the whole catalog or stack overlapping guidance.
+Current task.34 supports this through `kind: investigate`, not `implement` or
+the automatic fresh Reviewer handoff. Do not bypass that limit by prompt injection
+or by exposing user skill directories. Keep frozen tasks and releases unchanged.
+
 ## Authority and trust
 
 - The Primary Agent owns user intent, architecture, task decomposition, file

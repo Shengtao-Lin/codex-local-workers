@@ -1,0 +1,39 @@
+--- a/strata/general_host.py
++++ b/strata/general_host.py
+@@ -301,7 +301,6 @@
+                 type(start) is not int
+                 or type(end) is not int
+                 or not 1 <= start <= end
+-                or end - start + 1 > 120
+             ):
+                 details = {"max_lines": 120}
+                 if type(start) is int and start >= 1:
+@@ -313,6 +312,8 @@
+                 raise W.SafeEditError(
+                     "Read1..120 lines; use the supplied legal window", details=details
+                 )
++            if end - start + 1 > 120:
++                args["end_line"] = start + 119
+         elif (
+             set(args) != {"path", "query"}
+             or not isinstance(args["query"], str)
+@@ -377,6 +378,7 @@
+             if W.path_matches_any(relative, self.packet["scope"]["forbidden"]):
+                 raise StateError("Evidence outside approved exact source manifest")
+             raise EvidenceScopeError("Evidence outside approved exact source manifest")
++        requested_arguments = copy.deepcopy(args)
+         self._evidence_arguments(action, args, relative)
+         if absent_create:
+             return self._absent_creation_evidence(relative)
+@@ -393,6 +395,11 @@
+                     f"{i + 1}: {line}" for i, line in enumerate(lines) if start <= i + 1 <= end
+                 ),
+             }
++            if args != requested_arguments:
++                observation["window_clipped"] = True
++                observation["requested_end_line"] = requested_arguments["end_line"]
++                if end < len(lines):
++                    observation["next_read"] = {"path": relative, "start_line": end + 1, "end_line": min(end + 120, len(lines))}
+         else:
+             matches, scanned = [], []
+             for name in selected:

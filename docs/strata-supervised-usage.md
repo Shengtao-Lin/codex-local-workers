@@ -3,7 +3,7 @@
 初次使用先读[短操作说明](strata-quickstart.md)，本文保留完整预算、证据和历史边界。
 
 当前新隔离编码试用选择**task.34**：
-[完整本机试用包](../benchmarks/work/releases/strata-task34-supervised-coding-trial.zip)。
+[完整本机试用包](../releases/strata-task34/strata-task34-supervised-coding-trial.zip)。
 629项宿主控制（含9项新增class引用前置拒绝）、118文件安装/doctor/拒绝覆盖通过。
 正确绑定后的已暴露生命周期单元完整链接受，574项独立工程检查和实际NativeAgent
 集成通过。原错误合同的HOLD保留；不是盲迁移，不宣称模型语义能力提升。
@@ -194,6 +194,15 @@ task.33继承task.31的诊断修复：零测试/缺失测试不能冒充旧失�
 
 ## Primary怎样接手结果
 
+Primary终态处置按[架构决策表](strata-architecture.md)执行：满足验收就接受；确认的原合同
+缺陷仍值得委派且状态允许就续作；小缺口或继续协调不划算就保留原稿后补完；合同/权限冲突就replan。
+部分成果可以有价值，但不能标成ready或接受。最新[真实源码试用](../benchmarks/work/subagent-handoff-pilot-20261031-1/report.md)
+中，Worker主体和15项测试可复用，Primary另补类型标注；原canonical为takeover，最终为assisted。
+
+直接补完时等待任务settled、无活动writer，保留原源码/检查/报告，在独立副本修改。
+记录Primary实际diff，对最终源码重新运行必要工程/独立检查；旧fresh Reviewer不覆盖新版本。
+最终接受由Primary负责，不能把新结果写回旧Worker档案，也不因此重抽同一份审查。
+
 先查看canonical `workflow/runs/<attempt>/result.json`和对应完整交付材料；`status`
 只是索引。成功意味着可供Primary审查，接受仍须核实实际源码/diff、configured
 checks、fresh Reviewer、保护输入与当前绑定，并按风险做独立关键/整体验收。
@@ -254,5 +263,5 @@ fresh意味着独立上下文和证据快照；Coder与Reviewer仍是同一iq3_s
 
 本轮A、B均未写参考实现，仍新增关键验收和批次适配，不能据此宣称低准备成本。
 两批准备墙钟起算位置不同，不能直接比较为节省；无Primary-only配对和云token/
-主动时间时不报净省百分比。weekly只作预算停止线，当前按用户最新20% used；
-历史批次的50%不代表当前授权。
+主动时间时不报净省百分比。weekly只作预算停止线，按用户最新授权和
+[当前行动计划](strata-supervised-next-step.md)执行；不要使用本页历史批次的预算作为当前授权。

@@ -1,5 +1,8 @@
 # Strata 可选能力：受监督试用边界
 
+> 以下保留C1/C2/C3阶段的历史状态，并非当前task.34状态。当前能力与版本核对见
+> [架构](strata-architecture.md)和[受监督版本完成审计](strata-supervised-release-audit.md)。
+
 当前不是全功能自动启用版。核心实现仍使用已冻结 C3；新能力逐项实验，必须显式选择入口及批准范围，Primary 保留最终验收。
 
 ## 已完成与执行中
