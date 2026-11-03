@@ -1,12 +1,15 @@
 # codex-local-workers
 
 For **Strata supervised subagent 0.3.0-supervised.2**, start with
+[the GitHub prerelease](https://github.com/Shengtao-Lin/codex-local-workers/releases/tag/strata-v0.3.0-supervised.2),
 [installation and calibration](docs/strata-installation-and-calibration.md),
 the [quickstart](docs/strata-quickstart.md), and the release asset's README/SETUP.
 This is a supervised prerelease using the unchanged task.34 runtime. Primary
 reviews real project checks and independently accepts the result. General
 autonomous use remains unqualified. Historical task.34 evidence and its older
 [frozen bundle](releases/strata-task34/README.md) remain available.
+The actual Release-to-new-project setup and independently accepted coding smoke
+are recorded in the [publication verification](docs/strata-release-0.3.0-supervised.2-verification.md).
 
 Run scoped Python coding tasks with local LM Studio models while Codex handles
 planning, review and final acceptance.
@@ -46,13 +49,14 @@ LM Studio E/C/R route or automatic acceptance. Qualification is limited to the
 recorded single-function families; no general coding or cloud-savings claim.
 The default configuration below is unchanged.
 
-For the current opt-in Strata development candidate, see the
+For the current opt-in Strata supervised release, see the
 [supervised quickstart](docs/strata-quickstart.md),
 [architecture and boundaries](docs/strata-architecture.md),
 [supervised usage guide](docs/strata-supervised-usage.md), and
 [next-step plan](docs/strata-supervised-next-step.md). These describe the current
-supervised coding and bounded rework; they do not replace the published preview,
-change the LM Studio defaults, or establish general autonomous qualification.
+supervised coding and bounded rework. Use the current prerelease's setup path;
+the older preview remains historical. LM Studio defaults are unchanged, and
+general autonomous qualification is not established.
 
 Current evidence supports **limited supervised use, not general autonomous
 coding**. For the explicitly tested single-function path, use

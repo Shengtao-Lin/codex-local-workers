@@ -1,10 +1,12 @@
 # Strata 受监督试用：从这里开始
 
 新项目优先使用[自动安装与环境校准](strata-installation-and-calibration.md)和候选包内SETUP.md。
-本机安装/等待/续配/计数校准/完整编码smoke已验证；新版GitHub远程全链仍待实际发布后复验。
+本机安装/等待/续配/计数校准/完整编码smoke已验证；新版真实GitHub远程全链也已通过，
+见[发布复验记录](strata-release-0.3.0-supervised.2-verification.md)。
 下方手动安装说明继续保留，不把doctor ready当作完整计数绑定兼容证明。
 
-当前发布准备版本为 **0.3.0-supervised.2**，运行时保持 **task.34**；用户已批准发布，远程复验结果另记。
+当前[预发行版](https://github.com/Shengtao-Lin/codex-local-workers/releases/tag/strata-v0.3.0-supervised.2)
+为 **0.3.0-supervised.2**，运行时保持 **task.34**；从发布包开始遵循README/SETUP。
 此前 **0.3.0-supervised.1** 的资格和记录保持。
 新版ZIP与资格见[受监督v1说明](strata-supervised-v1.md)，解压后从其中README.md开始。
 适用于可信Python工程中的有界实现和补测试。

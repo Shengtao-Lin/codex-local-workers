@@ -1,5 +1,11 @@
 # 自动安装与环境校准
 
+2026-11-03最新：**0.3.0-supervised.2已发布，真实GitHub到新项目完整链复验通过**。
+见[固定发布身份与分层证据](strata-release-0.3.0-supervised.2-verification.md)：
+干净clone重建一致、59项支持控制；安装READY后3Coder+4Reviewer请求，
+11配置/15独立合并测试通过并canonical accept；任务后重复setup保留全部任务历史。
+weekly观测28%/上限50%。以下“待授权/待发布”是原准备阶段记录，已由本段结果更新。
+
 2026-11-03补充：[0.3.0-supervised.2发布准备](strata-release-preparation.md)已完成。
 builder不再依赖忽略的实验目录，三次构建（含干净源码导出）ZIP逐字节一致。
 新包仅更新文案/资格元数据及VERSION，全部功能文件延用已验收字节；59项支持控制通过。

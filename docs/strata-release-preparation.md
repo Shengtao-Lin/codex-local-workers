@@ -1,5 +1,9 @@
 # Strata发布准备：0.3.0-supervised.2
 
+执行完成：已提交并push当前dev，发布固定tag预发行版，真实远程安装及完整任务链已独立接受。
+详见[2026-11-03发布复验](strata-release-0.3.0-supervised.2-verification.md)。
+下文保留准备时状态，不代表仍未发布；发布ZIP/tag保持冻结，main不变。
+
 最新授权：用户已明确批准commit/push当前dev分支、发布该预发行版并做真实GitHub到新项目复验。
 以下“尚未发布/待授权”保留为准备阶段状态；实际结果以后续发布复验记录为准。main不改，历史不重写。
 
